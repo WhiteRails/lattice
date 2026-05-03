@@ -7,6 +7,7 @@ Runnable narratives on top of the Lattice MVP (`core/`).
 | [01-government-citizen-certificate](./01-government-citizen-certificate/) | Who may issue “government” certificates; citizen binding (demo subject). |
 | [02-bank-government-validated-transfer](./02-bank-government-validated-transfer/) | Bank transfer tool call gated by a separate government-signed approval. |
 | [03-transparency-signed-manifest](./03-transparency-signed-manifest/) | Signed issuer manifest, Merkle log batch, on-chain checkpoint hook. |
+| [04-lattice-domain-registry](./04-lattice-domain-registry/) | On-chain `*.lattice` namespaces: register, bindings, access policy, reserved slugs (English). |
 | [testnet-demo.ts](./testnet-demo.ts) | End-to-end in-memory testnet (CA, registry, gateway, log, revoke). |
 | [agents/node-agent.js](./agents/node-agent.js) | HTTP agent via Entry proxy (requires overlay stack). |
 
@@ -14,5 +15,6 @@ Runnable narratives on top of the Lattice MVP (`core/`).
 npm run example:gov
 npm run example:bank
 npm run example:manifest
+npm run example:domains
 npm run demo
 ```

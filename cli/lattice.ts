@@ -23,10 +23,32 @@ import { EntryNode, DEFAULT_ENTRY_PORT } from '../node/entry';
 import { RelayNode, DEFAULT_RELAY_PORT } from '../node/relay';
 import { ServiceGateway } from '../node/gateway';
 import { createBatch, generateProof } from '../node/batch';
-import { deployLatticeChain, submitCheckpoint, verifyCheckpointOnChain } from '../node/chain';
+import {
+  deployLatticeChain,
+  submitCheckpoint,
+  verifyCheckpointOnChain,
+  chainRegisterCertType,
+  chainRegisterIssuer,
+  chainSetIssuerPermission,
+  chainRegisterNamespace,
+  chainUpdateNamespaceServiceBinding,
+  chainSetNamespaceAccessPolicy,
+  chainGetNamespace,
+  chainGetIssuer,
+  chainGetCertType,
+  chainIssuerCanIssue,
+  chainTransferOwnership,
+  chainSetReservedOfficialSlug,
+  chainGetReservedOfficialSlug,
+  readPublicKeyHashFromFile,
+  labelToBytes32,
+  resolvePrivateKeyFromCli,
+} from '../node/chain';
+import { credentialMaskFromNames } from '../core/namespace-access';
 import { LatticeCA }         from '../core/ca';
 import { generateKeyPair } from '../core/identity';
 import * as crypto from 'crypto';
+import { ethers } from 'ethers';
 
 const program = new Command();
 program.name('lattice').description('Certified overlay network for autonomous AI agents').version('0.1.0');
@@ -40,6 +62,16 @@ function requireInit() {
 }
 function ok(msg: string) { console.log(`${chalk.green('✓')} ${msg}`); }
 function err(msg: string) { console.error(`${chalk.red('✗')} ${msg}`); process.exit(1); }
+
+/** Private key for chain txs: use --key-file (outside repo) instead of raw --key when possible. */
+function requireChainPk(opts: { key?: string; keyFile?: string }): string {
+  try {
+    return resolvePrivateKeyFromCli(opts);
+  } catch (e: any) {
+    err(e.message);
+    throw e;
+  }
+}
 
 // ── init ────────────────────────────────────────────────────────────────────
 program.command('init').description('Initialize Lattice (~/.lattice)').action(() => {
@@ -304,14 +336,323 @@ const chain = program.command('chain').description('LatticeChain Trust Anchor op
 
 chain.command('deploy').description('Deploy LatticeChain contract to network')
   .requiredOption('--rpc <url>', 'RPC URL')
-  .requiredOption('--key <key>', 'Private key')
+  .option('--key <key>', 'Deployer private key (hex)')
+  .option('--key-file <path>', 'Deployer private key file (recommended; keep outside repo)')
   .action(async (opts) => {
     requireInit();
+    const pk = requireChainPk(opts);
     console.log(chalk.dim('Deploying LatticeChain contract...'));
     try {
-      const address = await deployLatticeChain(opts.rpc, opts.key);
+      const address = await deployLatticeChain(opts.rpc, pk);
       ok(`Contract deployed to: ${chalk.green(address)}`);
     } catch (e: any) { err(e.message); }
+  });
+
+const chainOwnership = chain.command('ownership').description('Contract owner (governance)');
+
+chainOwnership
+  .command('transfer <newOwnerAddress>')
+  .description('Transfer LatticeChain owner (only current owner)')
+  .requiredOption('--rpc <url>', 'RPC URL')
+  .requiredOption('--contract <address>', 'LatticeChain address')
+  .option('--key <key>', 'Current owner private key (hex)')
+  .option('--key-file <path>', 'Current owner private key file')
+  .action(async (newOwnerAddress, opts) => {
+    requireInit();
+    const pk = requireChainPk(opts);
+    try {
+      const txHash = await chainTransferOwnership(opts.rpc, pk, opts.contract, newOwnerAddress.trim());
+      ok(`Ownership transferred  tx=${chalk.green(txHash)}`);
+    } catch (e: any) { err(e.message); }
+  });
+
+const chainReserved = chain.command('reserved').description('Official lattice slug reservations (owner-only writes)');
+
+chainReserved
+  .command('set <slug>')
+  .description('Mark slug (label before .lattice) as official/reserved or clear it')
+  .requiredOption('--rpc <url>', 'RPC URL')
+  .requiredOption('--contract <address>', 'LatticeChain address')
+  .option('--key <key>', 'Owner private key (hex)')
+  .option('--key-file <path>', 'Owner private key file')
+  .option('--remove', 'Clear reservation (non-owner may register that slug.lattice)', false)
+  .action(async (slug, opts) => {
+    requireInit();
+    const pk = requireChainPk(opts);
+    const reserved = !opts.remove;
+    try {
+      const txHash = await chainSetReservedOfficialSlug(opts.rpc, pk, opts.contract, slug, reserved);
+      ok(`Reserved slug updated  tx=${chalk.green(txHash)}  reserved=${reserved}`);
+    } catch (e: any) { err(e.message); }
+  });
+
+chainReserved
+  .command('show <slug>')
+  .description('Query whether a slug is reserved for owner-only registration')
+  .requiredOption('--rpc <url>', 'RPC URL')
+  .requiredOption('--contract <address>', 'LatticeChain address')
+  .action(async (slug, opts) => {
+    try {
+      const v = await chainGetReservedOfficialSlug(opts.rpc, opts.contract, slug);
+      console.log(JSON.stringify({ slug, reservedOfficial: v }, null, 2));
+    } catch (e: any) { err(e.message); }
+  });
+
+const chainCertType = chain
+  .command('cert-type')
+  .description('CertType registry (register requires contract owner)');
+
+chainCertType
+  .command('register <name>')
+  .description('Register a cert type; bytes32 id is keccak256(name) unless name is 0x + 64 hex')
+  .requiredOption('--rpc <url>', 'RPC URL')
+  .requiredOption('--contract <address>', 'LatticeChain address')
+  .option('--key <key>', 'Contract owner private key (hex)')
+  .option('--key-file <path>', 'Contract owner private key file')
+  .requiredOption('--level <n>', 'Assurance level (0–255)')
+  .action(async (name, opts) => {
+    requireInit();
+    const pk = requireChainPk(opts);
+    try {
+      const level = parseInt(String(opts.level), 10);
+      if (!Number.isFinite(level) || level < 0 || level > 255) err('--level must be 0–255');
+      const { txHash, certTypeId } = await chainRegisterCertType(opts.rpc, pk, opts.contract, name, level);
+      ok(`CertType registered  tx=${chalk.green(txHash)}`);
+      console.log(chalk.dim(`  certTypeId: ${certTypeId}`));
+    } catch (e: any) { err(e.message); }
+  });
+
+chainCertType
+  .command('show <name>')
+  .description('Read on-chain cert type row')
+  .requiredOption('--rpc <url>', 'RPC URL')
+  .requiredOption('--contract <address>', 'LatticeChain address')
+  .action(async (name, opts) => {
+    try {
+      const r = await chainGetCertType(opts.rpc, opts.contract, name);
+      console.log(JSON.stringify(r, null, 2));
+    } catch (e: any) { err(e.message); }
+  });
+
+const chainIssuer = chain
+  .command('issuer')
+  .description('Issuer registry (register + permit require contract owner)');
+
+chainIssuer
+  .command('register <label>')
+  .description('Register issuer; id = keccak256(label) unless label is 0x + 64 hex')
+  .requiredOption('--rpc <url>', 'RPC URL')
+  .requiredOption('--contract <address>', 'LatticeChain address')
+  .option('--key <key>', 'Contract owner private key (hex)')
+  .option('--key-file <path>', 'Contract owner private key file')
+  .requiredOption('--type <label>', 'Issuer type label (hashed to bytes32)')
+  .option('--pub-key-hash <hex>', 'bytes32 public key hash (0x + 64 hex)')
+  .option('--pub-key-file <path>', 'UTF-8 file; hash = keccak256(contents) → bytes32')
+  .action(async (label, opts) => {
+    requireInit();
+    const pk = requireChainPk(opts);
+    if (!opts.pubKeyHash && !opts.pubKeyFile) err('Provide --pub-key-hash or --pub-key-file');
+    let publicKeyHash: string;
+    if (opts.pubKeyHash) {
+      const h = (opts.pubKeyHash as string).trim();
+      if (!/^0x[0-9a-fA-F]{64}$/.test(h)) err('--pub-key-hash must be 0x + 64 hex characters');
+      publicKeyHash = h;
+    } else {
+      const fp = path.resolve(process.cwd(), opts.pubKeyFile as string);
+      if (!fs.existsSync(fp)) err(`File not found: ${fp}`);
+      publicKeyHash = readPublicKeyHashFromFile(fp);
+    }
+    try {
+      const { txHash, issuerId } = await chainRegisterIssuer(
+        opts.rpc,
+        pk,
+        opts.contract,
+        label,
+        opts.type as string,
+        publicKeyHash,
+      );
+      ok(`Issuer registered  tx=${chalk.green(txHash)}`);
+      console.log(chalk.dim(`  issuerId: ${issuerId}`));
+    } catch (e: any) { err(e.message); }
+  });
+
+chainIssuer
+  .command('permit <issuerLabel> <certTypeName>')
+  .description('Allow or deny an issuer to issue a cert type')
+  .requiredOption('--rpc <url>', 'RPC URL')
+  .requiredOption('--contract <address>', 'LatticeChain address')
+  .option('--key <key>', 'Contract owner private key (hex)')
+  .option('--key-file <path>', 'Contract owner private key file')
+  .option('--deny', 'Set permission to false', false)
+  .action(async (issuerLabel, certTypeName, opts) => {
+    requireInit();
+    const pk = requireChainPk(opts);
+    try {
+      const allowed = !opts.deny;
+      const txHash = await chainSetIssuerPermission(
+        opts.rpc,
+        pk,
+        opts.contract,
+        issuerLabel,
+        certTypeName,
+        allowed,
+      );
+      ok(`Issuer permission updated  tx=${chalk.green(txHash)}  allowed=${allowed}`);
+    } catch (e: any) { err(e.message); }
+  });
+
+chainIssuer
+  .command('show <label>')
+  .description('Read on-chain issuer row')
+  .requiredOption('--rpc <url>', 'RPC URL')
+  .requiredOption('--contract <address>', 'LatticeChain address')
+  .action(async (label, opts) => {
+    try {
+      const r = await chainGetIssuer(opts.rpc, opts.contract, label);
+      console.log(JSON.stringify(r, null, 2));
+      console.log(chalk.dim(`  issuerId (bytes32): ${r.issuerId}`));
+    } catch (e: any) { err(e.message); }
+  });
+
+chainIssuer
+  .command('can-issue <issuerLabel> <certTypeName>')
+  .description('Query canIssue(issuerId, certTypeId)')
+  .requiredOption('--rpc <url>', 'RPC URL')
+  .requiredOption('--contract <address>', 'LatticeChain address')
+  .action(async (issuerLabel, certTypeName, opts) => {
+    try {
+      const v = await chainIssuerCanIssue(opts.rpc, opts.contract, issuerLabel, certTypeName);
+      console.log(JSON.stringify({ issuerLabel, certTypeName, canIssue: v }, null, 2));
+    } catch (e: any) { err(e.message); }
+  });
+
+const chainNs = chain
+  .command('namespace')
+  .description('NamespaceRegistry: only `label.lattice` (ASCII lowercase [a-z0-9-]+). Official slugs (governments, lattice, …) → contract owner only.');
+
+chainNs
+  .command('register <fqdn>')
+  .description('Register namespace on-chain (FQDN must end with .lattice; reserved slugs require owner key)')
+  .requiredOption('--rpc <url>', 'RPC URL')
+  .requiredOption('--contract <address>', 'LatticeChain address')
+  .option('--key <key>', 'Caller private key (hex)')
+  .option('--key-file <path>', 'Caller private key file')
+  .requiredOption('--owner-issuer <label>', 'Issuer label (hashed to bytes32) as namespace owner')
+  .option('--service-cert-hash <hex>', 'bytes32 service cert hash (default 0x0…0)')
+  .option('--metadata-hash <hex>', 'bytes32 metadata hash (default 0x0…0)')
+  .option('--namespace-admin <address>', 'Domain admin (default: caller); may update service binding + access policy')
+  .option('--public', 'Accept any client at gateway (see docs/Namespace-firewall-gateway.md)')
+  .option('--credentials <csv>', 'When not --public: OR mask from gov,enterprise,model (comma-separated)')
+  .option('--min-assurance <n>', 'Minimum cert assurance level when not public (default 0)', '0')
+  .action(async (fqdn, opts) => {
+    requireInit();
+    const pk = requireChainPk(opts);
+    try {
+      const publicAccess = Boolean(opts.public);
+      const credCsv = (opts.credentials as string | undefined)?.trim();
+      if (publicAccess && credCsv) err('Use either --public or --credentials, not both');
+      let credentialMask = 0;
+      if (!publicAccess && credCsv) {
+        credentialMask = credentialMaskFromNames(credCsv.split(',').map(s => s.trim()).filter(Boolean));
+      }
+      const minAssuranceLevel = Math.max(0, Math.min(255, parseInt(String(opts.minAssurance), 10) || 0));
+      const { txHash, nameHash, ownerIssuerId } = await chainRegisterNamespace(
+        opts.rpc,
+        pk,
+        opts.contract,
+        fqdn,
+        opts.ownerIssuer as string,
+        opts.serviceCertHash as string | undefined,
+        opts.metadataHash as string | undefined,
+        opts.namespaceAdmin as string | undefined,
+        publicAccess,
+        credentialMask,
+        minAssuranceLevel,
+      );
+      ok(`Namespace registered  tx=${chalk.green(txHash)}`);
+      console.log(chalk.dim(`  nameHash:       ${nameHash}`));
+      console.log(chalk.dim(`  ownerIssuerId:  ${ownerIssuerId}`));
+    } catch (e: any) { err(e.message); }
+  });
+
+chainNs
+  .command('update-service <fqdn>')
+  .description('Update serviceCertHash / metadataHash (namespace admin or contract owner)')
+  .requiredOption('--rpc <url>', 'RPC URL')
+  .requiredOption('--contract <address>', 'LatticeChain address')
+  .option('--key <key>', 'Private key (hex)')
+  .option('--key-file <path>', 'Private key file')
+  .option('--service-cert-hash <hex>', 'bytes32 (omit or 0 to keep unchanged)')
+  .option('--metadata-hash <hex>', 'bytes32 (omit or 0 to keep unchanged)')
+  .action(async (fqdn, opts) => {
+    requireInit();
+    const pk = requireChainPk(opts);
+    try {
+      const txHash = await chainUpdateNamespaceServiceBinding(
+        opts.rpc,
+        pk,
+        opts.contract,
+        fqdn,
+        opts.serviceCertHash as string | undefined,
+        opts.metadataHash as string | undefined,
+      );
+      ok(`Namespace service binding updated  tx=${chalk.green(txHash)}`);
+    } catch (e: any) { err(e.message); }
+  });
+
+chainNs
+  .command('set-policy <fqdn>')
+  .description('Set publicAccess, credentialMask, minAssuranceLevel (namespace admin or contract owner)')
+  .requiredOption('--rpc <url>', 'RPC URL')
+  .requiredOption('--contract <address>', 'LatticeChain address')
+  .option('--key <key>', 'Private key (hex)')
+  .option('--key-file <path>', 'Private key file')
+  .option('--public', 'Open namespace at gateway policy layer')
+  .option('--credentials <csv>', 'When not --public: gov,enterprise,model (comma OR)')
+  .option('--min-assurance <n>', 'Minimum assurance when not public', '0')
+  .action(async (fqdn, opts) => {
+    requireInit();
+    const pk = requireChainPk(opts);
+    try {
+      const publicAccess = Boolean(opts.public);
+      const credCsv = (opts.credentials as string | undefined)?.trim();
+      if (publicAccess && credCsv) err('Use either --public or --credentials, not both');
+      let credentialMask = 0;
+      if (!publicAccess && credCsv) {
+        credentialMask = credentialMaskFromNames(credCsv.split(',').map(s => s.trim()).filter(Boolean));
+      }
+      const minAssuranceLevel = Math.max(0, Math.min(255, parseInt(String(opts.minAssurance), 10) || 0));
+      const txHash = await chainSetNamespaceAccessPolicy(
+        opts.rpc,
+        pk,
+        opts.contract,
+        fqdn,
+        publicAccess,
+        credentialMask,
+        minAssuranceLevel,
+      );
+      ok(`Namespace policy updated  tx=${chalk.green(txHash)}`);
+    } catch (e: any) { err(e.message); }
+  });
+
+chainNs
+  .command('show <fqdn>')
+  .description('Read NamespaceRecord (nameHash = keccak256(utf8(fqdn)) for valid lattice FQDNs)')
+  .requiredOption('--rpc <url>', 'RPC URL')
+  .requiredOption('--contract <address>', 'LatticeChain address')
+  .action(async (fqdn, opts) => {
+    try {
+      const r = await chainGetNamespace(opts.rpc, opts.contract, fqdn);
+      console.log(JSON.stringify(r, null, 2));
+      console.log(chalk.dim(`  nameHash (bytes32): ${r.nameHash}`));
+    } catch (e: any) { err(e.message); }
+  });
+
+chainNs
+  .command('hash <fqdn>')
+  .description('Print nameHash (keccak256 of UTF-8 fqdn) as stored on-chain')
+  .action(fqdn => {
+    console.log(labelToBytes32(fqdn.trim()));
   });
 
 logs.command('batch').description('Create a Merkle batch of unbatched action logs')
@@ -324,19 +665,21 @@ logs.command('batch').description('Create a Merkle batch of unbatched action log
     } catch (e: any) { err(e.message); }
   });
 
-program.command('checkpoint submit').description('Submit a batch Merkle root to the LatticeChain')
+program.command('checkpoint submit').description('Submit a batch Merkle root to the LatticeChain (contract owner only)')
   .requiredOption('--batch <id>', 'Batch ID')
   .requiredOption('--rpc <url>', 'RPC URL')
-  .requiredOption('--key <key>', 'Private key')
   .requiredOption('--contract <address>', 'LatticeChain contract address')
+  .option('--key <key>', 'Owner private key (hex)')
+  .option('--key-file <path>', 'Owner private key file')
   .action(async (opts) => {
     requireInit();
+    const pk = requireChainPk(opts);
     const f = path.join(LATTICE_DIR, 'batches', `${opts.batch}.json`);
     if (!fs.existsSync(f)) err(`Batch '${opts.batch}' not found`);
     const meta = JSON.parse(fs.readFileSync(f, 'utf-8'));
     console.log(chalk.dim(`Submitting checkpoint for ${opts.batch}...`));
     try {
-      const txHash = await submitCheckpoint(meta, opts.rpc, opts.key, opts.contract);
+      const txHash = await submitCheckpoint(meta, opts.rpc, pk, opts.contract);
       ok(`Checkpoint anchored at tx: ${chalk.green(txHash)}`);
     } catch (e: any) { err(e.message); }
   });
@@ -356,8 +699,11 @@ program.command('proof <action_id>').description('Generate and verify Merkle pro
       if (opts.rpc && opts.contract) {
         console.log(chalk.dim('  Querying LatticeChain...'));
         const result = await verifyCheckpointOnChain(batch.batch_id, opts.rpc, opts.contract);
-        if (result.anchored) {
-          if (result.merkleRoot === batch.merkle_root) {
+        if (result.anchored && result.merkleRoot !== undefined) {
+          const chainRoot = ethers.hexlify(result.merkleRoot);
+          const raw = batch.merkle_root.replace(/^0x/i, '');
+          const batchRoot = ethers.hexlify('0x' + raw);
+          if (chainRoot === batchRoot) {
             onChainVerified = true;
             console.log(`  Checkpoint:        ${chalk.green('on-chain (verified)')}`);
             console.log(`  Signer:            ${chalk.dim(result.signer)}`);

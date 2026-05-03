@@ -123,9 +123,9 @@ npm run lattice -- logs batch
 > Merkle root: 0x41096fd...
 ```
 
-**Anchor it on-chain:**
+**Anchor it on-chain (must use contract owner key):**
 ```bash
-npm run lattice -- checkpoint submit --batch batch_d075dbe77157 --rpc <RPC_URL> --key <PRIVATE_KEY> --contract <ADDRESS>
+npm run lattice -- checkpoint submit --batch batch_d075dbe77157 --rpc <RPC_URL> --key-file <PATH_OUTSIDE_REPO> --contract <ADDRESS>
 ```
 
 **Verify an action cryptographically:**
@@ -135,6 +135,22 @@ npm run lattice -- proof act_0f7b53976546
 > Included in batch: batch_d075dbe77157
 > Merkle root: 0x41096fd...
 > Checkpoint: on-chain (verified)
+```
+
+**Namespaces (`*.lattice` on-chain):** Only ASCII lowercase `label.lattice` (single label, `[a-z0-9-]+`). Reserved official slugs (`governments`, `lattice`, `system`, `registry` by default) can **only** be registered by the **contract owner**. See [`docs/lattice-uri-scheme.md`](docs/lattice-uri-scheme.md) for the `lattice://` mapping and [`docs/Operator-key-security.md`](docs/Operator-key-security.md) for storing owner keys outside the repo.
+
+```bash
+npm run lattice -- chain cert-type register AgentCert --level 1 --rpc <RPC> --key-file ~/.secrets/lattice/owner.hex --contract <ADDR>
+npm run lattice -- chain issuer register gov:ux:root --type government --pub-key-file ./gov-pub.pem --rpc <RPC> --key-file ~/.secrets/lattice/owner.hex --contract <ADDR>
+npm run lattice -- chain issuer permit gov:ux:root AgentCert --rpc <RPC> --key-file ~/.secrets/lattice/owner.hex --contract <ADDR>
+# Official governments host (owner key only):
+npm run lattice -- chain namespace register governments.lattice --owner-issuer gov:ux:root --rpc <RPC> --key-file ~/.secrets/lattice/owner.hex --contract <ADDR>
+# Public echo host (any wallet with gas):
+npm run lattice -- chain namespace register echo.lattice --owner-issuer gov:ux:root --rpc <RPC> --key-file ~/.secrets/lattice/user.hex --contract <ADDR>
+
+npm run lattice -- chain namespace hash governments.lattice
+npm run lattice -- chain namespace show governments.lattice --rpc <RPC> --contract <ADDR>
+npm run lattice -- chain reserved show governments --rpc <RPC> --contract <ADDR>
 ```
 
 ---

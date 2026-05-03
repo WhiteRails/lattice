@@ -6,13 +6,14 @@ pragma solidity ^0.8.19;
  * @dev Federated trust registry + transparency checkpoints + key lifecycle roots.
  *      On-chain stores hashes and lifecycle metadata only (never private keys).
  *
- *      Logical modules (single deployable unit for the MVP toolchain):
- *      — IssuerRegistry + CertType registry
- *      — NamespaceRegistry
- *      — KeyRegistry + RecoveryRegistry
- *      — RevocationRegistry (per-key events) + legacy Merkle revocation checkpoints
- *      — CheckpointRegistry (signed log roots)
- *      — GovernanceRegistry (subject freeze)
+ *      Governance: contract `owner` controls global registry + checkpoints.
+ *      Per-namespace: `namespaceAdmin` (domain owner) may change routing hashes
+ *      (`serviceCertHash`, `metadataHash`) and the DNS-level access policy
+ *      (`publicAccess`, `credentialMask`, `minAssuranceLevel`). Gateways MUST
+ *      enforce policy before forwarding to backends (see docs).
+ *
+ *      Namespaces: ASCII lowercase `*.lattice` (single label). Reserved official
+ *      slugs → only `owner` may register them initially.
  */
 contract LatticeChain {
     address public owner;
@@ -24,6 +25,10 @@ contract LatticeChain {
 
     constructor() {
         owner = msg.sender;
+        reservedOfficialLatticeSlugs[keccak256(bytes("governments"))] = true;
+        reservedOfficialLatticeSlugs[keccak256(bytes("lattice"))] = true;
+        reservedOfficialLatticeSlugs[keccak256(bytes("system"))] = true;
+        reservedOfficialLatticeSlugs[keccak256(bytes("registry"))] = true;
     }
 
     // --- IssuerRegistry + CertType ---
@@ -47,16 +52,34 @@ contract LatticeChain {
 
     // --- NamespaceRegistry ---
 
+    /**
+     * @dev `serviceCertHash` / `metadataHash` are opaque commitments (e.g. gateway URI,
+     *      cert binding, policy JSON hash). `namespaceAdmin` may update routing + policy.
+     * @dev `credentialMask` bits (OR semantics at gateway): 1=government-class,
+     *      2=enterprise-class, 4=model-provider-class. If `publicAccess`, mask ignored.
+     */
     struct NamespaceRecord {
         bytes32 nameHash;
         bytes32 ownerIssuerId;
         bytes32 serviceCertHash;
         bytes32 metadataHash;
         bool active;
+        address namespaceAdmin;
+        bool publicAccess;
+        uint8 credentialMask;
+        uint8 minAssuranceLevel;
     }
     mapping(bytes32 => NamespaceRecord) public namespaces;
 
-    // --- Merkle revocation checkpoints (bulk transparency) ---
+    /** keccak256(ascii lowercase slug) where slug is the label before `.lattice`. */
+    mapping(bytes32 => bool) public reservedOfficialLatticeSlugs;
+
+    /// Bit flags for `credentialMask` (accepted client *classes* — OR at verify time).
+    uint8 public constant CRED_GOVERNMENT = 1;
+    uint8 public constant CRED_ENTERPRISE = 2;
+    uint8 public constant CRED_MODEL = 4;
+
+    // --- Merkle revocation checkpoints ---
 
     struct RevocationCheckpoint {
         bytes32 issuerId;
@@ -66,7 +89,7 @@ contract LatticeChain {
     }
     mapping(bytes32 => RevocationCheckpoint[]) public revocationCheckpoints;
 
-    // --- CheckpointRegistry (signed batch / log roots) — used by node/chain.ts ---
+    // --- CheckpointRegistry ---
 
     struct Checkpoint {
         bytes32 batchId;
@@ -112,7 +135,7 @@ contract LatticeChain {
     mapping(bytes32 => RecoveryPolicy) public recoveryPolicies;
     mapping(bytes32 => bytes32[]) public recoveryKeyIds;
 
-    // --- RevocationRegistry (key lifecycle evidence) ---
+    // --- RevocationRegistry ---
 
     struct RevocationEvent {
         bytes32 targetKeyId;
@@ -124,7 +147,7 @@ contract LatticeChain {
 
     mapping(bytes32 => RevocationEvent[]) public keyRevocationEvents;
 
-    // --- GovernanceRegistry (emergency freeze) ---
+    // --- GovernanceRegistry ---
 
     struct SubjectFreeze {
         bool active;
@@ -137,16 +160,36 @@ contract LatticeChain {
 
     // --- Events ---
 
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
     event CertTypeRegistered(bytes32 indexed certTypeId, string name);
     event IssuerRegistered(bytes32 indexed issuerId, bytes32 issuerType, bytes32 publicKeyHash);
     event IssuerPermissionSet(bytes32 indexed issuerId, bytes32 indexed certTypeId, bool allowed);
-    event NamespaceRegistered(bytes32 indexed nameHash, bytes32 indexed ownerIssuerId);
+    event NamespaceRegistered(
+        bytes32 indexed nameHash,
+        bytes32 indexed ownerIssuerId,
+        string fqdn,
+        address namespaceAdmin,
+        bool publicAccess,
+        uint8 credentialMask,
+        uint8 minAssuranceLevel
+    );
+    event NamespaceServiceUpdated(bytes32 indexed nameHash, bytes32 serviceCertHash, bytes32 metadataHash);
+    event NamespacePolicyUpdated(bytes32 indexed nameHash, bool publicAccess, uint8 credentialMask, uint8 minAssuranceLevel);
+    event ReservedSlugUpdated(bytes32 indexed slugHash, bool reserved);
     event RevocationAnchored(bytes32 indexed issuerId, bytes32 merkleRoot);
     event CheckpointAnchored(bytes32 indexed batchId, bytes32 merkleRoot, uint64 actionCount);
-    event KeyUpserted(bytes32 indexed subjectId, bytes32 indexed keyId, KeyStatus status);
+    event KeyUpserted(bytes32 indexed subjectId, bytes32 keyId, KeyStatus status);
     event RecoveryPolicySet(bytes32 indexed subjectId, uint8 threshold, uint64 timelockSeconds);
-    event KeyRevocationEvent(bytes32 indexed subjectId, bytes32 indexed targetKeyId, bytes32 reasonCode);
+    event KeyRevocationEvent(bytes32 indexed subjectId, bytes32 targetKeyId, bytes32 reasonCode);
     event SubjectFreezeSet(bytes32 indexed subjectId, bool active);
+
+    // --- Ownership ---
+
+    function transferOwnership(address newOwner) external onlyOwner {
+        require(newOwner != address(0), "Zero owner");
+        emit OwnershipTransferred(owner, newOwner);
+        owner = newOwner;
+    }
 
     // --- Issuer / cert type ---
 
@@ -167,18 +210,92 @@ contract LatticeChain {
         emit IssuerPermissionSet(_issuerId, _certTypeId, _allowed);
     }
 
-    function registerNamespace(
-        bytes32 _nameHash,
-        bytes32 _ownerIssuerId,
-        bytes32 _serviceCertHash,
-        bytes32 _metadataHash
-    ) external {
-        require(issuers[_ownerIssuerId].active, "Issuer inactive");
-        namespaces[_nameHash] = NamespaceRecord(_nameHash, _ownerIssuerId, _serviceCertHash, _metadataHash, true);
-        emit NamespaceRegistered(_nameHash, _ownerIssuerId);
+    function setReservedOfficialSlug(string calldata slug, bool reserved) external onlyOwner {
+        bytes memory s = bytes(slug);
+        require(s.length > 0 && s.length <= 64, "Bad slug length");
+        for (uint i = 0; i < s.length; i++) {
+            require(s[i] != bytes1("."), "Slug must not contain dots");
+        }
+        bytes32 h = keccak256(s);
+        reservedOfficialLatticeSlugs[h] = reserved;
+        emit ReservedSlugUpdated(h, reserved);
     }
 
-    function anchorRevocation(bytes32 _issuerId, bytes32 _merkleRoot, uint64 _validFrom, uint64 _validTo) external {
+    /**
+     * @param _namespaceAdmin address(0) → defaults to `msg.sender`.
+     * @param _publicAccess if true, gateway treats namespace as open (no client cert class gate).
+     * @param _credentialMask OR of CRED_* bits when !publicAccess; 0 with !publicAccess = deny-all at gateway.
+     * @param _minAssuranceLevel minimum CertType.assuranceLevel on presented client cert (0 = no minimum).
+     */
+    function registerNamespace(
+        string calldata fqdn,
+        bytes32 _ownerIssuerId,
+        bytes32 _serviceCertHash,
+        bytes32 _metadataHash,
+        address _namespaceAdmin,
+        bool _publicAccess,
+        uint8 _credentialMask,
+        uint8 _minAssuranceLevel
+    ) external {
+        require(issuers[_ownerIssuerId].active, "Issuer inactive");
+        (bool ok, bytes32 nameHash, bytes32 slugHash) = _parseLatticeFqdn(fqdn);
+        require(ok, "Invalid lattice FQDN");
+        if (reservedOfficialLatticeSlugs[slugHash]) {
+            require(msg.sender == owner, "Reserved official namespace");
+        }
+        require(namespaces[nameHash].ownerIssuerId == bytes32(0), "Namespace taken");
+
+        address admin = _namespaceAdmin == address(0) ? msg.sender : _namespaceAdmin;
+
+        namespaces[nameHash] = NamespaceRecord({
+            nameHash: nameHash,
+            ownerIssuerId: _ownerIssuerId,
+            serviceCertHash: _serviceCertHash,
+            metadataHash: _metadataHash,
+            active: true,
+            namespaceAdmin: admin,
+            publicAccess: _publicAccess,
+            credentialMask: _credentialMask,
+            minAssuranceLevel: _minAssuranceLevel
+        });
+        emit NamespaceRegistered(nameHash, _ownerIssuerId, fqdn, admin, _publicAccess, _credentialMask, _minAssuranceLevel);
+    }
+
+    /// @notice Domain owner (`namespaceAdmin`) or contract owner may update routing / binding hashes.
+    function updateNamespaceServiceBinding(
+        string calldata fqdn,
+        bytes32 newServiceCertHash,
+        bytes32 newMetadataHash
+    ) external {
+        (bool ok, bytes32 nameHash, ) = _parseLatticeFqdn(fqdn);
+        require(ok, "Invalid lattice FQDN");
+        NamespaceRecord storage n = namespaces[nameHash];
+        require(n.ownerIssuerId != bytes32(0), "Unknown namespace");
+        require(msg.sender == n.namespaceAdmin || msg.sender == owner, "Not namespace admin");
+        n.serviceCertHash = newServiceCertHash;
+        n.metadataHash = newMetadataHash;
+        emit NamespaceServiceUpdated(nameHash, newServiceCertHash, newMetadataHash);
+    }
+
+    /// @notice Domain owner or contract owner may change DNS-level access policy (gateway-enforced).
+    function setNamespaceAccessPolicy(
+        string calldata fqdn,
+        bool publicAccess,
+        uint8 credentialMask,
+        uint8 minAssuranceLevel
+    ) external {
+        (bool ok, bytes32 nameHash, ) = _parseLatticeFqdn(fqdn);
+        require(ok, "Invalid lattice FQDN");
+        NamespaceRecord storage n = namespaces[nameHash];
+        require(n.ownerIssuerId != bytes32(0), "Unknown namespace");
+        require(msg.sender == n.namespaceAdmin || msg.sender == owner, "Not namespace admin");
+        n.publicAccess = publicAccess;
+        n.credentialMask = credentialMask;
+        n.minAssuranceLevel = minAssuranceLevel;
+        emit NamespacePolicyUpdated(nameHash, publicAccess, credentialMask, minAssuranceLevel);
+    }
+
+    function anchorRevocation(bytes32 _issuerId, bytes32 _merkleRoot, uint64 _validFrom, uint64 _validTo) external onlyOwner {
         require(issuers[_issuerId].active, "Issuer inactive");
         revocationCheckpoints[_issuerId].push(RevocationCheckpoint(_issuerId, _merkleRoot, _validFrom, _validTo));
         emit RevocationAnchored(_issuerId, _merkleRoot);
@@ -190,7 +307,7 @@ contract LatticeChain {
         uint64 fromTimestamp,
         uint64 toTimestamp,
         uint64 actionCount
-    ) external {
+    ) external onlyOwner {
         require(checkpoints[batchId].merkleRoot == bytes32(0), "Checkpoint exists");
         checkpoints[batchId] = Checkpoint({
             batchId: batchId,
@@ -202,8 +319,6 @@ contract LatticeChain {
         });
         emit CheckpointAnchored(batchId, merkleRoot, actionCount);
     }
-
-    // --- KeyRegistry ---
 
     function upsertKey(
         bytes32 subjectId,
@@ -218,8 +333,6 @@ contract LatticeChain {
         emit KeyUpserted(subjectId, keyId, status);
     }
 
-    // --- RecoveryRegistry ---
-
     function setRecoveryPolicy(
         bytes32 subjectId,
         uint8 threshold,
@@ -230,8 +343,6 @@ contract LatticeChain {
         recoveryKeyIds[subjectId] = keyIds;
         emit RecoveryPolicySet(subjectId, threshold, timelockSeconds);
     }
-
-    // --- RevocationRegistry ---
 
     function appendKeyRevocation(
         bytes32 subjectId,
@@ -247,8 +358,6 @@ contract LatticeChain {
         emit KeyRevocationEvent(subjectId, targetKeyId, reasonCode);
     }
 
-    // --- GovernanceRegistry ---
-
     function setSubjectFreeze(
         bytes32 subjectId,
         bool active,
@@ -258,5 +367,38 @@ contract LatticeChain {
     ) external onlyOwner {
         subjectFreezes[subjectId] = SubjectFreeze(active, blockNewCertIssuance, blockHighRiskActions, allowReadOnlyVerification);
         emit SubjectFreezeSet(subjectId, active);
+    }
+
+    function _parseLatticeFqdn(string memory fqdn)
+        internal
+        pure
+        returns (bool ok, bytes32 nameHash, bytes32 slugHash)
+    {
+        bytes memory b = bytes(fqdn);
+        if (b.length < 9) return (false, 0, 0);
+
+        bytes memory suffix = ".lattice";
+        for (uint i = 0; i < 8; i++) {
+            if (b[b.length - 8 + i] != suffix[i]) return (false, 0, 0);
+        }
+
+        uint prefixLen = b.length - 8;
+        if (prefixLen == 0) return (false, 0, 0);
+
+        for (uint j = 0; j < prefixLen; j++) {
+            uint8 c = uint8(b[j]);
+            bool isLower = c >= 97 && c <= 122;
+            bool isDigit = c >= 48 && c <= 57;
+            bool isHyphen = c == 45;
+            if (!isLower && !isDigit && !isHyphen) return (false, 0, 0);
+        }
+
+        bytes memory slug = new bytes(prefixLen);
+        for (uint k = 0; k < prefixLen; k++) {
+            slug[k] = b[k];
+        }
+        slugHash = keccak256(slug);
+        nameHash = keccak256(b);
+        return (true, nameHash, slugHash);
     }
 }

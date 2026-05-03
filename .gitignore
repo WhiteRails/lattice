@@ -1,3 +1,10 @@
 node_modules/
 dist/
 *.log
+.env
+.env.*
+*.pem
+*.key
+secrets/
+operator.key
+*.pkcs8
