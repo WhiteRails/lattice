@@ -1,0 +1,42 @@
+version: '3.8'
+
+services:
+  whitenetd:
+    build:
+      context: ..
+      dockerfile: testnet/Dockerfile
+    command: ["npm", "run", "whitenetd"]
+    ports:
+      - "7777:7777"
+    volumes:
+      - ~/.whitenet:/root/.whitenet
+    networks:
+      - whitenet-overlay
+
+  echo-service:
+    build:
+      context: ..
+      dockerfile: testnet/Dockerfile
+    command: ["npm", "run", "services:echo"]
+    networks:
+      - whitenet-overlay
+
+  github-service:
+    build:
+      context: ..
+      dockerfile: testnet/Dockerfile
+    command: ["npm", "run", "services:github"]
+    networks:
+      - whitenet-overlay
+
+  gmail-service:
+    build:
+      context: ..
+      dockerfile: testnet/Dockerfile
+    command: ["npm", "run", "services:gmail"]
+    networks:
+      - whitenet-overlay
+
+networks:
+  whitenet-overlay:
+    driver: bridge

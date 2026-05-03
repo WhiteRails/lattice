@@ -1,14 +1,18 @@
 import { AgentCert, CapabilityToken, DelegationGrant, IntentAnchor, SAAE, PASScore } from './types';
-import { isCertValid, verifySignature, signData } from './identity';
-import { createSAAEBase, hashObject, signSAAE } from './envelope';
+import { isCertValid, signData } from './identity';
+import { createSAAEBase, hashObject } from './envelope';
 import { RevocationNetwork } from './revocation';
 import { PowerAccumulationTracker } from './pas';
+import { WhitePolicy } from './policy';
+import { WhiteLog } from './log';
 import * as crypto from 'crypto';
 
 export class WhiteGateway {
   private registeredAgents: Map<string, AgentCert> = new Map();
   private revocationNetwork?: RevocationNetwork;
   private pasTracker?: PowerAccumulationTracker;
+  private policy?: WhitePolicy;
+  private log?: WhiteLog;
 
   constructor(public gatewayId: string, private gatewayPrivateKey: string) {}
 
@@ -18,6 +22,14 @@ export class WhiteGateway {
 
   setPASTracker(pas: PowerAccumulationTracker) {
     this.pasTracker = pas;
+  }
+
+  setPolicy(policy: WhitePolicy) {
+    this.policy = policy;
+  }
+
+  setLog(log: WhiteLog) {
+    this.log = log;
   }
 
   /**
@@ -39,6 +51,7 @@ export class WhiteGateway {
     delegation: DelegationGrant;
     intent: IntentAnchor;
     capability: CapabilityToken;
+    capability_class?: string;
     tool_id: string;
     action_type: string;
     action_parameters: any;
@@ -69,7 +82,22 @@ export class WhiteGateway {
       throw e;
     }
 
-    // 2. PAS check & update
+    // 2. Policy engine evaluation (preferred path when available)
+    if (this.policy && params.capability_class) {
+      const pasScore = this.pasTracker?.getScore(params.agent_id)?.score ?? 0;
+      const pd = this.policy.evaluate({
+        agent_id: params.agent_id,
+        tool_id: params.tool_id,
+        capability_class: params.capability_class,
+        pas_score: pasScore,
+      });
+      const safeDecisions = new Set(['allow', 'deny', 'require_human_approval']);
+      decision = safeDecisions.has(pd.decision)
+        ? (pd.decision as typeof decision)
+        : 'require_human_approval';
+    }
+
+    // 3. PAS check & update
     if (this.pasTracker && params.pas_updates) {
       const newScore = this.pasTracker.recordAction(params.agent_id, params.pas_updates);
       if (newScore.score > 100) {
@@ -123,6 +151,9 @@ export class WhiteGateway {
         gateway_signature: signData(unsignedStr, this.gatewayPrivateKey),
       }
     };
+
+    // Append to action log if configured
+    this.log?.append(finalEnvelope);
 
     return finalEnvelope;
   }

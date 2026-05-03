@@ -1,0 +1,67 @@
+const http = require('http');
+
+// Read HTTP_PROXY from environment
+const proxy = process.env.HTTP_PROXY;
+if (!proxy) {
+  console.error('Error: HTTP_PROXY environment variable is not set.');
+  console.error('This agent must be run inside the WhiteNet sandbox.');
+  process.exit(1);
+}
+
+console.log(`[Agent] Starting up. Using proxy: ${proxy}`);
+
+const proxyUrl = new URL(proxy);
+
+function makeRequest(targetUrl, method = 'GET') {
+  return new Promise((resolve, reject) => {
+    const target = new URL(targetUrl);
+    const options = {
+      hostname: proxyUrl.hostname,
+      port: proxyUrl.port,
+      path: targetUrl, // Proxy receives full URL in path
+      method: method,
+      headers: {
+        Host: target.host,
+        'x-whitenet-agent': process.env.WHITENET_AGENT
+      }
+    };
+
+    console.log(`\n[Agent] Trying to ${method} ${targetUrl} ...`);
+    const req = http.request(options, (res) => {
+      console.log(`[Agent] Response Status: ${res.statusCode}`);
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        try {
+          // Try to pretty-print if JSON
+          console.log(`[Agent] Response Body: ${JSON.stringify(JSON.parse(data), null, 2)}`);
+        } catch {
+          console.log(`[Agent] Response Body: ${data.slice(0, 200)}...`);
+        }
+        resolve();
+      });
+    });
+
+    req.on('error', (err) => {
+      console.error(`[Agent] Request failed: ${err.message}`);
+      resolve(); // resolve anyway so we can continue demo
+    });
+
+    req.end();
+  });
+}
+
+async function main() {
+  // 1. Try an allowed resource
+  await makeRequest('http://echo.white/echo.ping?foo=bar');
+
+  // 2. Try an external internet resource (should be blocked by default policy)
+  await makeRequest('http://example.com');
+  
+  // 3. Try GitHub allowed endpoint
+  await makeRequest('http://github.white/repo.read?repo=acme/core');
+
+  console.log('\n[Agent] Finished tasks.');
+}
+
+main();

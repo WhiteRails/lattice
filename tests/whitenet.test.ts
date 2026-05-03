@@ -1,17 +1,19 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { generateKeyPair, createAgentCert } from '../src/identity';
-import { WhiteGateway } from '../src/gateway';
-import { WhiteRegistry } from '../src/registry';
-import { RevocationNetwork } from '../src/revocation';
-import { PowerAccumulationTracker } from '../src/pas';
-import { hashObject } from '../src/envelope';
-import { DelegationGrant, IntentAnchor, CapabilityToken } from '../src/types';
+import { generateKeyPair, createAgentCert } from '../core/identity';
+import { WhiteGateway } from '../core/gateway';
+import { WhiteRegistry } from '../core/registry';
+import { RevocationNetwork } from '../core/revocation';
+import { PowerAccumulationTracker } from '../core/pas';
+import { WhiteLog } from '../core/log';
+import { hashObject } from '../core/envelope';
+import { DelegationGrant, IntentAnchor, CapabilityToken } from '../core/types';
 
 describe('WhiteNet MVP Flow', () => {
   let gateway: WhiteGateway;
   let registry: WhiteRegistry;
   let revocation: RevocationNetwork;
   let pasTracker: PowerAccumulationTracker;
+  let log: WhiteLog;
   let gatewayKeys: any;
   let agentKeys: any;
   let agentCert: any;
@@ -20,8 +22,11 @@ describe('WhiteNet MVP Flow', () => {
     gatewayKeys = generateKeyPair();
     agentKeys = generateKeyPair();
 
+    const logKeys = generateKeyPair();
+    log = new WhiteLog('test-log', logKeys.privateKey);
+
     gateway = new WhiteGateway('gw-1', gatewayKeys.privateKey);
-    registry = new WhiteRegistry();
+    registry = new WhiteRegistry('test-registry', log);
     revocation = new RevocationNetwork();
     pasTracker = new PowerAccumulationTracker();
 
@@ -127,16 +132,18 @@ describe('WhiteNet MVP Flow', () => {
     expect(saae.policy.decision).toBe('require_human_approval');
   });
 
-  it('resolves WhiteNet addresses through registry', () => {
-    const address = registry.register({
-      certificate: agentCert,
-      certificate_chain: [],
-      accepted_capabilities: ['email'],
-      protecting_gateways: ['gw-1'],
+  it('resolves WhiteNet names through registry', () => {
+    const name = registry.register({
+      name: 'agent-1.test.white',
+      public_key: agentCert.public_key,
+      service_cert: agentCert.id,
+      gateway_endpoints: ['quic://gw-1:4433'],
+      issuer: 'org-1-ca',
+      accepted_agent_issuers: ['org-1-ca'],
     });
 
-    expect(address).toContain('.white');
-    const record = registry.resolve(address);
+    expect(name).toBe('agent-1.test.white');
+    const record = registry.resolve(name);
     expect(record?.public_key).toBe(agentCert.public_key);
   });
 });

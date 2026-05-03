@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { generateKeyPair, createAgentCert, isCertValid, signData, verifySignature } from '../src/identity';
+import { generateKeyPair, createAgentCert, isCertValid, signData, verifySignature } from '../core/identity';
 
 describe('Identity Layer', () => {
   it('should generate a valid key pair', () => {

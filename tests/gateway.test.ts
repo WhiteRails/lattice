@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
-import { WhiteGateway } from '../src/gateway';
-import { generateKeyPair, createAgentCert } from '../src/identity';
-import { DelegationGrant, IntentAnchor, CapabilityToken } from '../src/types';
+import { WhiteGateway } from '../core/gateway';
+import { generateKeyPair, createAgentCert } from '../core/identity';
+import { DelegationGrant, IntentAnchor, CapabilityToken } from '../core/types';
 
 describe('White Gateway', () => {
   it('should mediate a tool call and produce a signed SAAE', async () => {
