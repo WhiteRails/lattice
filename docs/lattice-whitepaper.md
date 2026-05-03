@@ -1,4 +1,4 @@
-# WhiteNet
+# Lattice
 
 **A Certified Overlay Network for Autonomous AI Agents**
 
@@ -12,14 +12,14 @@ Date: May 2026
 
 The internet was designed for humans, servers, applications, and open connectivity. It was not designed for autonomous artificial agents capable of planning, invoking tools, chaining APIs, acquiring resources, writing code, moving money, contacting people, deploying infrastructure, or accumulating operational power at machine speed.
 
-WhiteNet proposes a new overlay network for AI agents.
+Lattice proposes a new overlay network for AI agents.
 
-It is structurally inspired by Tor-like networks: separate addressing, overlay routing, cryptographic service identity, and location-independent services. But WhiteNet has the opposite purpose.
+It is structurally inspired by Tor-like networks: separate addressing, overlay routing, cryptographic service identity, and location-independent services. But Lattice has the opposite purpose.
 
 > Tor protects anonymity.  
-> WhiteNet protects accountable agency.
+> Lattice protects accountable agency.
 
-WhiteNet is not a "dark web for AI." It is a certified operational network where autonomous agents can communicate with services only through cryptographic identity, delegated capabilities, signed action envelopes, policy gates, privacy-preserving logs, and revocation.
+Lattice is not a "dark web for AI." It is a certified operational network where autonomous agents can communicate with services only through cryptographic identity, delegated capabilities, signed action envelopes, policy gates, privacy-preserving logs, and revocation.
 
 The goal is not to make every AI thought visible. The goal is to prevent autonomous AI agents from turning intelligence into external operational power without identity, limits, traceability, and the ability to cut them off.
 
@@ -35,7 +35,7 @@ The dangerous part is:
 intelligence + tools + credentials + scale + persistence + no accountability
 ```
 
-WhiteNet exists to break that chain.
+Lattice exists to break that chain.
 
 Current internet:
 
@@ -43,7 +43,7 @@ Current internet:
 agent/script/app -> public API -> real-world effect
 ```
 
-WhiteNet:
+Lattice:
 
 ```
 agent -> certified overlay -> gateway -> policy -> signed action -> audited effect
@@ -74,7 +74,7 @@ Because the normal internet cannot reliably distinguish:
 
 A separate overlay network gives us a cleaner boundary:
 
-> If you are an AI agent performing autonomous actions, you enter through WhiteNet.
+> If you are an AI agent performing autonomous actions, you enter through Lattice.
 
 This allows services to enforce:
 
@@ -84,17 +84,17 @@ This allows services to enforce:
 - No signed envelope, no effect.
 - No revocation check, no trust.
 
-WhiteNet creates a new default:
+Lattice creates a new default:
 
 > Autonomous action is not accepted as ordinary traffic.
 
 ---
 
-## 3. WhiteNet vs Tor
+## 3. Lattice vs Tor
 
-WhiteNet borrows structural ideas from Tor-like systems, but reverses the purpose.
+Lattice borrows structural ideas from Tor-like systems, but reverses the purpose.
 
-| Tor | WhiteNet |
+| Tor | Lattice |
 |-----|----------|
 | Hide user identity | Certify agent identity |
 | Hide service location | Protect private payloads |
@@ -106,14 +106,14 @@ The difference:
 
 ```
 Tor:      "You cannot know who acted."
-WhiteNet: "You can verify what certified agent acted,
+Lattice: "You can verify what certified agent acted,
            under whose authority,
            with what capability,
            while preserving private content."
 ```
 
-WhiteNet may hide physical location.  
-WhiteNet must **not** hide operational responsibility.
+Lattice may hide physical location.  
+Lattice must **not** hide operational responsibility.
 
 ---
 
@@ -121,7 +121,7 @@ WhiteNet must **not** hide operational responsibility.
 
 ### 4.1 Certified Actors Only
 
-Every node participating in WhiteNet must have a certificate.
+Every node participating in Lattice must have a certificate.
 
 Certificate types:
 
@@ -147,7 +147,7 @@ Relays should not see private content.
 
 But actions must still be attributable.
 
-WhiteNet separates:
+Lattice separates:
 
 ```
 network privacy
@@ -169,7 +169,7 @@ operational accountability
 
 In normal networks, connectivity comes first.
 
-In WhiteNet, capability comes first.
+In Lattice, capability comes first.
 
 An agent cannot merely "connect" and then act. It must present:
 
@@ -204,7 +204,7 @@ A network for AI agents without revocation is useless.
 
 ### 4.5 Open Protocol, Federated Trust
 
-WhiteNet must not be owned by one company.
+Lattice must not be owned by one company.
 
 Correct model:
 
@@ -216,8 +216,8 @@ Correct model:
 - public test suites
 - neutral governance
 
-A company may build WhiteNet infrastructure.  
-No company should own WhiteNet.
+A company may build Lattice infrastructure.  
+No company should own Lattice.
 
 ---
 
@@ -247,12 +247,12 @@ No company should own WhiteNet.
 [Action Log + Evidence Store + Revocation Layer]
 ```
 
-WhiteNet is composed of:
+Lattice is composed of:
 
 1. White Addressing
 2. White Nodes
 3. White Relays
-4. White Gateways
+4. Lattice Gateways
 5. White Services
 6. White Registry
 7. White Certificate Authorities
@@ -264,30 +264,30 @@ WhiteNet is composed of:
 
 ## 6. White Addressing
 
-WhiteNet services use cryptographic addresses.
+Lattice services use cryptographic addresses.
 
 Examples:
 
 ```
-wp://github-gateway.ab72k.white
-wp://stripe-proxy.91fa.white
-wp://cloud-registry.00ac.white
-wp://agent-market.331k.white
+lp://github-gateway.ab72k.lattice
+lp://stripe-proxy.91fa.lattice
+lp://cloud-registry.00ac.lattice
+lp://agent-market.331k.lattice
 ```
 
 The address is derived from a public key:
 
 ```
-public_key -> hash -> base32 -> .white address
+public_key -> hash -> base32 -> .lattice address
 ```
 
 Simplified formula:
 
 ```
-white_address = base32(blake3(public_key))[0:32] + ".white"
+white_address = base32(blake3(public_key))[0:32] + ".lattice"
 ```
 
-This gives WhiteNet **self-authenticating addresses**.
+This gives Lattice **self-authenticating addresses**.
 
 The address itself proves the expected service key.
 
@@ -306,13 +306,13 @@ Must present:
 - `DelegationGrant`
 - `CapabilityToken`
 
-An Agent Node may not directly access high-risk external services. It must go through a White Gateway.
+An Agent Node may not directly access high-risk external services. It must go through a Lattice Gateway.
 
 ---
 
 ### 7.2 Entry Node
 
-First WhiteNet node contacted by an agent.
+First Lattice node contacted by an agent.
 
 Responsibilities:
 
@@ -366,17 +366,17 @@ The gateway is the **actuator firewall**.
 
 ### 7.5 Service Node
 
-A certified service exposed through WhiteNet.
+A certified service exposed through Lattice.
 
 Examples:
 
 ```
-wp://gmail.white
-wp://github.white
-wp://stripe.white
-wp://cloudflare.white
-wp://gcp.white
-wp://banking.white
+lp://gmail.lattice
+lp://github.lattice
+lp://stripe.lattice
+lp://cloudflare.lattice
+lp://gcp.lattice
+lp://banking.lattice
 ```
 
 In early versions, these may be proxies around existing APIs.
@@ -385,11 +385,11 @@ In early versions, these may be proxies around existing APIs.
 
 ### 7.6 Registry Node
 
-Resolves WhiteNet identities.
+Resolves Lattice identities.
 
 Answers:
 
-- What is this `.white` address?
+- What is this `.lattice` address?
 - What public key does it map to?
 - What certificate chain does it use?
 - Who issued it?
@@ -431,7 +431,7 @@ Purpose:
 
 ---
 
-## 8. WhiteNet Request Lifecycle
+## 8. Lattice Request Lifecycle
 
 Example: an agent wants to draft and send an email.
 
@@ -442,7 +442,7 @@ Example: an agent wants to draft and send an email.
   "agent_id": "agent:acme:support-agent:v1",
   "intent": "reply_to_customer_ticket",
   "capability": "email:draft",
-  "target_service": "wp://gmail-gateway.7fa2.white",
+  "target_service": "lp://gmail-gateway.7fa2.lattice",
   "request_hash": "sha256:..."
 }
 ```
@@ -461,7 +461,7 @@ Checks:
 
 ### Step 3: Overlay routing
 
-The request travels through WhiteNet.
+The request travels through Lattice.
 
 Payload remains encrypted. Relays know only what they need to route.
 
@@ -509,7 +509,7 @@ Gateway emits an action envelope:
 
 ```json
 {
-  "schema": "whitenet.action.v0.1",
+  "schema": "lattice.action.v0.1",
   "action_id": "act_001",
   "timestamp": "2026-05-02T18:12:00Z",
   "agent": {
@@ -522,7 +522,7 @@ Gateway emits an action envelope:
     "intent_hash": "sha256:..."
   },
   "service": {
-    "address": "wp://gmail-gateway.7fa2.white",
+    "address": "lp://gmail-gateway.7fa2.lattice",
     "service_cert_hash": "sha256:..."
   },
   "tool": {
@@ -569,7 +569,7 @@ Action envelope is added to an append-only log. Periodic Merkle root is publishe
 
 ## 9. Capability Firewall
 
-WhiteNet is not just a routing network.
+Lattice is not just a routing network.
 
 It must include an enforcement layer: the **Capability Firewall**.
 
@@ -616,7 +616,7 @@ Its purpose is to **constrain action**.
 
 ## 10. Power Accumulation Score
 
-WhiteNet tracks dangerous sequences.
+Lattice tracks dangerous sequences.
 
 A single action may look safe. A sequence may not.
 
@@ -634,7 +634,7 @@ hire freelancers
 spawn more agents
 ```
 
-WhiteNet assigns a **Power Accumulation Score (PAS)**.
+Lattice assigns a **Power Accumulation Score (PAS)**.
 
 PAS factors:
 
@@ -675,7 +675,7 @@ to:
 
 ## 11. Privacy Model
 
-WhiteNet must not become a surveillance network.
+Lattice must not become a surveillance network.
 
 **Public layer:**
 
@@ -726,7 +726,7 @@ No universal government database.
 
 ## 12. Revocation Network
 
-WhiteNet needs fast revocation.
+Lattice needs fast revocation.
 
 Revocation applies to:
 
@@ -744,7 +744,7 @@ Example revocation record:
 
 ```json
 {
-  "schema": "whitenet.revocation.v0.1",
+  "schema": "lattice.revocation.v0.1",
   "target_type": "AgentCert",
   "target_hash": "sha256:...",
   "revoked_by": "org:acme",
@@ -778,7 +778,7 @@ optional root -> external anchor
 
 Blockchain can be used only as an optional notary, not as the database.
 
-WhiteNet's scalable integrity layer:
+Lattice's scalable integrity layer:
 
 - Hash chains
 - Merkle batching
@@ -788,9 +788,9 @@ WhiteNet's scalable integrity layer:
 
 ---
 
-## 14. WhiteNet Overlay Routing
+## 14. Lattice Overlay Routing
 
-WhiteNet can evolve in stages.
+Lattice can evolve in stages.
 
 ### v0: Simulated Network
 
@@ -838,10 +838,10 @@ Purpose: Tor-like network structure, without anonymous agent action.
 
 ## 15. Why Not Fork Tor?
 
-Because Tor's design goal fights WhiteNet's design goal.
+Because Tor's design goal fights Lattice's design goal.
 
 Tor is built for anonymity.  
-WhiteNet is built for accountable autonomy.
+Lattice is built for accountable autonomy.
 
 Forking Tor would force the system to fight its own foundation.
 
@@ -860,7 +860,7 @@ Forking Tor would force the system to fight its own foundation.
 - Anti-attribution defaults
 - Lack of capability governance
 
-**Build WhiteNet with modern primitives:**
+**Build Lattice with modern primitives:**
 
 - Rust or Go
 - QUIC
@@ -876,33 +876,33 @@ Forking Tor would force the system to fight its own foundation.
 
 ## 16. Enforcement Requirement
 
-WhiteNet works only if important services enforce it.
+Lattice works only if important services enforce it.
 
 A separate network is not enough.
 
 Critical services must eventually say:
 
-> If you are an autonomous agent, you cannot use ordinary credentials for high-impact actions. You must enter through WhiteNet.
+> If you are an autonomous agent, you cannot use ordinary credentials for high-impact actions. You must enter through Lattice.
 
 Examples:
 
 | Service | Requirement |
 |---------|-------------|
-| GitHub | Code merge by agent requires WhiteNet envelope |
+| GitHub | Code merge by agent requires Lattice envelope |
 | Stripe | Payment/invoice actions by agent require `AgentCert` |
 | Cloudflare | DNS modification by agent requires capability grant |
 | AWS/GCP | IAM and compute provisioning require runtime and agent identity |
 | Gmail | Mass outbound agent email requires human approval and traceable envelope |
 | Banks | Transfer execution requires high-assurance delegation |
 
-Without enforcement, WhiteNet is optional.  
-With enforcement, WhiteNet becomes an accountability layer.
+Without enforcement, Lattice is optional.  
+With enforcement, Lattice becomes an accountability layer.
 
 ---
 
 ## 17. Governance
 
-WhiteNet must be open.
+Lattice must be open.
 
 Required governance:
 
@@ -982,14 +982,14 @@ That is enough for v0.
 ## 19. Suggested Repository Structure
 
 ```
-whitenet/
+lattice/
   specs/
-    whitenet-addressing.md
-    whitenet-node-cert.md
-    whitenet-routing.md
-    whitenet-action-envelope.md
-    whitenet-revocation.md
-    whitenet-policy.md
+    lattice-addressing.md
+    lattice-node-cert.md
+    lattice-routing.md
+    lattice-action-envelope.md
+    lattice-revocation.md
+    lattice-policy.md
   crates/
     white-ca/
     white-registry/
@@ -1016,7 +1016,7 @@ whitenet/
 
 ## 20. First Technical Milestone
 
-Build **WhiteNet Local Testnet v0**.
+Build **Lattice Local Testnet v0**.
 
 It should include:
 
@@ -1045,23 +1045,23 @@ white-agent call again -> blocked
 
 ---
 
-## 21. WhiteNet and White Protocol
+## 21. Lattice and White Protocol
 
 Important distinction:
 
 | | |
 |-|-|
 | **White Protocol** | The standard for identity, delegation, signed actions, evidence, revocation. |
-| **WhiteNet** | The overlay network where agents and certified services communicate using White Protocol. |
+| **Lattice** | The overlay network where agents and certified services communicate using White Protocol. |
 
-White Protocol can run without WhiteNet.  
-WhiteNet cannot work without White Protocol.
+White Protocol can run without Lattice.  
+Lattice cannot work without White Protocol.
 
 ---
 
 ## 22. Risk and Limitations
 
-**WhiteNet does not solve:**
+**Lattice does not solve:**
 
 - AI alignment
 - Superintelligence containment
@@ -1073,7 +1073,7 @@ WhiteNet cannot work without White Protocol.
 - Malicious governments
 - Physical coercion
 
-**WhiteNet does reduce:**
+**Lattice does reduce:**
 
 - Anonymous autonomous digital action
 - Unbounded agent tool use
@@ -1086,7 +1086,7 @@ WhiteNet cannot work without White Protocol.
 
 **Honest claim:**
 
-> WhiteNet reduces the ability of AI agents to gain operational power through compliant digital systems without accountability.
+> Lattice reduces the ability of AI agents to gain operational power through compliant digital systems without accountability.
 
 That is strong enough. Do not overclaim.
 
@@ -1094,7 +1094,7 @@ That is strong enough. Do not overclaim.
 
 ## 23. One-Sentence Definition
 
-> WhiteNet is a Tor-like overlay network for AI agents, but inverted: private in transport, accountable in action, restricted by capability, and revocable by design.
+> Lattice is a Tor-like overlay network for AI agents, but inverted: private in transport, accountable in action, restricted by capability, and revocable by design.
 
 ---
 
@@ -1102,7 +1102,7 @@ That is strong enough. Do not overclaim.
 
 The internet needs a separate trust layer for non-human actors.
 
-WhiteNet gives AI agents their own certified network, where every meaningful action requires identity, delegated permission, policy enforcement, signed provenance, privacy-preserving audit, and revocation.
+Lattice gives AI agents their own certified network, where every meaningful action requires identity, delegated permission, policy enforcement, signed provenance, privacy-preserving audit, and revocation.
 
 It is not a dark web.  
 It is an **accountable web for autonomous intelligence**.
@@ -1115,7 +1115,7 @@ The old internet asks:
 
 > Can this client connect?
 
-WhiteNet asks:
+Lattice asks:
 
 > Who is this agent?  
 > Who authorized it?  
@@ -1127,10 +1127,10 @@ WhiteNet asks:
 
 That is the difference.
 
-WhiteNet is not about blocking intelligence.  
+Lattice is not about blocking intelligence.  
 It is about governing agency.
 
 The future risk is not that AI thinks.  
 The risk is that AI acts with no boundary.
 
-**WhiteNet is the boundary.**
+**Lattice is the boundary.**

@@ -1,5 +1,5 @@
 /**
- * WhiteNet Local Testnet Demo v0
+ * Lattice Local Testnet Demo v0
  *
  * Implements the full flow from whitepaper §20:
  *
@@ -17,13 +17,13 @@
  * Run with: npx ts-node examples/testnet-demo.ts
  */
 
-import { WhiteCA } from '../core/ca';
-import { WhiteGateway } from '../core/gateway';
-import { WhiteRegistry } from '../core/registry';
+import { LatticeCA } from '../core/ca';
+import { LatticeGateway } from '../core/gateway';
+import { LatticeRegistry } from '../core/registry';
 import { RevocationNetwork } from '../core/revocation';
 import { PowerAccumulationTracker } from '../core/pas';
 import { WhitePolicy } from '../core/policy';
-import { WhiteLog } from '../core/log';
+import { LatticeLog } from '../core/log';
 import { generateKeyPair } from '../core/identity';
 import { hashObject } from '../core/envelope';
 import { DelegationGrant, IntentAnchor, CapabilityToken } from '../core/types';
@@ -47,13 +47,13 @@ function info(msg: string) { console.log(`  ${dim(msg)}`); }
 
 async function run() {
   console.log(bold('\n╔══════════════════════════════════════════╗'));
-  console.log(bold('║   WhiteNet Local Testnet v0              ║'));
+  console.log(bold('║   Lattice Local Testnet v0              ║'));
   console.log(bold('╚══════════════════════════════════════════╝'));
 
   // ── Step 1: Spin up CA ───────────────────────────────────────────────────
   step(1, 'white-ca issue-org / issue-agent / issue-service');
 
-  const ca = new WhiteCA('ca.whitenet.local');
+  const ca = new LatticeCA('ca.lattice.local');
   info(`CA created: ${ca.id}`);
 
   const orgCert = ca.issueOrgCert({ org_id: 'org:acme', expires_in_days: 365 });
@@ -78,16 +78,16 @@ async function run() {
   const gatewaySigned = ca.issueGatewayCert({ gateway_id: 'gw:acme:primary' });
   ok(`GatewayCert issued → ${gatewaySigned.cert.id}`);
 
-  // ── Step 1.5: WhiteLog ───────────────────────────────────────────────────
+  // ── Step 1.5: LatticeLog ───────────────────────────────────────────────────
   const logKeys = generateKeyPair();
-  const log = new WhiteLog('log.whitenet.local', logKeys.privateKey);
+  const log = new LatticeLog('log.lattice.local', logKeys.privateKey);
 
   // ── Step 2: Registry ──────────────────────────────────────────────────────
   step(2, 'white-registry register (Federated)');
 
-  const registry = new WhiteRegistry('registry.whitenet.local', log);
+  const registry = new LatticeRegistry('registry.lattice.local', log);
   const agentName = registry.register({
-    name: 'support-agent.acme.white',
+    name: 'support-agent.acme.lattice',
     public_key: agentKeys.publicKey,
     service_cert: agentSigned.cert.id,
     gateway_endpoints: ['quic://gateway.acme.internal:4433'],
@@ -97,10 +97,10 @@ async function run() {
   });
 
   const svcName = registry.register({
-    name: 'gmail-gateway.cloud.white',
+    name: 'gmail-gateway.cloud.lattice',
     public_key: generateKeyPair().publicKey,
     service_cert: serviceCert.cert.id,
-    gateway_endpoints: ['quic://gmail.gateway.white:4433'],
+    gateway_endpoints: ['quic://gmail.gateway.lattice:4433'],
     issuer: ca.id,
     accepted_agent_issuers: [orgCert.cert.id],
   });
@@ -109,8 +109,8 @@ async function run() {
   ok(`Service registered → ${svcName}`);
 
   // Test transparency log key rotation
-  registry.rotateKey('gmail-gateway.cloud.white', generateKeyPair().publicKey);
-  ok('Key rotated for gmail-gateway.cloud.white (Transparency event logged)');
+  registry.rotateKey('gmail-gateway.cloud.lattice', generateKeyPair().publicKey);
+  ok('Key rotated for gmail-gateway.cloud.lattice (Transparency event logged)');
 
   // ── Step 3: Policy grants ─────────────────────────────────────────────────
   step(3, 'white-policy grant capability');
@@ -134,7 +134,7 @@ async function run() {
   const revocation = new RevocationNetwork();
   const pasTracker = new PowerAccumulationTracker();
   const gatewayKeys = generateKeyPair();
-  const gateway = new WhiteGateway('gw:acme:primary', gatewayKeys.privateKey);
+  const gateway = new LatticeGateway('gw:acme:primary', gatewayKeys.privateKey);
   gateway.setRevocationNetwork(revocation);
   gateway.setPASTracker(pasTracker);
   gateway.setPolicy(policy);

@@ -10,10 +10,10 @@ export class RelayNode {
   // Fake Federated Registry for the testnet
   // Maps destination -> Gateway WS URL
   private registry: Record<string, string> = {
-    'wp://echo.white': 'ws://127.0.0.1:8889',
-    'wp://github.white': 'ws://127.0.0.1:8890',
-    'wp://gmail.white': 'ws://127.0.0.1:8891',
-    'wp://browser.white': 'ws://127.0.0.1:8892',
+    'lp://echo.lattice': 'ws://127.0.0.1:8889',
+    'lp://github.lattice': 'ws://127.0.0.1:8890',
+    'lp://gmail.lattice': 'ws://127.0.0.1:8891',
+    'lp://browser.lattice': 'ws://127.0.0.1:8892',
   };
 
   constructor(port = DEFAULT_RELAY_PORT) {

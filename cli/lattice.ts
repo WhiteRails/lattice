@@ -1,9 +1,9 @@
 #!/usr/bin/env ts-node
 /**
- * cmd/whitenet.ts — The whitenet CLI
+ * cmd/lattice.ts — The lattice CLI
  *
- * Usage: npx ts-node cmd/whitenet.ts <command> [options]
- * Or via npm:  npm run whitenet -- <command>
+ * Usage: npx ts-node cmd/lattice.ts <command> [options]
+ * Or via npm:  npm run lattice -- <command>
  */
 import { Command } from 'commander';
 import chalk from 'chalk';
@@ -14,7 +14,7 @@ import {
   saveAgent, loadAgent, agentExists, listAgents,
   saveService, loadService, serviceExists, listServices,
   saveRevocation, isRevoked, listRevocations,
-  tailLog, logPath, WHITENET_DIR,
+  tailLog, logPath, LATTICE_DIR,
 } from '../node/state';
 import { PolicyLoader } from '../node/policy-loader';
 import { ping }         from '../node/ping';
@@ -23,17 +23,17 @@ import { EntryNode, DEFAULT_ENTRY_PORT } from '../node/entry';
 import { RelayNode, DEFAULT_RELAY_PORT } from '../node/relay';
 import { ServiceGateway } from '../node/gateway';
 import { createBatch, generateProof } from '../node/batch';
-import { deployWhiteChain, submitCheckpoint, verifyCheckpointOnChain } from '../node/chain';
-import { WhiteCA }         from '../core/ca';
+import { deployLatticeChain, submitCheckpoint, verifyCheckpointOnChain } from '../node/chain';
+import { LatticeCA }         from '../core/ca';
 import { generateKeyPair } from '../core/identity';
 
 const program = new Command();
-program.name('whitenet').description('Certified overlay network for autonomous AI agents').version('0.1.0');
+program.name('lattice').description('Certified overlay network for autonomous AI agents').version('0.1.0');
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 function requireInit() {
   if (!isInitialized()) {
-    console.error(chalk.red('Not initialized. Run: whitenet init'));
+    console.error(chalk.red('Not initialized. Run: lattice init'));
     process.exit(1);
   }
 }
@@ -41,19 +41,19 @@ function ok(msg: string) { console.log(`${chalk.green('✓')} ${msg}`); }
 function err(msg: string) { console.error(`${chalk.red('✗')} ${msg}`); process.exit(1); }
 
 // ── init ────────────────────────────────────────────────────────────────────
-program.command('init').description('Initialize WhiteNet (~/.whitenet)').action(() => {
+program.command('init').description('Initialize Lattice (~/.lattice)').action(() => {
   if (isInitialized()) { console.log(chalk.yellow('Already initialized.')); return; }
   initDirs();
-  const ca = new WhiteCA('ca.local');
+  const ca = new LatticeCA('ca.local');
   saveCA({ caId: ca.id, publicKey: ca.publicKey, createdAt: new Date().toISOString() });
-  ok(`WhiteNet initialized at ${chalk.cyan(WHITENET_DIR)}`);
+  ok(`Lattice initialized at ${chalk.cyan(LATTICE_DIR)}`);
   ok('Local CA created: ca.local');
   console.log(chalk.dim('\nNext steps:'));
-  ['whitenet agent create bot1',
-   'whitenet service add echo --url http://localhost:9001',
-   'whitenet grant bot1 wp://echo.white echo.ping',
-   'whitenet gateway start',
-   'whitenet run --agent bot1 -- node agent.js',
+  ['lattice agent create bot1',
+   'lattice service add echo --url http://localhost:9001',
+   'lattice grant bot1 lp://echo.lattice echo.ping',
+   'lattice gateway start',
+   'lattice run --agent bot1 -- node agent.js',
   ].forEach(s => console.log('  ' + chalk.dim(s)));
 });
 
@@ -67,7 +67,7 @@ agent.command('create <name>').description('Create an agent with a certificate')
     requireInit();
     if (agentExists(name)) err(`Agent '${name}' already exists`);
     const keys = generateKeyPair();
-    const ca = new WhiteCA('ca.local');
+    const ca = new LatticeCA('ca.local');
     const signed = ca.issueAgentCert({
       agent_id: `agent:local:${name}`, owner_org: opts.org, agent_type: opts.type,
       version: '1.0', public_key: keys.publicKey,
@@ -90,7 +90,7 @@ agent.command('revoke <name>').description('Revoke an agent').action((name) => {
 agent.command('list').description('List agents').action(() => {
   requireInit();
   const agents = listAgents();
-  if (!agents.length) { console.log(chalk.dim('No agents. Run: whitenet agent create <name>')); return; }
+  if (!agents.length) { console.log(chalk.dim('No agents. Run: lattice agent create <name>')); return; }
   const revoked = listRevocations();
   console.log(chalk.bold('Agents:'));
   for (const n of agents) {
@@ -114,19 +114,19 @@ program.command('cert inspect <name>').description('Show agent certificate').act
 // ── service ──────────────────────────────────────────────────────────────────
 const svc = program.command('service').description('Manage services');
 
-svc.command('add <name>').description('Register a wp://<name>.white service')
+svc.command('add <name>').description('Register a lp://<name>.lattice service')
   .requiredOption('--url <url>', 'Backend URL')
   .option('--policy <profile>', 'Policy profile', 'default')
   .action((name, opts) => {
     requireInit();
-    saveService(name, { name, address: `wp://${name}.white`, url: opts.url, policy_profile: opts.policy, registeredAt: new Date().toISOString() });
-    ok(`Service '${chalk.cyan(`wp://${name}.white`)}' → ${opts.url}`);
+    saveService(name, { name, address: `lp://${name}.lattice`, url: opts.url, policy_profile: opts.policy, registeredAt: new Date().toISOString() });
+    ok(`Service '${chalk.cyan(`lp://${name}.lattice`)}' → ${opts.url}`);
   });
 
 svc.command('list').description('List registered services').action(() => {
   requireInit();
   const services = listServices();
-  if (!services.length) { console.log(chalk.dim('No services. Run: whitenet service add <name> --url <url>')); return; }
+  if (!services.length) { console.log(chalk.dim('No services. Run: lattice service add <name> --url <url>')); return; }
   console.log(chalk.bold('Services:'));
   for (const n of services) {
     const s = loadService(n);
@@ -135,9 +135,9 @@ svc.command('list').description('List registered services').action(() => {
 });
 
 // ── resolve ──────────────────────────────────────────────────────────────────
-program.command('resolve <address>').description('Resolve a wp:// address').action((address) => {
+program.command('resolve <address>').description('Resolve a lp:// address').action((address) => {
   requireInit();
-  const name = address.replace('wp://', '').replace('.white', '');
+  const name = address.replace('lp://', '').replace('.lattice', '');
   if (!serviceExists(name)) err(`Service '${address}' not found`);
   const s = loadService(name);
   console.log(chalk.bold(`Resolved: ${address}`));
@@ -171,12 +171,12 @@ pol.command('inspect <agent>').description('Show agent policy').action((agentNam
 });
 
 // ── gateway ──────────────────────────────────────────────────────────────────
-const nodeCmd = program.command('node').description('Manage WhiteNet Overlay Nodes');
+const nodeCmd = program.command('node').description('Manage Lattice Overlay Nodes');
 
-nodeCmd.command('start').description('Start a WhiteNet Overlay Node')
+nodeCmd.command('start').description('Start a Lattice Overlay Node')
   .requiredOption('--role <role>', 'Role of the node: entry, relay, or gateway')
   .option('--port <port>', 'Port to listen on')
-  .option('--service <wp_url>', 'For gateway: The WhiteNet service address (e.g. wp://echo.white)')
+  .option('--service <wp_url>', 'For gateway: The Lattice service address (e.g. lp://echo.lattice)')
   .option('--target <http_url>', 'For gateway: The internal HTTP backend to proxy to')
   .action((opts) => {
     requireInit();
@@ -195,7 +195,7 @@ nodeCmd.command('start').description('Start a WhiteNet Overlay Node')
   });
 
 // ── run ───────────────────────────────────────────────────────────────────────
-program.command('run').description('Run an agent command inside WhiteNet sandbox')
+program.command('run').description('Run an agent command inside Lattice sandbox')
   .requiredOption('--agent <name>', 'Agent name')
   .option('--no-internet', 'Block normal internet (requires Docker for real isolation)', false)
   .option('--docker', 'Run inside Docker container', false)
@@ -243,11 +243,11 @@ logs.command('tail').description('Tail the action log')
   });
 
 // ── ping ─────────────────────────────────────────────────────────────────────
-program.command('ping <address>').description('Trust-ping a wp:// address')
+program.command('ping <address>').description('Trust-ping a lp:// address')
   .option('--agent <name>', 'Check policy for agent')
   .action(async (address, opts) => {
     requireInit();
-    if (!address.startsWith('wp://')) address = `wp://${address}`;
+    if (!address.startsWith('lp://')) address = `lp://${address}`;
     const result = await ping(address, opts.agent);
 
     console.log(chalk.bold(`\n  ${address}`));
@@ -282,16 +282,16 @@ function printLogEntry(e: any) {
 }
 
 // ── chain / batch / proof ───────────────────────────────────────────────────
-const chain = program.command('chain').description('WhiteChain Trust Anchor operations');
+const chain = program.command('chain').description('LatticeChain Trust Anchor operations');
 
-chain.command('deploy').description('Deploy WhiteChain contract to network')
+chain.command('deploy').description('Deploy LatticeChain contract to network')
   .requiredOption('--rpc <url>', 'RPC URL')
   .requiredOption('--key <key>', 'Private key')
   .action(async (opts) => {
     requireInit();
-    console.log(chalk.dim('Deploying WhiteChain contract...'));
+    console.log(chalk.dim('Deploying LatticeChain contract...'));
     try {
-      const address = await deployWhiteChain(opts.rpc, opts.key);
+      const address = await deployLatticeChain(opts.rpc, opts.key);
       ok(`Contract deployed to: ${chalk.green(address)}`);
     } catch (e: any) { err(e.message); }
   });
@@ -306,14 +306,14 @@ logs.command('batch').description('Create a Merkle batch of unbatched action log
     } catch (e: any) { err(e.message); }
   });
 
-program.command('checkpoint submit').description('Submit a batch Merkle root to the WhiteChain')
+program.command('checkpoint submit').description('Submit a batch Merkle root to the LatticeChain')
   .requiredOption('--batch <id>', 'Batch ID')
   .requiredOption('--rpc <url>', 'RPC URL')
   .requiredOption('--key <key>', 'Private key')
-  .requiredOption('--contract <address>', 'WhiteChain contract address')
+  .requiredOption('--contract <address>', 'LatticeChain contract address')
   .action(async (opts) => {
     requireInit();
-    const f = path.join(WHITENET_DIR, 'batches', `${opts.batch}.json`);
+    const f = path.join(LATTICE_DIR, 'batches', `${opts.batch}.json`);
     if (!fs.existsSync(f)) err(`Batch '${opts.batch}' not found`);
     const meta = JSON.parse(fs.readFileSync(f, 'utf-8'));
     console.log(chalk.dim(`Submitting checkpoint for ${opts.batch}...`));
@@ -325,7 +325,7 @@ program.command('checkpoint submit').description('Submit a batch Merkle root to 
 
 program.command('proof <action_id>').description('Generate and verify Merkle proof for an action')
   .option('--rpc <url>', 'RPC URL to verify on-chain checkpoint (optional)')
-  .option('--contract <address>', 'WhiteChain contract address (optional)')
+  .option('--contract <address>', 'LatticeChain contract address (optional)')
   .action(async (actionId, opts) => {
     requireInit();
     try {
@@ -336,7 +336,7 @@ program.command('proof <action_id>').description('Generate and verify Merkle pro
       
       let onChainVerified = false;
       if (opts.rpc && opts.contract) {
-        console.log(chalk.dim('  Querying WhiteChain...'));
+        console.log(chalk.dim('  Querying LatticeChain...'));
         const result = await verifyCheckpointOnChain(batch.batch_id, opts.rpc, opts.contract);
         if (result.anchored) {
           if (result.merkleRoot === batch.merkle_root) {

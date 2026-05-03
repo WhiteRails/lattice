@@ -1,12 +1,12 @@
 import { describe, it, expect } from 'vitest';
-import { WhiteGateway } from '../core/gateway';
+import { LatticeGateway } from '../core/gateway';
 import { generateKeyPair, createAgentCert } from '../core/identity';
 import { DelegationGrant, IntentAnchor, CapabilityToken } from '../core/types';
 
-describe('White Gateway', () => {
+describe('Lattice Gateway', () => {
   it('should mediate a tool call and produce a signed SAAE', async () => {
     const gatewayKeyPair = generateKeyPair();
-    const gateway = new WhiteGateway('gateway:test', gatewayKeyPair.privateKey);
+    const gateway = new LatticeGateway('gateway:test', gatewayKeyPair.privateKey);
 
     const agentKeyPair = generateKeyPair();
     const agentCert = createAgentCert({
@@ -71,7 +71,7 @@ describe('White Gateway', () => {
 
   it('should throw if agent is not registered', async () => {
      const gatewayKeyPair = generateKeyPair();
-     const gateway = new WhiteGateway('gateway:test', gatewayKeyPair.privateKey);
+     const gateway = new LatticeGateway('gateway:test', gatewayKeyPair.privateKey);
 
      await expect(gateway.mediateToolCall({
        agent_id: 'agent:unregistered',

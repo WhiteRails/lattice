@@ -29,7 +29,7 @@ export class RevocationFreshnessProver {
     const checked_at = new Date().toISOString();
 
     const unsigned = {
-      schema: 'whitenet.freshness.v0.1' as const,
+      schema: 'lattice.freshness.v0.1' as const,
       cert_hash: certHash,
       checked_at,
       not_revoked,

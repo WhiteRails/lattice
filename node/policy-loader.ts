@@ -1,7 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as yaml from 'js-yaml';
-import { WHITENET_DIR } from './state';
+import { LATTICE_DIR } from './state';
 
 export interface PolicyRule { resource: string; actions?: string[]; }
 export interface AgentPolicy {
@@ -14,7 +14,7 @@ export interface AgentPolicy {
 export interface PolicyCheck { allowed: boolean; requires_approval: boolean; reason: string; }
 
 export class PolicyLoader {
-  private dir = path.join(WHITENET_DIR, 'policies');
+  private dir = path.join(LATTICE_DIR, 'policies');
 
   load(name: string): AgentPolicy {
     const f = this.policyPath(name);
@@ -83,7 +83,7 @@ export class PolicyLoader {
 
   private match(pattern: string, resource: string): boolean {
     if (pattern === resource) return true;
-    if (pattern === 'internet:*') return !resource.startsWith('wp://');
+    if (pattern === 'internet:*') return !resource.startsWith('lp://');
     if (pattern.endsWith(':*')) return resource.startsWith(pattern.slice(0, -2));
     return false;
   }

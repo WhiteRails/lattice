@@ -15,7 +15,7 @@ const server = http.createServer((req, res) => {
     const body = Buffer.concat(chunks).toString();
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
-      echo: 'WhiteNet Echo Service',
+      echo: 'Lattice Echo Service',
       method: req.method,
       url: req.url,
       headers: req.headers,
@@ -25,5 +25,5 @@ const server = http.createServer((req, res) => {
 });
 
 server.listen(PORT, '127.0.0.1', () => {
-  console.log(`wp://echo.white backend listening on http://127.0.0.1:${PORT}`);
+  console.log(`lp://echo.lattice backend listening on http://127.0.0.1:${PORT}`);
 });

@@ -1,6 +1,6 @@
 import { spawn } from 'child_process';
 import * as path from 'path';
-import { agentExists, isRevoked, WHITENET_DIR } from './state';
+import { agentExists, isRevoked, LATTICE_DIR } from './state';
 
 export interface RunOptions {
   agentName: string;
@@ -12,7 +12,7 @@ export interface RunOptions {
 
 export async function runAgent(opts: RunOptions): Promise<void> {
   if (!agentExists(opts.agentName))
-    throw new Error(`Agent '${opts.agentName}' not found. Run: whitenet agent create ${opts.agentName}`);
+    throw new Error(`Agent '${opts.agentName}' not found. Run: lattice agent create ${opts.agentName}`);
   if (isRevoked(opts.agentName))
     throw new Error(`Agent '${opts.agentName}' is revoked`);
 
@@ -22,14 +22,14 @@ export async function runAgent(opts: RunOptions): Promise<void> {
 async function runWithProxy(opts: RunOptions): Promise<void> {
   const proxy = `http://127.0.0.1:${opts.proxyPort}`;
   if (opts.noInternet)
-    console.warn('[whitenet] --no-internet without Docker only injects proxy env vars. Use --docker for real isolation.');
+    console.warn('[lattice] --no-internet without Docker only injects proxy env vars. Use --docker for real isolation.');
 
   const env: NodeJS.ProcessEnv = {
     ...process.env,
     HTTP_PROXY: proxy, HTTPS_PROXY: proxy,
     http_proxy: proxy, https_proxy: proxy,
-    WHITENET_AGENT: opts.agentName,
-    WHITENET_DIR,
+    LATTICE_AGENT: opts.agentName,
+    LATTICE_DIR,
     NO_PROXY: '',
   };
 
@@ -46,13 +46,13 @@ async function runInDocker(opts: RunOptions): Promise<void> {
     '-e', `HTTPS_PROXY=${proxy}`,
     '-e', `http_proxy=${proxy}`,
     '-e', `https_proxy=${proxy}`,
-    '-e', `WHITENET_AGENT=${opts.agentName}`,
+    '-e', `LATTICE_AGENT=${opts.agentName}`,
     '-v', `${process.cwd()}:/workspace`,
     '-w', '/workspace',
     detectImage(opts.command[0]),
     ...opts.command,
   ];
-  console.log(`[whitenet] docker ${args.join(' ')}`);
+  console.log(`[lattice] docker ${args.join(' ')}`);
   return spawnChild('docker', args, process.env as NodeJS.ProcessEnv);
 }
 

@@ -24,7 +24,7 @@ const SERVICE_ACTIONS: Record<string, string[]> = {
 };
 
 export async function ping(address: string, agentName?: string): Promise<PingResult> {
-  const svcName = address.replace('wp://', '').replace('.white', '');
+  const svcName = address.replace('lp://', '').replace('.lattice', '');
   const start = Date.now();
 
   const result: PingResult = {

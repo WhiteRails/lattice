@@ -1,12 +1,12 @@
 import { describe, it, expect } from 'vitest';
-import { WhiteCA } from '../core/ca';
+import { LatticeCA } from '../core/ca';
 import { RevocationNetwork } from '../core/revocation';
 import { generateKeyPair } from '../core/identity';
 import { hashObject } from '../core/envelope';
 
-describe('WhiteCA', () => {
+describe('LatticeCA', () => {
   it('issues and verifies an AgentCert', () => {
-    const ca = new WhiteCA('ca.test');
+    const ca = new LatticeCA('ca.test');
     const { publicKey } = generateKeyPair();
     const signed = ca.issueAgentCert({
       agent_id: 'agent-test',
@@ -26,7 +26,7 @@ describe('WhiteCA', () => {
   });
 
   it('issues OrgCert, ServiceCert, GatewayCert, RuntimeCert, ToolCert', () => {
-    const ca = new WhiteCA('ca.test');
+    const ca = new LatticeCA('ca.test');
     expect(ca.issueOrgCert({ org_id: 'org-1' }).cert.type).toBe('OrgCert');
     expect(ca.issueServiceCert({ service_id: 'svc-1' }).cert.type).toBe('ServiceCert');
     expect(ca.issueGatewayCert({ gateway_id: 'gw-1' }).cert.type).toBe('GatewayCert');
@@ -35,7 +35,7 @@ describe('WhiteCA', () => {
   });
 
   it('revokes a cert and records it in the revocation network', () => {
-    const ca = new WhiteCA('ca.test');
+    const ca = new LatticeCA('ca.test');
     const { publicKey } = generateKeyPair();
     const signed = ca.issueAgentCert({
       agent_id: 'agent-rev',
@@ -53,7 +53,7 @@ describe('WhiteCA', () => {
   });
 
   it('signature fails if cert is tampered', () => {
-    const ca = new WhiteCA('ca.test');
+    const ca = new LatticeCA('ca.test');
     const { publicKey } = generateKeyPair();
     const signed = ca.issueOrgCert({ org_id: 'org-1' });
     // Tamper

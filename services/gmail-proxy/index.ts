@@ -23,5 +23,5 @@ const server = http.createServer((req, res) => {
 });
 
 server.listen(PORT, '127.0.0.1', () => {
-  console.log(`wp://gmail.white backend listening on http://127.0.0.1:${PORT}`);
+  console.log(`lp://gmail.lattice backend listening on http://127.0.0.1:${PORT}`);
 });

@@ -73,17 +73,17 @@ export function merkleProofPath(
   return path;
 }
 
-// ─── WhiteLog ────────────────────────────────────────────────────────────────
+// ─── LatticeLog ────────────────────────────────────────────────────────────────
 
 /**
- * WhiteLog — an append-only, Merkle-batched action log.
+ * LatticeLog — an append-only, Merkle-batched action log.
  *
  * Actions are first appended as LogEntries (indexed, hashed envelopes).
  * computeBatch() seals a window of entries into a BatchCommitment whose
  * Merkle root is signed by the log key. Any individual entry can later be
  * proven with getProof() / verifyProof().
  */
-export class WhiteLog {
+export class LatticeLog {
   private entries: LogEntry[] = [];
   private batches: BatchCommitment[] = [];
 

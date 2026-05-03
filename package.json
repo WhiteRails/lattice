@@ -1,13 +1,12 @@
 {
-  "name": "white-protocol-mvp",
+  "name": "lattice-protocol-mvp",
   "version": "0.1.0",
-  "description": "White Protocol MVP implementation",
+  "description": "Lattice Protocol MVP implementation",
   "main": "dist/index.js",
   "scripts": {
     "test": "vitest run",
     "build": "tsc",
-    "whitenet": "ts-node cli/whitenet.ts",
-    "whitenetd": "ts-node node/proxy.ts",
+    "lattice": "ts-node cli/lattice.ts",
     "services:echo": "ts-node services/echo/index.ts",
     "services:github": "ts-node services/github-proxy/index.ts",
     "services:gmail": "ts-node services/gmail-proxy/index.ts",

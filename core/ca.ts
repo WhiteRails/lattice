@@ -5,7 +5,7 @@ import { hashObject } from './envelope';
 import { RevocationNetwork } from './revocation';
 
 /**
- * A certificate that has been signed by a WhiteCA.
+ * A certificate that has been signed by a LatticeCA.
  */
 export interface SignedCert<T extends WhiteCertificate> {
   cert: T;
@@ -14,12 +14,12 @@ export interface SignedCert<T extends WhiteCertificate> {
 }
 
 /**
- * WhiteCA — issues, tracks and revokes certificates for all WhiteNet actor types.
+ * LatticeCA — issues, tracks and revokes certificates for all Lattice actor types.
  *
  * Each CA instance generates its own Ed25519 key pair. Certificates are signed
  * by the CA private key and can be verified against the CA public key.
  */
-export class WhiteCA {
+export class LatticeCA {
   private readonly caKeyPair: KeyPair;
   private readonly caId: string;
   private issuedCerts: Map<string, SignedCert<WhiteCertificate>> = new Map();

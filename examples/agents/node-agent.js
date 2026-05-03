@@ -4,7 +4,7 @@ const http = require('http');
 const proxy = process.env.HTTP_PROXY;
 if (!proxy) {
   console.error('Error: HTTP_PROXY environment variable is not set.');
-  console.error('This agent must be run inside the WhiteNet sandbox.');
+  console.error('This agent must be run inside the Lattice sandbox.');
   process.exit(1);
 }
 
@@ -22,7 +22,7 @@ function makeRequest(targetUrl, method = 'GET') {
       method: method,
       headers: {
         Host: target.host,
-        'x-whitenet-agent': process.env.WHITENET_AGENT
+        'x-lattice-agent': process.env.LATTICE_AGENT
       }
     };
 
@@ -53,13 +53,13 @@ function makeRequest(targetUrl, method = 'GET') {
 
 async function main() {
   // 1. Try an allowed resource
-  await makeRequest('http://echo.white/echo.ping?foo=bar');
+  await makeRequest('http://echo.lattice/echo.ping?foo=bar');
 
   // 2. Try an external internet resource (should be blocked by default policy)
   await makeRequest('http://example.com');
   
   // 3. Try GitHub allowed endpoint
-  await makeRequest('http://github.white/repo.read?repo=acme/core');
+  await makeRequest('http://github.lattice/repo.read?repo=acme/core');
 
   console.log('\n[Agent] Finished tasks.');
 }

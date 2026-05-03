@@ -1,19 +1,19 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { generateKeyPair, createAgentCert } from '../core/identity';
-import { WhiteGateway } from '../core/gateway';
-import { WhiteRegistry } from '../core/registry';
+import { LatticeGateway } from '../core/gateway';
+import { LatticeRegistry } from '../core/registry';
 import { RevocationNetwork } from '../core/revocation';
 import { PowerAccumulationTracker } from '../core/pas';
-import { WhiteLog } from '../core/log';
+import { LatticeLog } from '../core/log';
 import { hashObject } from '../core/envelope';
 import { DelegationGrant, IntentAnchor, CapabilityToken } from '../core/types';
 
-describe('WhiteNet MVP Flow', () => {
-  let gateway: WhiteGateway;
-  let registry: WhiteRegistry;
+describe('Lattice MVP Flow', () => {
+  let gateway: LatticeGateway;
+  let registry: LatticeRegistry;
   let revocation: RevocationNetwork;
   let pasTracker: PowerAccumulationTracker;
-  let log: WhiteLog;
+  let log: LatticeLog;
   let gatewayKeys: any;
   let agentKeys: any;
   let agentCert: any;
@@ -23,10 +23,10 @@ describe('WhiteNet MVP Flow', () => {
     agentKeys = generateKeyPair();
 
     const logKeys = generateKeyPair();
-    log = new WhiteLog('test-log', logKeys.privateKey);
+    log = new LatticeLog('test-log', logKeys.privateKey);
 
-    gateway = new WhiteGateway('gw-1', gatewayKeys.privateKey);
-    registry = new WhiteRegistry('test-registry', log);
+    gateway = new LatticeGateway('gw-1', gatewayKeys.privateKey);
+    registry = new LatticeRegistry('test-registry', log);
     revocation = new RevocationNetwork();
     pasTracker = new PowerAccumulationTracker();
 
@@ -132,9 +132,9 @@ describe('WhiteNet MVP Flow', () => {
     expect(saae.policy.decision).toBe('require_human_approval');
   });
 
-  it('resolves WhiteNet names through registry', () => {
+  it('resolves Lattice names through registry', () => {
     const name = registry.register({
-      name: 'agent-1.test.white',
+      name: 'agent-1.test.lattice',
       public_key: agentCert.public_key,
       service_cert: agentCert.id,
       gateway_endpoints: ['quic://gw-1:4433'],
@@ -142,7 +142,7 @@ describe('WhiteNet MVP Flow', () => {
       accepted_agent_issuers: ['org-1-ca'],
     });
 
-    expect(name).toBe('agent-1.test.white');
+    expect(name).toBe('agent-1.test.lattice');
     const record = registry.resolve(name);
     expect(record?.public_key).toBe(agentCert.public_key);
   });

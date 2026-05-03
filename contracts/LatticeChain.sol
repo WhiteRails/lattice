@@ -2,13 +2,13 @@
 pragma solidity ^0.8.19;
 
 /**
- * @title WhiteChain
- * @dev Minimal public trust anchor for the WhiteNet overlay network.
+ * @title LatticeChain
+ * @dev Minimal public trust anchor for the Lattice overlay network.
  * It stores Merkle roots of off-chain action batches, ensuring that
  * agents' actions remain private and scalable while retaining public
  * auditable provenance.
  */
-contract WhiteChain {
+contract LatticeChain {
     struct Checkpoint {
         bytes32 merkleRoot;
         uint64 fromTimestamp;

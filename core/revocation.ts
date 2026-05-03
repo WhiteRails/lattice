@@ -16,7 +16,7 @@ export class RevocationNetwork {
     issuerPrivateKey: string;
   }): RevocationRecord {
     const record: Omit<RevocationRecord, 'signature'> = {
-      schema: 'whitenet.revocation.v0.1',
+      schema: 'lattice.revocation.v0.1',
       target_type: params.target_type,
       target_hash: params.target_hash,
       revoked_by: params.revoked_by,

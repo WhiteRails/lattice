@@ -6,7 +6,7 @@ import * as crypto from 'crypto';
 const ALPHABET = 'abcdefghijklmnopqrstuvwxyz234567';
 
 /**
- * Simple Base32 encoder for WhiteNet addresses
+ * Simple Base32 encoder for Lattice addresses
  */
 function base32Encode(buffer: Buffer): string {
   let bits = 0;
@@ -31,11 +31,11 @@ function base32Encode(buffer: Buffer): string {
 }
 
 /**
- * Generates a WhiteNet address from a public key.
- * Formula: white_address = base32(sha256(public_key))[0:32] + ".white"
+ * Generates a Lattice address from a public key.
+ * Formula: white_address = base32(sha256(public_key))[0:32] + ".lattice"
  */
 export function generateWhiteAddress(publicKey: string): string {
   const hash = crypto.createHash('sha256').update(publicKey).digest();
   const encoded = base32Encode(hash);
-  return `${encoded.slice(0, 32)}.white`;
+  return `${encoded.slice(0, 32)}.lattice`;
 }

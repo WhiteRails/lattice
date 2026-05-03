@@ -112,7 +112,7 @@ export type CapabilityToken = z.infer<typeof CapabilityTokenSchema>;
 // ─────────────────────────────────────────────────────────────────────────────
 
 export const RevocationRecordSchema = z.object({
-  schema: z.literal('whitenet.revocation.v0.1'),
+  schema: z.literal('lattice.revocation.v0.1'),
   target_type: z.string(),
   target_hash: z.string(),
   revoked_by: z.string(),
@@ -127,7 +127,7 @@ export type RevocationRecord = z.infer<typeof RevocationRecordSchema>;
 // ─────────────────────────────────────────────────────────────────────────────
 
 export const RevocationFreshnessProofSchema = z.object({
-  schema: z.literal('whitenet.freshness.v0.1'),
+  schema: z.literal('lattice.freshness.v0.1'),
   cert_hash: z.string(),
   checked_at: z.string().datetime(),
   not_revoked: z.boolean(),
@@ -314,7 +314,7 @@ export type PASScore = z.infer<typeof PASScoreSchema>;
 // ─────────────────────────────────────────────────────────────────────────────
 
 export const WitnessAttestationSchema = z.object({
-  schema: z.literal('whitenet.witness.v0.1'),
+  schema: z.literal('lattice.witness.v0.1'),
   witness_id: z.string(),
   attested_batch_ids: z.array(z.string()),
   cross_root: z.string(),
@@ -324,7 +324,7 @@ export const WitnessAttestationSchema = z.object({
 export type WitnessAttestation = z.infer<typeof WitnessAttestationSchema>;
 
 export const EquivocationReportSchema = z.object({
-  schema: z.literal('whitenet.equivocation.v0.1'),
+  schema: z.literal('lattice.equivocation.v0.1'),
   detected_by: z.string(),
   batch_id: z.string(),
   conflicting_roots: z.array(z.string()),

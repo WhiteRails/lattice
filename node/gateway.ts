@@ -11,7 +11,7 @@ export class ServiceGateway {
   private policy = new PolicyLoader();
 
   constructor(
-    private serviceAddress: string, // e.g. wp://echo.white
+    private serviceAddress: string, // e.g. lp://echo.lattice
     private targetHttpBase: string, // e.g. http://127.0.0.1:9001
     port: number
   ) {

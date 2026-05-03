@@ -29,7 +29,7 @@ export class EntryNode {
     }
 
     const host = (req.headers.host ?? '').split(':')[0];
-    const resource = `wp://${host}`;
+    const resource = `lp://${host}`;
 
     // Read full body
     const chunks: Buffer[] = [];
@@ -84,6 +84,6 @@ export class EntryNode {
   }
 
   private agentName(req: http.IncomingMessage): string {
-    return (req.headers['x-whitenet-agent'] as string) ?? process.env.WHITENET_AGENT ?? 'unknown';
+    return (req.headers['x-lattice-agent'] as string) ?? process.env.LATTICE_AGENT ?? 'unknown';
   }
 }

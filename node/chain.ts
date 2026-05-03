@@ -5,11 +5,11 @@ import { BatchMetadata } from './batch';
 
 function getContractArtifacts() {
   const dir = path.join(__dirname, '../contracts');
-  const abiPath = path.join(dir, 'contracts_WhiteChain_sol_WhiteChain.abi');
-  const binPath = path.join(dir, 'contracts_WhiteChain_sol_WhiteChain.bin');
+  const abiPath = path.join(dir, 'contracts_LatticeChain_sol_LatticeChain.abi');
+  const binPath = path.join(dir, 'contracts_LatticeChain_sol_LatticeChain.bin');
   
   if (!fs.existsSync(abiPath) || !fs.existsSync(binPath)) {
-    throw new Error("Contract artifacts not found. Run 'npm run build:contracts' or compile WhiteChain.sol");
+    throw new Error("Contract artifacts not found. Run 'npm run build:contracts' or compile LatticeChain.sol");
   }
   
   return {
@@ -18,7 +18,7 @@ function getContractArtifacts() {
   };
 }
 
-export async function deployWhiteChain(rpcUrl: string, privateKey: string): Promise<string> {
+export async function deployLatticeChain(rpcUrl: string, privateKey: string): Promise<string> {
   const provider = new ethers.JsonRpcProvider(rpcUrl);
   const wallet = new ethers.Wallet(privateKey, provider);
   const { abi, bytecode } = getContractArtifacts();

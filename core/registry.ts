@@ -1,23 +1,23 @@
 import * as crypto from 'crypto';
 import { RegistryRecord, RegistryRecordSchema, RegistryEvent } from './types';
-import { WhiteLog } from './log';
+import { LatticeLog } from './log';
 
 /**
- * WhiteRegistry — federated, name-based identity registry (§7.6).
+ * LatticeRegistry — federated, name-based identity registry (§7.6).
  *
  * Differences from the old address-based registry:
- * - Records are keyed by human-readable `.white` names
+ * - Records are keyed by human-readable `.lattice` names
  * - Every mutation (register, key-rotate, revoke) is appended as a
  *   RegistryEvent to a transparency log (§13)
  * - Supports key rotation with log evidence
  * - Answers all 7 registry questions from §7.6
  */
-export class WhiteRegistry {
+export class LatticeRegistry {
   private records: Map<string, RegistryRecord> = new Map();
 
   constructor(
     private readonly registryId: string,
-    private readonly log?: WhiteLog,
+    private readonly log?: LatticeLog,
   ) {}
 
   // ─── Write operations ──────────────────────────────────────────────────────
@@ -81,7 +81,7 @@ export class WhiteRegistry {
 
   // ─── Query operations (§7.6 questions) ────────────────────────────────────
 
-  /** What is this .white name? */
+  /** What is this .lattice name? */
   resolve(name: string): RegistryRecord | undefined {
     return this.records.get(name);
   }

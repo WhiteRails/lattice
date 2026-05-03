@@ -1,17 +1,17 @@
 version: '3.8'
 
 services:
-  whitenetd:
+  latticed:
     build:
       context: ..
       dockerfile: testnet/Dockerfile
-    command: ["npm", "run", "whitenetd"]
+    command: ["npm", "run", "latticed"]
     ports:
       - "7777:7777"
     volumes:
-      - ~/.whitenet:/root/.whitenet
+      - ~/.lattice:/root/.lattice
     networks:
-      - whitenet-overlay
+      - lattice-overlay
 
   echo-service:
     build:
@@ -19,7 +19,7 @@ services:
       dockerfile: testnet/Dockerfile
     command: ["npm", "run", "services:echo"]
     networks:
-      - whitenet-overlay
+      - lattice-overlay
 
   github-service:
     build:
@@ -27,7 +27,7 @@ services:
       dockerfile: testnet/Dockerfile
     command: ["npm", "run", "services:github"]
     networks:
-      - whitenet-overlay
+      - lattice-overlay
 
   gmail-service:
     build:
@@ -35,8 +35,8 @@ services:
       dockerfile: testnet/Dockerfile
     command: ["npm", "run", "services:gmail"]
     networks:
-      - whitenet-overlay
+      - lattice-overlay
 
 networks:
-  whitenet-overlay:
+  lattice-overlay:
     driver: bridge

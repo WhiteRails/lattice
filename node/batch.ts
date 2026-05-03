@@ -1,7 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as crypto from 'crypto';
-import { tailLog, WHITENET_DIR } from './state';
+import { tailLog, LATTICE_DIR } from './state';
 import { merkleRoot, merkleProofPath, MerkleProof } from '../core/log';
 
 export interface BatchMetadata {
@@ -18,7 +18,7 @@ export function createBatch(): BatchMetadata {
   const actions = tailLog(10000); // For MVP, grab recent unbatched
   if (actions.length === 0) throw new Error("No actions to batch");
 
-  const batchDir = path.join(WHITENET_DIR, 'batches');
+  const batchDir = path.join(LATTICE_DIR, 'batches');
   if (!fs.existsSync(batchDir)) fs.mkdirSync(batchDir, { recursive: true });
 
   // Only take actions not already in a batch (naive approach for MVP: read all batches and exclude)
@@ -55,7 +55,7 @@ export function createBatch(): BatchMetadata {
 }
 
 export function generateProof(actionId: string): { batch: BatchMetadata, proof: MerkleProof } {
-  const batchDir = path.join(WHITENET_DIR, 'batches');
+  const batchDir = path.join(LATTICE_DIR, 'batches');
   if (!fs.existsSync(batchDir)) throw new Error("No batches found");
 
   const existingBatches = fs.readdirSync(batchDir).filter(f => f.endsWith('.json'));

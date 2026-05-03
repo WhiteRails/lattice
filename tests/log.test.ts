@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { WhiteLog } from '../core/log';
+import { LatticeLog } from '../core/log';
 import { generateKeyPair } from '../core/identity';
 import { SAAE } from '../core/types';
 import * as crypto from 'crypto';
@@ -20,11 +20,11 @@ function makeSAAE(agentId = 'agent-1', toolId = 'tool.a'): SAAE {
   };
 }
 
-describe('WhiteLog', () => {
+describe('LatticeLog', () => {
   const { privateKey } = generateKeyPair();
 
   it('appends entries and indexes them correctly', () => {
-    const log = new WhiteLog('log-test', privateKey);
+    const log = new LatticeLog('log-test', privateKey);
     const s1 = makeSAAE();
     const s2 = makeSAAE();
     log.append(s1);
@@ -37,7 +37,7 @@ describe('WhiteLog', () => {
   });
 
   it('computes a signed batch commitment', () => {
-    const log = new WhiteLog('log-test', privateKey);
+    const log = new LatticeLog('log-test', privateKey);
     log.append(makeSAAE());
     log.append(makeSAAE());
     const batch = log.computeBatch();
@@ -47,12 +47,12 @@ describe('WhiteLog', () => {
   });
 
   it('throws when computing a batch with no new entries', () => {
-    const log = new WhiteLog('log-test', privateKey);
+    const log = new LatticeLog('log-test', privateKey);
     expect(() => log.computeBatch()).toThrow('No new entries');
   });
 
   it('generates a valid Merkle proof', () => {
-    const log = new WhiteLog('log-test', privateKey);
+    const log = new LatticeLog('log-test', privateKey);
     const s = makeSAAE();
     log.append(s);
     log.append(makeSAAE());
@@ -64,12 +64,12 @@ describe('WhiteLog', () => {
   });
 
   it('returns undefined proof for unknown action', () => {
-    const log = new WhiteLog('log-test', privateKey);
+    const log = new LatticeLog('log-test', privateKey);
     expect(log.getProof('nonexistent')).toBeUndefined();
   });
 
   it('batches only new entries since last batch', () => {
-    const log = new WhiteLog('log-test', privateKey);
+    const log = new LatticeLog('log-test', privateKey);
     log.append(makeSAAE());
     const b1 = log.computeBatch();
     expect(b1.action_count).toBe(1);
@@ -82,7 +82,7 @@ describe('WhiteLog', () => {
   });
 
   it('filters entries by agent', () => {
-    const log = new WhiteLog('log-test', privateKey);
+    const log = new LatticeLog('log-test', privateKey);
     log.append(makeSAAE('alice'));
     log.append(makeSAAE('bob'));
     log.append(makeSAAE('alice'));

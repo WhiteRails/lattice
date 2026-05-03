@@ -4,15 +4,15 @@ import { createSAAEBase, hashObject } from './envelope';
 import { RevocationNetwork } from './revocation';
 import { PowerAccumulationTracker } from './pas';
 import { WhitePolicy } from './policy';
-import { WhiteLog } from './log';
+import { LatticeLog } from './log';
 import * as crypto from 'crypto';
 
-export class WhiteGateway {
+export class LatticeGateway {
   private registeredAgents: Map<string, AgentCert> = new Map();
   private revocationNetwork?: RevocationNetwork;
   private pasTracker?: PowerAccumulationTracker;
   private policy?: WhitePolicy;
-  private log?: WhiteLog;
+  private log?: LatticeLog;
 
   constructor(public gatewayId: string, private gatewayPrivateKey: string) {}
 
@@ -28,7 +28,7 @@ export class WhiteGateway {
     this.policy = policy;
   }
 
-  setLog(log: WhiteLog) {
+  setLog(log: LatticeLog) {
     this.log = log;
   }
 
