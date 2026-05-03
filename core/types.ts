@@ -262,6 +262,17 @@ const RegistryRegisteredEventSchema = z.object({
   issuer: z.string(),
 });
 
+/** Commitment of a signed issuer manifest to the append-only transparency log (hash binds downloadable content). */
+const IssuerManifestCommittedEventSchema = z.object({
+  event: z.literal('issuer_manifest_committed'),
+  manifest_id: z.string(),
+  manifest_content_hash: z.string(),
+  issuer_row_count: z.number().int().nonnegative(),
+  effective_at: z.string().datetime(),
+  issuer: z.string(),
+  signed_by: z.array(z.string()),
+});
+
 const RegistryPolicyUpdatedEventSchema = z.object({
   event: z.literal('policy_updated'),
   subject_id: z.string(),
@@ -328,6 +339,7 @@ export const UnfreezeSubjectEventSchema = z.object({
 /** Transparency log events for registry / subject lifecycle. */
 export const RegistryTransparencyEventSchema = z.discriminatedUnion('event', [
   RegistryRegisteredEventSchema,
+  IssuerManifestCommittedEventSchema,
   RegistryPolicyUpdatedEventSchema,
   RegistryRevokedEventSchema,
   KeyRotationEventSchema,

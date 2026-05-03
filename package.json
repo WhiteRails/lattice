@@ -12,6 +12,9 @@
     "services:gmail": "ts-node services/gmail-proxy/index.ts",
     "services:browser": "ts-node services/browser-proxy/index.ts",
     "demo": "ts-node examples/testnet-demo.ts",
+    "example:gov": "ts-node examples/01-government-citizen-certificate/scenario.ts",
+    "example:bank": "ts-node examples/02-bank-government-validated-transfer/scenario.ts",
+    "example:manifest": "ts-node examples/03-transparency-signed-manifest/scenario.ts",
     "build:contracts": "solcjs --bin --abi --include-path contracts --base-path . -o contracts contracts/LatticeChain.sol"
   },
   "type": "commonjs",

@@ -118,13 +118,19 @@ export class LatticeLog {
    * Appends a RegistryTransparencyEvent to the transparency log.
    */
   appendRegistryEvent(event: RegistryTransparencyEvent): LogEntry {
+    const target_name =
+      event.event === 'issuer_manifest_committed' ? event.manifest_id : event.name;
+    const subject_id =
+      event.event === 'issuer_manifest_committed'
+        ? event.manifest_content_hash
+        : event.subject_id;
     const entry: LogEntry = {
       payload_hash: hashObject(event),
       timestamp: event.effective_at,
       index: this.entries.length,
       event_type: event.event,
-      target_name: event.name,
-      subject_id: event.subject_id,
+      target_name,
+      subject_id,
     };
     this.entries.push(entry);
     return entry;
@@ -166,7 +172,19 @@ export class LatticeLog {
   getProof(actionId: string): MerkleProof | undefined {
     const entry = this.entries.find(e => e.action_id === actionId);
     if (!entry) return undefined;
+    return this.merkleProofForEntry(entry);
+  }
 
+  /**
+   * Merkle proof for any log entry (e.g. registry / manifest commits without action_id).
+   */
+  getProofByEntryIndex(entryIndex: number): MerkleProof | undefined {
+    const entry = this.entries[entryIndex];
+    if (!entry) return undefined;
+    return this.merkleProofForEntry(entry);
+  }
+
+  private merkleProofForEntry(entry: LogEntry): MerkleProof | undefined {
     const batch = this.batches.find(b =>
       entry.index >= b.start_index && entry.index < b.start_index + b.action_count,
     );
@@ -174,7 +192,7 @@ export class LatticeLog {
     const localIndex = batch ? entry.index - batch.start_index : entry.index;
 
     return {
-      action_id: actionId,
+      action_id: entry.action_id ?? `log-entry:${entry.index}`,
       leaf_hash: entry.payload_hash,
       path: merkleProofPath(leaves, localIndex),
       root: batch?.merkle_root ?? merkleRoot(leaves),
