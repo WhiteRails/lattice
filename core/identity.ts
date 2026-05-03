@@ -30,6 +30,7 @@ export function createAgentCert(params: {
   allowed_capability_classes: string[];
   forbidden_capability_classes: string[];
   expires_in_days?: number;
+  signing_key_id?: string;
 }): AgentCert {
   const now = new Date();
   const issued_at = now.toISOString();
@@ -49,6 +50,7 @@ export function createAgentCert(params: {
     agent_type: params.agent_type,
     version: params.version,
     public_key: params.public_key,
+    signing_key_id: params.signing_key_id ?? 'key_initial_signing',
     issuer: params.issuer,
     issued_at,
     expires_at,
@@ -72,7 +74,31 @@ export function signData(data: string | Buffer, privateKey: string): string {
  * Verifies a signature using a public key.
  */
 export function verifySignature(data: string | Buffer, signature: string, publicKey: string): boolean {
-  return crypto.verify(null, Buffer.from(data), publicKey, Buffer.from(signature, 'base64'));
+  try {
+    return crypto.verify(null, Buffer.from(data), publicKey, Buffer.from(signature, 'base64'));
+  } catch {
+    return false;
+  }
+}
+
+export function hashRequestBody(body: Buffer | string): string {
+  return crypto.createHash('sha256').update(body).digest('hex');
+}
+
+export function requestSignaturePayload(params: {
+  method?: string;
+  host?: string;
+  url?: string;
+  timestamp: string;
+  bodyHash: string;
+}): string {
+  return [
+    (params.method ?? 'GET').toUpperCase(),
+    params.host ?? '',
+    params.url ?? '/',
+    params.timestamp,
+    params.bodyHash,
+  ].join('\n');
 }
 
 /**

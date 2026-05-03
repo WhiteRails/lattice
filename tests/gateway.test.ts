@@ -1,7 +1,8 @@
 import { describe, it, expect } from 'vitest';
-import { LatticeGateway } from '../core/gateway';
-import { generateKeyPair, createAgentCert } from '../core/identity';
+import { LatticeGateway, toolCallSignaturePayload } from '../core/gateway';
+import { generateKeyPair, createAgentCert, signData } from '../core/identity';
 import { DelegationGrant, IntentAnchor, CapabilityToken } from '../core/types';
+import { LatticeCA } from '../core/ca';
 
 describe('Lattice Gateway', () => {
   it('should mediate a tool call and produce a signed SAAE', async () => {
@@ -9,7 +10,8 @@ describe('Lattice Gateway', () => {
     const gateway = new LatticeGateway('gateway:test', gatewayKeyPair.privateKey);
 
     const agentKeyPair = generateKeyPair();
-    const agentCert = createAgentCert({
+    const ca = new LatticeCA('ca:test');
+    const signedAgentCert = ca.issueAgentCert({
       agent_id: 'agent:test',
       owner_org: 'org:test',
       agent_type: 'test-agent',
@@ -20,7 +22,7 @@ describe('Lattice Gateway', () => {
       forbidden_capability_classes: [],
     });
 
-    gateway.registerAgent(agentCert);
+    gateway.registerAgent(signedAgentCert, ca.publicKey);
 
     const delegation: DelegationGrant = {
       human_subject: 'user:test',
@@ -52,19 +54,25 @@ describe('Lattice Gateway', () => {
       },
     };
 
-    const envelope = await gateway.mediateToolCall({
+    const request = {
       agent_id: 'agent:test',
-      agent_signature: 'AGENT_SIG',
       delegation,
       intent,
       capability,
+      capability_class: 'email:draft',
       tool_id: 'tool:gmail.draft',
-      action_type: 'gmail.draft_email',
+      action_type: 'email:draft',
       action_parameters: { to: 'test@example.com' },
       runtime_cert_hash: 'sha256:runtime',
+    };
+
+    const envelope = await gateway.mediateToolCall({
+      ...request,
+      agent_signature: signData(toolCallSignaturePayload(request), agentKeyPair.privateKey),
     });
 
     expect(envelope.actor.agent_id).toBe('agent:test');
+    expect(envelope.signatures.agent_signature).not.toBe('PENDING_AGENT_SIG');
     expect(envelope.signatures.gateway_signature).toBeDefined();
     expect(envelope.signatures.gateway_signature).not.toBe('GATEWAY_SIGNATURE_PLACEHOLDER');
   });
@@ -77,5 +85,26 @@ describe('Lattice Gateway', () => {
        agent_id: 'agent:unregistered',
        // ... other params don't matter much for this test
      } as any)).rejects.toThrow('Agent agent:unregistered is not registered');
+  });
+
+  it('rejects unsigned or tampered agent certificates', () => {
+    const gatewayKeyPair = generateKeyPair();
+    const gateway = new LatticeGateway('gateway:test', gatewayKeyPair.privateKey);
+    const ca = new LatticeCA('ca:test');
+    const agentKeyPair = generateKeyPair();
+    const signed = ca.issueAgentCert({
+      agent_id: 'agent:test',
+      owner_org: 'org:test',
+      agent_type: 'test-agent',
+      version: '1.0.0',
+      public_key: agentKeyPair.publicKey,
+      allowed_capability_classes: ['email:draft'],
+      forbidden_capability_classes: [],
+    });
+
+    expect(() => gateway.registerAgent({
+      ...signed,
+      cert: { ...signed.cert, owner_org: 'evil:org' },
+    }, ca.publicKey)).toThrow('Invalid CA signature');
   });
 });

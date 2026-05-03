@@ -24,17 +24,29 @@ export class LatticeCA {
   private readonly caId: string;
   private issuedCerts: Map<string, SignedCert<WhiteCertificate>> = new Map();
 
-  constructor(caId: string) {
+  constructor(caId: string, keyPair: KeyPair = generateKeyPair()) {
     this.caId = caId;
-    this.caKeyPair = generateKeyPair();
+    this.caKeyPair = keyPair;
   }
 
   get publicKey(): string {
     return this.caKeyPair.publicKey;
   }
 
+  get privateKey(): string {
+    return this.caKeyPair.privateKey;
+  }
+
   get id(): string {
     return this.caId;
+  }
+
+  exportKeyPair(): KeyPair {
+    return { ...this.caKeyPair };
+  }
+
+  static fromKeyPair(caId: string, keyPair: KeyPair): LatticeCA {
+    return new LatticeCA(caId, keyPair);
   }
 
   // ─── Private helpers ──────────────────────────────────────────────────────

@@ -1,6 +1,6 @@
 import { spawn } from 'child_process';
 import * as path from 'path';
-import { agentExists, isRevoked, LATTICE_DIR } from './state';
+import { agentExists, isRevoked, LATTICE_DIR, loadAgent } from './state';
 
 export interface RunOptions {
   agentName: string;
@@ -21,14 +21,18 @@ export async function runAgent(opts: RunOptions): Promise<void> {
 
 async function runWithProxy(opts: RunOptions): Promise<void> {
   const proxy = `http://127.0.0.1:${opts.proxyPort}`;
-  if (opts.noInternet)
-    console.warn('[lattice] --no-internet without Docker only injects proxy env vars. Use --docker for real isolation.');
+  if (opts.noInternet) {
+    throw new Error('--no-internet requires an OS/container network sandbox; non-Docker mode cannot enforce it');
+  }
+
+  const agent = loadAgent(opts.agentName);
 
   const env: NodeJS.ProcessEnv = {
     ...process.env,
     HTTP_PROXY: proxy, HTTPS_PROXY: proxy,
     http_proxy: proxy, https_proxy: proxy,
     LATTICE_AGENT: opts.agentName,
+    LATTICE_AGENT_PRIVATE_KEY: agent.privateKey,
     LATTICE_DIR,
     NO_PROXY: '',
   };
@@ -39,6 +43,7 @@ async function runWithProxy(opts: RunOptions): Promise<void> {
 
 async function runInDocker(opts: RunOptions): Promise<void> {
   const proxy = `http://host.docker.internal:${opts.proxyPort}`;
+  const agent = loadAgent(opts.agentName);
   const args = [
     'run', '--rm',
     ...(opts.noInternet ? ['--network', 'none'] : []),
@@ -47,6 +52,7 @@ async function runInDocker(opts: RunOptions): Promise<void> {
     '-e', `http_proxy=${proxy}`,
     '-e', `https_proxy=${proxy}`,
     '-e', `LATTICE_AGENT=${opts.agentName}`,
+    '-e', `LATTICE_AGENT_PRIVATE_KEY=${agent.privateKey}`,
     '-v', `${process.cwd()}:/workspace`,
     '-w', '/workspace',
     detectImage(opts.command[0]),

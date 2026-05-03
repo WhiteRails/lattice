@@ -12,6 +12,7 @@ export interface BatchMetadata {
   action_count: number;
   created_at: string;
   actions: string[]; // action_ids included
+  leaves: Array<{ action_id: string; leaf_hash: string }>;
 }
 
 export function createBatch(): BatchMetadata {
@@ -47,7 +48,8 @@ export function createBatch(): BatchMetadata {
     to_timestamp: toTs,
     action_count: unbatched.length,
     created_at: new Date().toISOString(),
-    actions: unbatched.map((a: any) => a.action_id)
+    actions: unbatched.map((a: any) => a.action_id),
+    leaves: unbatched.map((a: any, i) => ({ action_id: a.action_id, leaf_hash: leaves[i] })),
   };
 
   fs.writeFileSync(path.join(batchDir, `${batch_id}.json`), JSON.stringify(meta, null, 2));
@@ -71,10 +73,10 @@ export function generateProof(actionId: string): { batch: BatchMetadata, proof: 
 
   if (!targetBatch) throw new Error(`Action ${actionId} not found in any batch`);
 
-  // Reconstruct leaves to get the path
-  const actions = tailLog(10000);
-  const batchActions = actions.filter((a: any) => targetBatch!.actions.includes(a.action_id));
-  const leaves = batchActions.map(a => crypto.createHash('sha256').update(JSON.stringify(a)).digest('hex'));
+  const leaves = targetBatch.leaves?.map(l => l.leaf_hash);
+  if (!leaves?.length) {
+    throw new Error(`Batch ${targetBatch.batch_id} does not contain sealed leaves`);
+  }
   
   const idx = targetBatch.actions.indexOf(actionId);
   const pathArr = merkleProofPath(leaves, idx);

@@ -9,6 +9,8 @@ export const WhiteCertificateSchema = z.object({
   type: z.string(),
   issuer: z.string(),
   public_key: z.string(),
+  /** Operational signing key id bound to this cert (stable subject may rotate keys). */
+  signing_key_id: z.string().optional(),
   issued_at: z.string().datetime(),
   expires_at: z.string().datetime().optional(),
   revocation_endpoint: z.string().url().optional(),
@@ -108,16 +110,99 @@ export const CapabilityTokenSchema = z.object({
 export type CapabilityToken = z.infer<typeof CapabilityTokenSchema>;
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Stable subject & key lifecycle (Trust Model §4)
+// ─────────────────────────────────────────────────────────────────────────────
+
+export const KeyPurposeSchema = z.enum([
+  'SIGNING',
+  'ENCRYPTION',
+  'RECOVERY',
+  'REVOCATION',
+  'AUDIT',
+  'COLD_ROOT',
+]);
+export type KeyPurpose = z.infer<typeof KeyPurposeSchema>;
+
+export const KeyStatusSchema = z.enum([
+  'ACTIVE',
+  'DEPRECATED',
+  'RETIRED',
+  'REVOKED_LOST',
+  'REVOKED_COMPROMISED',
+  'SUSPENDED',
+]);
+export type KeyStatus = z.infer<typeof KeyStatusSchema>;
+
+export const KeyRecordSchema = z.object({
+  key_id: z.string(),
+  subject_id: z.string(),
+  key_purpose: KeyPurposeSchema,
+  public_key: z.string(),
+  public_key_hash: z.string(),
+  valid_from: z.string().datetime(),
+  valid_until: z.string().datetime().optional(),
+  status: KeyStatusSchema,
+});
+export type KeyRecord = z.infer<typeof KeyRecordSchema>;
+
+export const RecoveryPolicySchema = z.object({
+  subject_id: z.string(),
+  threshold: z.number().int().min(1),
+  recovery_key_ids: z.array(z.string()),
+  timelock_seconds: z.number().int().min(0),
+  /** e.g. user_default | enterprise_default | government_default */
+  profile: z.string().optional(),
+});
+export type RecoveryPolicy = z.infer<typeof RecoveryPolicySchema>;
+
+export const CompromiseWindowSchema = z.object({
+  suspected_from: z.string().datetime(),
+  confirmed_at: z.string().datetime(),
+});
+export type CompromiseWindow = z.infer<typeof CompromiseWindowSchema>;
+
+export const SubjectFreezeEffectsSchema = z.object({
+  block_new_cert_issuance: z.boolean(),
+  block_high_risk_actions: z.boolean(),
+  allow_read_only_verification: z.boolean(),
+});
+export type SubjectFreezeEffects = z.infer<typeof SubjectFreezeEffectsSchema>;
+
+export const HistoricalSigStatusSchema = z.enum([
+  'valid',
+  'valid_but_contested',
+  'requires_secondary_proof',
+  'invalid',
+]);
+export type HistoricalSigStatus = z.infer<typeof HistoricalSigStatusSchema>;
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Revocation (§12)
 // ─────────────────────────────────────────────────────────────────────────────
 
+export const RevocationReasonCodeSchema = z.enum([
+  'UNSPECIFIED',
+  'KEY_COMPROMISE',
+  'KEY_LOST',
+  'CERT_EXPIRED',
+  'POLICY',
+  'ADMIN',
+]);
+export type RevocationReasonCode = z.infer<typeof RevocationReasonCodeSchema>;
+
 export const RevocationRecordSchema = z.object({
-  schema: z.literal('lattice.revocation.v0.1'),
+  schema: z.literal('lattice.revocation.v0.2'),
   target_type: z.string(),
   target_hash: z.string(),
+  /** When target is a key, identifies the key record. */
+  target_key_id: z.string().optional(),
   revoked_by: z.string(),
   reason: z.string(),
+  reason_code: RevocationReasonCodeSchema.optional(),
   effective_at: z.string().datetime(),
+  suspected_from: z.string().datetime().optional(),
+  compromise_window: CompromiseWindowSchema.optional(),
+  evidence_hash: z.string().optional(),
   signature: z.string(),
 });
 export type RevocationRecord = z.infer<typeof RevocationRecordSchema>;
@@ -138,31 +223,122 @@ export const RevocationFreshnessProofSchema = z.object({
 export type RevocationFreshnessProof = z.infer<typeof RevocationFreshnessProofSchema>;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Registry (§7.6) — federated, name-based
+// Registry (§7.6) — federated, name-based, subject-stable
 // ─────────────────────────────────────────────────────────────────────────────
 
+export const SubjectFreezeStateSchema = z.object({
+  active: z.boolean(),
+  reason: z.string(),
+  effect: SubjectFreezeEffectsSchema,
+  effective_at: z.string().datetime(),
+});
+export type SubjectFreezeState = z.infer<typeof SubjectFreezeStateSchema>;
+
 export const RegistryRecordSchema = z.object({
+  /** Stable Traceveil subject / DID string. */
+  subject_id: z.string(),
+  /** Human-readable or registered name (e.g. *.lattice). */
   name: z.string(),
-  public_key: z.string(),
+  keys: z.array(KeyRecordSchema),
   service_cert: z.string(),
   gateway_endpoints: z.array(z.string()),
   issuer: z.string(),
   accepted_agent_issuers: z.array(z.string()),
   policy_profile: z.string().optional(),
+  /** Optional link so gateways can apply org-level freeze (owner_org string). */
+  linked_org_id: z.string().optional(),
+  recovery_policy: RecoveryPolicySchema.optional(),
   registered_at: z.string().datetime(),
   is_revoked: z.boolean(),
+  freeze: SubjectFreezeStateSchema.optional(),
 });
 export type RegistryRecord = z.infer<typeof RegistryRecordSchema>;
 
-/** Transparency log event for registry mutations. */
-export const RegistryEventSchema = z.object({
-  event: z.enum(['registered', 'key_rotated', 'revoked', 'policy_updated']),
+const RegistryRegisteredEventSchema = z.object({
+  event: z.literal('registered'),
+  subject_id: z.string(),
   name: z.string(),
   effective_at: z.string().datetime(),
-  new_public_key: z.string().optional(),
   issuer: z.string(),
 });
-export type RegistryEvent = z.infer<typeof RegistryEventSchema>;
+
+const RegistryPolicyUpdatedEventSchema = z.object({
+  event: z.literal('policy_updated'),
+  subject_id: z.string(),
+  name: z.string(),
+  effective_at: z.string().datetime(),
+  issuer: z.string(),
+});
+
+const RegistryRevokedEventSchema = z.object({
+  event: z.literal('revoked'),
+  subject_id: z.string(),
+  name: z.string(),
+  effective_at: z.string().datetime(),
+  issuer: z.string(),
+});
+
+export const KeyRotationEventSchema = z.object({
+  event: z.literal('KEY_ROTATION'),
+  subject_id: z.string(),
+  name: z.string(),
+  old_key_id: z.string(),
+  new_key_id: z.string(),
+  effective_at: z.string().datetime(),
+  old_key_valid_until: z.string().datetime(),
+  signed_by: z.array(z.string()),
+  issuer: z.string(),
+});
+
+export const EmergencyKeyCompromiseEventSchema = z.object({
+  event: z.literal('EMERGENCY_KEY_COMPROMISE'),
+  subject_id: z.string(),
+  name: z.string(),
+  compromised_key_id: z.string(),
+  status: z.literal('revoked_compromised'),
+  compromise_window: CompromiseWindowSchema,
+  new_key_id: z.string(),
+  requires_reaudit: z.boolean(),
+  signed_by: z.array(z.string()),
+  threshold: z.string().optional(),
+  issuer: z.string(),
+  effective_at: z.string().datetime(),
+});
+
+export const FreezeSubjectEventSchema = z.object({
+  event: z.literal('FREEZE_SUBJECT'),
+  subject_id: z.string(),
+  name: z.string(),
+  reason: z.string(),
+  effect: SubjectFreezeEffectsSchema,
+  signed_by: z.array(z.string()),
+  issuer: z.string(),
+  effective_at: z.string().datetime(),
+});
+
+export const UnfreezeSubjectEventSchema = z.object({
+  event: z.literal('UNFREEZE_SUBJECT'),
+  subject_id: z.string(),
+  name: z.string(),
+  signed_by: z.array(z.string()),
+  issuer: z.string(),
+  effective_at: z.string().datetime(),
+});
+
+/** Transparency log events for registry / subject lifecycle. */
+export const RegistryTransparencyEventSchema = z.discriminatedUnion('event', [
+  RegistryRegisteredEventSchema,
+  RegistryPolicyUpdatedEventSchema,
+  RegistryRevokedEventSchema,
+  KeyRotationEventSchema,
+  EmergencyKeyCompromiseEventSchema,
+  FreezeSubjectEventSchema,
+  UnfreezeSubjectEventSchema,
+]);
+export type RegistryTransparencyEvent = z.infer<typeof RegistryTransparencyEventSchema>;
+
+/** @deprecated Use RegistryTransparencyEvent; kept as alias for append-only logs. */
+export type RegistryEvent = RegistryTransparencyEvent;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Signed Agent Action Envelope / SAAE (§8 Step 7)
@@ -175,6 +351,8 @@ export const SAAESchema = z.object({
   actor: z.object({
     agent_id: z.string(),
     agent_cert_hash: z.string(),
+    /** Signing key id used for the agent binding at action time (subject-stable PKI). */
+    signing_key_id: z.string().optional(),
   }),
   authority: z.object({
     org_id: z.string(),
@@ -227,6 +405,11 @@ export const EncryptedEvidenceSchema = z.object({
   ref: z.string(),
   action_id: z.string(),
   created_at: z.string().datetime(),
+  /** Logical encryption key id (for rotation / compromise response). */
+  encryption_key_id: z.string(),
+  /** Optional period or domain label for compartment policy. */
+  period_id: z.string().optional(),
+  exposure_status: z.enum(['CONFIDENTIAL', 'POTENTIALLY_EXPOSED']).optional(),
   /** AES-256-GCM ciphertext (hex) */
   ciphertext: z.string(),
   /** GCM auth tag (hex) */

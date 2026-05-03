@@ -31,11 +31,32 @@ function base32Encode(buffer: Buffer): string {
 }
 
 /**
+ * Default stable subject for a registry name when the operator does not supply a DID.
+ */
+export function deriveDefaultSubjectId(name: string): string {
+  const h = crypto.createHash('sha256').update(name, 'utf8').digest('hex');
+  return `did:traceveil:lattice:${h.slice(0, 32)}`;
+}
+
+/**
+ * 32-char base32 suffix for `.lattice` addresses derived from **subject_id** (whitepaper §6.1).
+ */
+export function hashSubjectForLatticeSuffix(subjectId: string): string {
+  const hash = crypto.createHash('sha256').update(subjectId, 'utf8').digest();
+  const encoded = base32Encode(hash);
+  return encoded.slice(0, 32);
+}
+
+export function generateWhiteAddressFromSubjectId(subjectId: string): string {
+  return `${hashSubjectForLatticeSuffix(subjectId)}.lattice`;
+}
+
+/**
  * Generates a Lattice address from a public key.
- * Formula: white_address = base32(sha256(public_key))[0:32] + ".lattice"
+ * @deprecated Prefer {@link generateWhiteAddressFromSubjectId} with a stable `subject_id`.
+ * This derives a synthetic subject from the public key material for backwards compatibility.
  */
 export function generateWhiteAddress(publicKey: string): string {
-  const hash = crypto.createHash('sha256').update(publicKey).digest();
-  const encoded = base32Encode(hash);
-  return `${encoded.slice(0, 32)}.lattice`;
+  const syntheticSubject = `did:traceveil:key:${crypto.createHash('sha256').update(publicKey, 'utf8').digest('hex')}`;
+  return generateWhiteAddressFromSubjectId(syntheticSubject);
 }

@@ -1,12 +1,13 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { generateKeyPair, createAgentCert } from '../core/identity';
-import { LatticeGateway } from '../core/gateway';
+import { generateKeyPair, createAgentCert, signData } from '../core/identity';
+import { LatticeGateway, toolCallSignaturePayload } from '../core/gateway';
 import { LatticeRegistry } from '../core/registry';
 import { RevocationNetwork } from '../core/revocation';
 import { PowerAccumulationTracker } from '../core/pas';
 import { LatticeLog } from '../core/log';
 import { hashObject } from '../core/envelope';
 import { DelegationGrant, IntentAnchor, CapabilityToken } from '../core/types';
+import { LatticeCA } from '../core/ca';
 
 describe('Lattice MVP Flow', () => {
   let gateway: LatticeGateway;
@@ -14,13 +15,15 @@ describe('Lattice MVP Flow', () => {
   let revocation: RevocationNetwork;
   let pasTracker: PowerAccumulationTracker;
   let log: LatticeLog;
-  let gatewayKeys: any;
-  let agentKeys: any;
-  let agentCert: any;
+  let gatewayKeys: ReturnType<typeof generateKeyPair>;
+  let agentKeys: ReturnType<typeof generateKeyPair>;
+  let agentCert: ReturnType<typeof createAgentCert>;
+  let ca: LatticeCA;
 
   beforeEach(() => {
     gatewayKeys = generateKeyPair();
     agentKeys = generateKeyPair();
+    ca = new LatticeCA('org-1-ca');
 
     const logKeys = generateKeyPair();
     log = new LatticeLog('test-log', logKeys.privateKey);
@@ -32,8 +35,9 @@ describe('Lattice MVP Flow', () => {
 
     gateway.setRevocationNetwork(revocation);
     gateway.setPASTracker(pasTracker);
+    gateway.setRegistry(registry);
 
-    agentCert = createAgentCert({
+    const signedAgentCert = ca.issueAgentCert({
       agent_id: 'agent-1',
       owner_org: 'org-1',
       agent_type: 'support',
@@ -43,18 +47,19 @@ describe('Lattice MVP Flow', () => {
       allowed_capability_classes: ['email'],
       forbidden_capability_classes: [],
     });
+    agentCert = signedAgentCert.cert;
 
-    gateway.registerAgent(agentCert);
+    gateway.registerAgent(signedAgentCert, ca.publicKey);
   });
 
   const mockDelegation: DelegationGrant = {
     human_subject: 'human-1',
     agent_id: 'agent-1',
     delegation: {
-      allowed_actions: ['send'],
+      allowed_actions: ['email:send', 'message:mass'],
       forbidden_actions: [],
       expires_at: new Date(Date.now() + 100000).toISOString(),
-    }
+    },
   };
 
   const mockIntent: IntentAnchor = {
@@ -74,23 +79,29 @@ describe('Lattice MVP Flow', () => {
     constraints: {
       requires_human_approval: false,
       expires_at: new Date(Date.now() + 100000).toISOString(),
-    }
+    },
   };
 
   it('allows a valid tool call', async () => {
-    const saae = await gateway.mediateToolCall({
+    const request = {
       agent_id: 'agent-1',
-      agent_signature: 'sig',
       delegation: mockDelegation,
       intent: mockIntent,
       capability: mockCapability,
+      capability_class: 'email:send',
       tool_id: 'gmail.send',
-      action_type: 'send_email',
+      action_type: 'email:send',
       action_parameters: { to: 'user@example.com', body: 'hello' },
       runtime_cert_hash: 'hash',
+    };
+
+    const saae = await gateway.mediateToolCall({
+      ...request,
+      agent_signature: signData(toolCallSignaturePayload(request), agentKeys.privateKey),
     });
 
     expect(saae.policy.decision).toBe('allow');
+    expect(saae.actor.signing_key_id).toBe('key_initial_signing');
   });
 
   it('blocks a tool call if the agent certificate is revoked', async () => {
@@ -99,51 +110,119 @@ describe('Lattice MVP Flow', () => {
       target_hash: hashObject(agentCert),
       revoked_by: 'org-1-ca',
       reason: 'security breach',
-      issuerPrivateKey: gatewayKeys.privateKey, // Simplified for test
+      issuerPrivateKey: gatewayKeys.privateKey,
     });
 
-    await expect(gateway.mediateToolCall({
-      agent_id: 'agent-1',
-      agent_signature: 'sig',
-      delegation: mockDelegation,
-      intent: mockIntent,
-      capability: mockCapability,
-      tool_id: 'gmail.send',
-      action_type: 'send_email',
-      action_parameters: {},
-      runtime_cert_hash: 'hash',
-    })).rejects.toThrow('Agent certificate for agent-1 has been revoked');
+    await expect(
+      (() => {
+        const request = {
+          agent_id: 'agent-1',
+          delegation: mockDelegation,
+          intent: mockIntent,
+          capability: mockCapability,
+          capability_class: 'email:send',
+          tool_id: 'gmail.send',
+          action_type: 'email:send',
+          action_parameters: {},
+          runtime_cert_hash: 'hash',
+        };
+        return gateway.mediateToolCall({
+          ...request,
+          agent_signature: signData(toolCallSignaturePayload(request), agentKeys.privateKey),
+        });
+      })(),
+    ).rejects.toThrow('Agent certificate for agent-1 has been revoked');
   });
 
   it('escalates to human approval if PAS exceeds threshold', async () => {
+    const request = {
+        agent_id: 'agent-1',
+        delegation: mockDelegation,
+        intent: mockIntent,
+        capability: mockCapability,
+        capability_class: 'email:send',
+        tool_id: 'gmail.send',
+        action_type: 'email:send',
+        action_parameters: {},
+        runtime_cert_hash: 'hash',
+        pas_updates: { agent_replication_attempted: 3 },
+      };
     const saae = await gateway.mediateToolCall({
-      agent_id: 'agent-1',
-      agent_signature: 'sig',
-      delegation: mockDelegation,
-      intent: mockIntent,
-      capability: mockCapability,
-      tool_id: 'gmail.send',
-      action_type: 'send_email',
-      action_parameters: {},
-      runtime_cert_hash: 'hash',
-      pas_updates: { agent_replication_attempted: 3 } // PAS will be 3 * 50 = 150 > 100
+      ...request,
+      agent_signature: signData(toolCallSignaturePayload(request), agentKeys.privateKey),
     });
 
     expect(saae.policy.decision).toBe('require_human_approval');
   });
 
-  it('resolves Lattice names through registry', () => {
+  it('resolves Lattice names through registry with stable subject', () => {
     const name = registry.register({
       name: 'agent-1.test.lattice',
+      subject_id: 'did:traceveil:org:org-1',
+      public_key: agentCert.public_key,
+      signing_key_id: 'key_initial_signing',
+      service_cert: agentCert.id,
+      gateway_endpoints: ['quic://gw-1:4433'],
+      issuer: 'org-1-ca',
+      accepted_agent_issuers: ['org-1-ca'],
+      linked_org_id: 'org-1',
+    });
+
+    expect(name).toBe('agent-1.test.lattice');
+    const record = registry.resolve(name);
+    expect(record?.subject_id).toBe('did:traceveil:org:org-1');
+    expect(record?.keys[0].key_id).toBe('key_initial_signing');
+    expect(registry.getPublicKey(name)).toBe(agentCert.public_key);
+  });
+
+  it('blocks high-risk tool calls when org subject is frozen', async () => {
+    registry.register({
+      name: 'agent-1.test.lattice',
+      subject_id: 'did:traceveil:org:org-1',
       public_key: agentCert.public_key,
       service_cert: agentCert.id,
       gateway_endpoints: ['quic://gw-1:4433'],
       issuer: 'org-1-ca',
       accepted_agent_issuers: ['org-1-ca'],
+      linked_org_id: 'org-1',
     });
 
-    expect(name).toBe('agent-1.test.lattice');
-    const record = registry.resolve(name);
-    expect(record?.public_key).toBe(agentCert.public_key);
+    registry.freezeSubject({
+      name: 'agent-1.test.lattice',
+      reason: 'suspected_key_compromise',
+      effect: {
+        block_new_cert_issuance: true,
+        block_high_risk_actions: true,
+        allow_read_only_verification: true,
+      },
+      signed_by: ['recovery_key_1', 'recovery_key_2'],
+      effective_at: new Date().toISOString(),
+    });
+
+    const massCap: CapabilityToken = {
+      ...mockCapability,
+      capability_id: 'cap:message:mass',
+      allowed_tool: 'mailing.broadcast',
+    };
+
+    await expect(
+      (() => {
+        const request = {
+          agent_id: 'agent-1',
+          delegation: mockDelegation,
+          intent: mockIntent,
+          capability: massCap,
+          capability_class: 'message:mass',
+          tool_id: 'mailing.broadcast',
+          action_type: 'message:mass',
+          action_parameters: {},
+          runtime_cert_hash: 'hash',
+        };
+        return gateway.mediateToolCall({
+          ...request,
+          agent_signature: signData(toolCallSignaturePayload(request), agentKeys.privateKey),
+        });
+      })(),
+    ).rejects.toThrow('Subject frozen');
   });
 });

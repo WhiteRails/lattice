@@ -49,7 +49,7 @@ describe('LatticeCA', () => {
 
     const rn = new RevocationNetwork();
     ca.revoke(signed.cert.id, 'test', rn);
-    expect(rn.isRevoked(hashObject(signed.cert))).toBe(true);
+    expect(rn.isRevoked('AgentCert', hashObject(signed.cert))).toBe(true);
   });
 
   it('signature fails if cert is tampered', () => {

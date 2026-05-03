@@ -32,7 +32,19 @@ The core of the local runtime. `latticed` intercepts all outbound HTTP/HTTPS tra
 - **Agent Sandbox:** Agents are run in isolated environments (e.g., Docker with `--network none`) where their only exit node is `latticed`.
 - **YAML Policies:** Agents operate under strict, human-readable YAML policies. If an agent tries to access `http://google.com`, the proxy blocks it. If it tries to `repo.delete` on `lp://github.lattice` without permission, the proxy blocks it.
 
-### 4. Federated Trust Registries
+### 4. Multi-Issuer Agent PKI (Traceveil Trust Chain)
+Lattice implements a federated PKI architecture allowing multiple levels of certification for a single action:
+- **User/Enterprise/Gov Certs**: Proves human identity or organizational authorization.
+- **Model Provider Certs**: Certifies model provenance, config, and encrypted prompt evidence.
+- **Agent & Tool Certs**: Cryptographically links the executing agent and the target API.
+
+### 5. Post-Quantum Crypto-Agility
+Lattice is built to withstand "harvest now, decrypt later" attacks. The protocol enforces algorithm agility via:
+- Hybrid Handshakes: `X25519` + `ML-KEM-768`
+- Hybrid Signatures: `Ed25519` + `ML-DSA-65`
+- Hashing: `SHA3-512` for long-term Merkle Trees.
+
+### 6. Federated Trust Registries
 A decentralized system (`LatticeRegistry`) to resolve `lp://` names to cryptographic public keys, certificate issuers, and network locations, completely independent of global DNS.
 
 ### 5. Cryptographic Action Provenance (SAAE)

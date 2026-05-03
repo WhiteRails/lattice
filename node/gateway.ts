@@ -1,9 +1,9 @@
 import { WebSocketServer, WebSocket } from 'ws';
 import * as http from 'http';
 import * as crypto from 'crypto';
-import { OverlayMessage } from './message';
+import { OverlayMessage, signOverlayMessage, verifyOverlayMessage } from './message';
 import { PolicyLoader } from './policy-loader';
-import { appendLog } from './state';
+import { appendLog, loadCA } from './state';
 import chalk from 'chalk';
 
 export class ServiceGateway {
@@ -27,6 +27,17 @@ export class ServiceGateway {
   private handleMessage(ws: WebSocket, data: string) {
     let msg: OverlayMessage;
     try { msg = JSON.parse(data); } catch { return; }
+    if (!verifyOverlayMessage(msg, loadCA().overlaySecret)) {
+      this.sendResponse(ws, {
+        id: msg.id,
+        type: 'response',
+        source: this.serviceAddress,
+        destination: msg.source,
+        payload: {},
+        trace: msg.trace ?? [],
+      }, 401, { error: 'Unauthenticated overlay request' });
+      return;
+    }
 
     msg.trace.push('gateway');
     const agent = msg.source;
@@ -73,14 +84,14 @@ export class ServiceGateway {
         const action_id = `act_${crypto.randomBytes(6).toString('hex')}`;
         this.log(msg.source, action, 'allow', reason, { action_id });
 
-        const outMsg: OverlayMessage = {
+        const outMsg = signOverlayMessage({
           id: msg.id,
           type: 'response',
           source: this.serviceAddress,
           destination: msg.source,
           payload: { status: res.statusCode, headers: res.headers as any, body: bodyStr },
           trace: msg.trace
-        };
+        }, loadCA().overlaySecret);
         ws.send(JSON.stringify(outMsg));
       });
     });
@@ -107,11 +118,11 @@ export class ServiceGateway {
   }
 
   private sendResponse(ws: WebSocket, req: OverlayMessage, status: number, bodyObj: object) {
-    const res: OverlayMessage = {
+    const res = signOverlayMessage({
       id: req.id, type: 'response', source: this.serviceAddress, destination: req.source,
       payload: { status, headers: { 'content-type': 'application/json' }, body: Buffer.from(JSON.stringify(bodyObj)).toString('base64') },
       trace: req.trace
-    };
+    }, loadCA().overlaySecret);
     ws.send(JSON.stringify(res));
   }
 }

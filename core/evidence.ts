@@ -37,7 +37,11 @@ export class EvidenceStore {
    * Encrypts and stores an evidence bundle for the given recipients.
    * Returns the EncryptedEvidence with a wp-evidence:// reference.
    */
-  async store_bundle(bundle: EvidenceBundle, recipients: Recipient[]): Promise<EncryptedEvidence> {
+  async store_bundle(
+    bundle: EvidenceBundle,
+    recipients: Recipient[],
+    cryptoBinding: { encryption_key_id: string; period_id?: string },
+  ): Promise<EncryptedEvidence> {
     const plaintext = Buffer.from(JSON.stringify(bundle), 'utf-8');
 
     // Generate a random 256-bit AES key and IV
@@ -63,6 +67,9 @@ export class EvidenceStore {
       ref,
       action_id: bundle.action_id,
       created_at: new Date().toISOString(),
+      encryption_key_id: cryptoBinding.encryption_key_id,
+      period_id: cryptoBinding.period_id,
+      exposure_status: 'CONFIDENTIAL',
       ciphertext: encrypted.toString('hex'),
       auth_tag: authTag.toString('hex'),
       iv: iv.toString('hex'),
@@ -106,6 +113,41 @@ export class EvidenceStore {
 
   get(ref: string): EncryptedEvidence | undefined {
     return this.store.get(ref);
+  }
+
+  /**
+   * Re-wraps the bundle AES key for a new encryption key id (post rotation / new recipients).
+   * Old ciphertext is decrypted with a recipient key, then re-encrypted with a fresh DEK.
+   */
+  async re_encrypt_bundle(params: {
+    ref: string;
+    decrypt_as_recipient_id: string;
+    recipient_private_key: string;
+    new_encryption_key_id: string;
+    new_period_id?: string;
+    new_recipients: Recipient[];
+  }): Promise<EncryptedEvidence> {
+    const bundle = await this.retrieve(params.ref, params.decrypt_as_recipient_id, params.recipient_private_key);
+    this.store.delete(params.ref);
+    return this.store_bundle(bundle, params.new_recipients, {
+      encryption_key_id: params.new_encryption_key_id,
+      period_id: params.new_period_id,
+    });
+  }
+
+  /**
+   * Marks evidence as potentially exposed after encryption key compromise (metadata only;
+   * ciphertext is not automatically re-wrapped here).
+   */
+  markPotentiallyExposed(ref: string): EncryptedEvidence {
+    const ev = this.store.get(ref);
+    if (!ev) throw new Error(`Evidence bundle not found: ${ref}`);
+    const next = EncryptedEvidenceSchema.parse({
+      ...ev,
+      exposure_status: 'POTENTIALLY_EXPOSED',
+    });
+    this.store.set(ref, next);
+    return next;
   }
 
   listRefs(): string[] {

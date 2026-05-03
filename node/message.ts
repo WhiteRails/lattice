@@ -1,3 +1,5 @@
+import * as crypto from 'crypto';
+
 export interface OverlayMessage {
   id: string;             // Unique message ID
   type: 'request' | 'response';
@@ -17,4 +19,38 @@ export interface OverlayMessage {
   
   // Overlay circuit trace
   trace: string[];
+  auth?: {
+    key_id: string;
+    signature: string;
+  };
+}
+
+function stableStringify(value: any): string {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(',')}]`;
+  const keys = Object.keys(value).sort();
+  return `{${keys.map(k => `${JSON.stringify(k)}:${stableStringify(value[k])}`).join(',')}}`;
+}
+
+function overlayAuthPayload(message: OverlayMessage): string {
+  const { auth, trace, ...signed } = message;
+  return stableStringify(signed);
+}
+
+export function signOverlayMessage(message: OverlayMessage, secret: string): OverlayMessage {
+  const signature = crypto
+    .createHmac('sha256', secret)
+    .update(overlayAuthPayload(message))
+    .digest('base64');
+  return { ...message, auth: { key_id: 'local-overlay', signature } };
+}
+
+export function verifyOverlayMessage(message: OverlayMessage, secret: string): boolean {
+  if (!message.auth?.signature) return false;
+  const expected = signOverlayMessage({ ...message, auth: undefined }, secret).auth!.signature;
+  try {
+    return crypto.timingSafeEqual(Buffer.from(message.auth.signature), Buffer.from(expected));
+  } catch {
+    return false;
+  }
 }

@@ -11,7 +11,8 @@
     "services:github": "ts-node services/github-proxy/index.ts",
     "services:gmail": "ts-node services/gmail-proxy/index.ts",
     "services:browser": "ts-node services/browser-proxy/index.ts",
-    "demo": "ts-node examples/testnet-demo.ts"
+    "demo": "ts-node examples/testnet-demo.ts",
+    "build:contracts": "solcjs --bin --abi --include-path contracts --base-path . -o contracts contracts/LatticeChain.sol"
   },
   "type": "commonjs",
   "devDependencies": {

@@ -88,17 +88,22 @@ async function run() {
   const registry = new LatticeRegistry('registry.lattice.local', log);
   const agentName = registry.register({
     name: 'support-agent.acme.lattice',
+    subject_id: 'did:traceveil:org:acme:agent:support-v1',
     public_key: agentKeys.publicKey,
+    signing_key_id: 'key_acme_support_signing_v1',
     service_cert: agentSigned.cert.id,
     gateway_endpoints: ['quic://gateway.acme.internal:4433'],
     issuer: orgCert.cert.id,
     accepted_agent_issuers: [orgCert.cert.id],
     policy_profile: 'support-agent-v1',
+    linked_org_id: 'org:acme',
   });
 
   const svcName = registry.register({
     name: 'gmail-gateway.cloud.lattice',
+    subject_id: 'did:traceveil:svc:gmail-gateway',
     public_key: generateKeyPair().publicKey,
+    signing_key_id: 'key_gmail_gateway_initial',
     service_cert: serviceCert.cert.id,
     gateway_endpoints: ['quic://gmail.gateway.lattice:4433'],
     issuer: ca.id,
@@ -108,9 +113,18 @@ async function run() {
   ok(`Agent registered → ${agentName}`);
   ok(`Service registered → ${svcName}`);
 
-  // Test transparency log key rotation
-  registry.rotateKey('gmail-gateway.cloud.lattice', generateKeyPair().publicKey);
-  ok('Key rotated for gmail-gateway.cloud.lattice (Transparency event logged)');
+  const rot = generateKeyPair();
+  const overlapUntil = new Date(Date.now() + 7 * 86400000).toISOString();
+  registry.rotateSigningKey({
+    name: 'gmail-gateway.cloud.lattice',
+    old_key_id: 'key_gmail_gateway_initial',
+    new_key_id: 'key_gmail_gateway_q2',
+    new_public_key: rot.publicKey,
+    effective_at: new Date().toISOString(),
+    old_key_valid_until: overlapUntil,
+    signed_by: ['key_gmail_gateway_initial', 'recovery_key_acme'],
+  });
+  ok('KEY_ROTATION logged for gmail-gateway.cloud.lattice (overlap window set)');
 
   // ── Step 3: Policy grants ─────────────────────────────────────────────────
   step(3, 'white-policy grant capability');

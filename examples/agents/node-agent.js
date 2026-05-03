@@ -1,4 +1,5 @@
 const http = require('http');
+const crypto = require('crypto');
 
 // Read HTTP_PROXY from environment
 const proxy = process.env.HTTP_PROXY;
@@ -11,18 +12,44 @@ if (!proxy) {
 console.log(`[Agent] Starting up. Using proxy: ${proxy}`);
 
 const proxyUrl = new URL(proxy);
+const privateKey = process.env.LATTICE_AGENT_PRIVATE_KEY;
+if (!privateKey) {
+  console.error('Error: LATTICE_AGENT_PRIVATE_KEY environment variable is not set.');
+  process.exit(1);
+}
+
+function signRequest({ method, host, path, body = '' }) {
+  const timestamp = new Date().toISOString();
+  const bodyHash = crypto.createHash('sha256').update(body).digest('hex');
+  const payload = [
+    method.toUpperCase(),
+    host,
+    path,
+    timestamp,
+    bodyHash,
+  ].join('\n');
+  const signature = crypto.sign(null, Buffer.from(payload), privateKey).toString('base64');
+  return { timestamp, signature };
+}
 
 function makeRequest(targetUrl, method = 'GET') {
   return new Promise((resolve, reject) => {
     const target = new URL(targetUrl);
+    const auth = signRequest({
+      method,
+      host: target.host,
+      path: target.pathname + target.search,
+    });
     const options = {
       hostname: proxyUrl.hostname,
       port: proxyUrl.port,
-      path: targetUrl, // Proxy receives full URL in path
+      path: target.pathname + target.search,
       method: method,
       headers: {
         Host: target.host,
-        'x-lattice-agent': process.env.LATTICE_AGENT
+        'x-lattice-agent': process.env.LATTICE_AGENT,
+        'x-lattice-timestamp': auth.timestamp,
+        'x-lattice-signature': auth.signature,
       }
     };
 

@@ -1,5 +1,5 @@
 import * as crypto from 'crypto';
-import { SAAE, RegistryEvent } from './types';
+import { SAAE, RegistryTransparencyEvent } from './types';
 import { hashData, hashObject } from './envelope';
 import { signData } from './identity';
 
@@ -15,6 +15,7 @@ export interface LogEntry {
   policy_decision?: string;
   event_type?: string;
   target_name?: string;
+  subject_id?: string;
 }
 
 export interface MerkleProof {
@@ -31,6 +32,8 @@ export interface BatchCommitment {
   timestamp: string;
   issuer: string;
   signature: string;
+  start_index: number;
+  leaf_hashes: string[];
 }
 
 // ─── Merkle helpers ──────────────────────────────────────────────────────────
@@ -112,15 +115,16 @@ export class LatticeLog {
   }
 
   /**
-   * Appends a RegistryEvent to the transparency log.
+   * Appends a RegistryTransparencyEvent to the transparency log.
    */
-  appendRegistryEvent(event: RegistryEvent): LogEntry {
+  appendRegistryEvent(event: RegistryTransparencyEvent): LogEntry {
     const entry: LogEntry = {
       payload_hash: hashObject(event),
       timestamp: event.effective_at,
       index: this.entries.length,
       event_type: event.event,
       target_name: event.name,
+      subject_id: event.subject_id,
     };
     this.entries.push(entry);
     return entry;
@@ -136,7 +140,8 @@ export class LatticeLog {
     const slice = this.entries.slice(batched);
     if (slice.length === 0) throw new Error('No new entries to batch');
 
-    const root = merkleRoot(slice.map(e => e.payload_hash));
+    const leaf_hashes = slice.map(e => e.payload_hash);
+    const root = merkleRoot(leaf_hashes);
     const batch_id = `batch_${crypto.randomBytes(4).toString('hex')}`;
     const unsigned = {
       batch_id,
@@ -144,6 +149,8 @@ export class LatticeLog {
       merkle_root: root,
       timestamp: new Date().toISOString(),
       issuer: this.logId,
+      start_index: batched,
+      leaf_hashes,
     };
     const signature = signData(JSON.stringify(unsigned), this.logPrivateKey);
     const commitment: BatchCommitment = { ...unsigned, signature };
@@ -154,17 +161,23 @@ export class LatticeLog {
   // ─── Proofs ───────────────────────────────────────────────────────────────
 
   /**
-   * Returns a Merkle inclusion proof for an action, computed over all entries.
+   * Returns a Merkle inclusion proof for an action, bound to the batch that sealed it.
    */
   getProof(actionId: string): MerkleProof | undefined {
     const entry = this.entries.find(e => e.action_id === actionId);
     if (!entry) return undefined;
-    const leaves = this.entries.map(e => e.payload_hash);
+
+    const batch = this.batches.find(b =>
+      entry.index >= b.start_index && entry.index < b.start_index + b.action_count,
+    );
+    const leaves = batch?.leaf_hashes ?? this.entries.map(e => e.payload_hash);
+    const localIndex = batch ? entry.index - batch.start_index : entry.index;
+
     return {
       action_id: actionId,
       leaf_hash: entry.payload_hash,
-      path: merkleProofPath(leaves, entry.index),
-      root: merkleRoot(leaves),
+      path: merkleProofPath(leaves, localIndex),
+      root: batch?.merkle_root ?? merkleRoot(leaves),
     };
   }
 

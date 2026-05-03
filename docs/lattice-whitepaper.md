@@ -275,21 +275,28 @@ lp://cloud-registry.00ac.lattice
 lp://agent-market.331k.lattice
 ```
 
-The address is derived from a public key:
+### 6.1 Stable subject vs rotatable keys (normative)
+
+**A Lattice subject is not its signing key.** Every critical entity has a **stable subject identifier** (Traceveil DID / `did:traceveil:…` or a protocol-normalized `subject_id`). Signing, encryption, recovery, revocation, audit, and cold-root keys are **separate key records** with `key_id`, purpose, validity window, and lifecycle state. Rotating or revoking a key **does not** retire the subject.
+
+The `.lattice` suffix in `lp://…` addresses is derived from a **stable binding** — the **subject id** (or a registered namespace id committed to that subject) — **not** from the current operational public key:
 
 ```
-public_key -> hash -> base32 -> .lattice address
+subject_id -> hash -> base32 -> .lattice suffix
 ```
 
-Simplified formula:
+Reference formula (reference implementations may use SHA-256 for the hash step):
 
 ```
-white_address = base32(blake3(public_key))[0:32] + ".lattice"
+lattice_suffix = base32(sha256(utf8(subject_id)))[0:32]
+white_address  = lattice_suffix + ".lattice"
 ```
 
-This gives Lattice **self-authenticating addresses**.
+The registry publishes **which signing key** is active for that subject at a given time, overlapping windows during rotation, and transparency events (`KEY_ROTATION`, `EMERGENCY_KEY_COMPROMISE`, `FREEZE_SUBJECT`). Verifiers evaluate historical signatures against **key state at the action timestamp**, including compromise windows (see Trust Model: Stable Subject & Key Lifecycle).
 
-The address itself proves the expected service key.
+### 6.2 Legacy note
+
+Earlier drafts tied the suffix directly to `hash(public_key)`. That model is **deprecated**: it collapses identity and key material and prevents clean rotation. Implementations MUST migrate to subject-bound addressing.
 
 ---
 
@@ -389,11 +396,13 @@ Resolves Lattice identities.
 
 Answers:
 
-- What is this `.lattice` address?
-- What public key does it map to?
+- What is this `.lattice` address / name?
+- What **stable subject** (`did:traceveil:…` / `subject_id`) does it name?
+- What **signing key** (and other purposes) are registered, with which `key_id` and validity windows?
+- Which signing key is **active** (and which are deprecated / retired / revoked)?
 - What certificate chain does it use?
 - Who issued it?
-- Is it revoked?
+- Is the subject or a specific key **revoked**, **compromised**, or **frozen**?
 - What capabilities does it accept?
 - What gateways protect it?
 

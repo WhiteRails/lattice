@@ -1,5 +1,6 @@
 import { WebSocketServer, WebSocket } from 'ws';
-import { OverlayMessage } from './message';
+import { OverlayMessage, signOverlayMessage, verifyOverlayMessage } from './message';
+import { loadCA } from './state';
 import chalk from 'chalk';
 
 export const DEFAULT_RELAY_PORT = 8888;
@@ -32,6 +33,12 @@ export class RelayNode {
       msg = JSON.parse(data);
     } catch { return; }
 
+    const overlaySecret = loadCA().overlaySecret;
+    if (!verifyOverlayMessage(msg, overlaySecret)) {
+      this.sendError(clientWs, msg, 'Unauthenticated overlay request');
+      return;
+    }
+
     msg.trace.push('relay');
 
     console.log(chalk.magenta(`[RelayNode]`) + ` Routing ${msg.id} -> ${msg.destination}`);
@@ -52,6 +59,11 @@ export class RelayNode {
     gatewayWs.on('message', (gwData) => {
       // Forward response back to the Entry Node
       const response: OverlayMessage = JSON.parse(gwData.toString());
+      if (!verifyOverlayMessage(response, overlaySecret)) {
+        this.sendError(clientWs, msg, 'Unauthenticated gateway response');
+        gatewayWs.close();
+        return;
+      }
       response.trace.push('relay');
       if (clientWs.readyState === WebSocket.OPEN) {
         clientWs.send(JSON.stringify(response));
@@ -65,14 +77,14 @@ export class RelayNode {
   }
 
   private sendError(ws: WebSocket, req: OverlayMessage, error: string) {
-    const res: OverlayMessage = {
+    const res = signOverlayMessage({
       id: req.id,
       type: 'response',
       source: 'relay',
       destination: req.source,
       payload: { status: 502, headers: { 'content-type': 'application/json' }, body: Buffer.from(JSON.stringify({ error })).toString('base64') },
       trace: [...req.trace]
-    };
+    }, loadCA().overlaySecret);
     if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(res));
   }
 }

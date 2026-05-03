@@ -19,14 +19,39 @@ import * as os from 'os';
 export const LATTICE_DIR = path.join(os.homedir(), '.lattice');
 
 const dirs = ['ca', 'agents', 'policies', 'services', 'logs', 'revocations', 'evidence'];
+const PRIVATE_FILE_MODE = 0o600;
+const PRIVATE_DIR_MODE = 0o700;
+
+export interface CAState {
+  caId: string;
+  publicKey: string;
+  privateKey: string;
+  overlaySecret: string;
+  createdAt: string;
+}
+
+export interface AgentState {
+  cert: any;
+  signedCert?: any;
+  publicKey: string;
+  privateKey: string;
+  createdAt: string;
+}
+
+function writePrivateJson(file: string, data: object): void {
+  fs.writeFileSync(file, JSON.stringify(data, null, 2), { mode: PRIVATE_FILE_MODE });
+  fs.chmodSync(file, PRIVATE_FILE_MODE);
+}
 
 export function initDirs(): void {
   if (!fs.existsSync(LATTICE_DIR)) {
-    fs.mkdirSync(LATTICE_DIR, { recursive: true });
+    fs.mkdirSync(LATTICE_DIR, { recursive: true, mode: PRIVATE_DIR_MODE });
   }
+  fs.chmodSync(LATTICE_DIR, PRIVATE_DIR_MODE);
   for (const d of dirs) {
     const full = path.join(LATTICE_DIR, d);
-    if (!fs.existsSync(full)) fs.mkdirSync(full, { recursive: true });
+    if (!fs.existsSync(full)) fs.mkdirSync(full, { recursive: true, mode: PRIVATE_DIR_MODE });
+    fs.chmodSync(full, PRIVATE_DIR_MODE);
   }
 }
 
@@ -36,23 +61,27 @@ export function isInitialized(): boolean {
 
 // ─── CA ──────────────────────────────────────────────────────────────────────
 
-export function saveCA(data: object): void {
-  fs.writeFileSync(path.join(LATTICE_DIR, 'ca', 'ca.json'), JSON.stringify(data, null, 2));
+export function saveCA(data: CAState): void {
+  writePrivateJson(path.join(LATTICE_DIR, 'ca', 'ca.json'), data);
 }
 
-export function loadCA(): any {
+export function loadCA(): CAState {
   const f = path.join(LATTICE_DIR, 'ca', 'ca.json');
   if (!fs.existsSync(f)) throw new Error('Lattice not initialized. Run: lattice init');
-  return JSON.parse(fs.readFileSync(f, 'utf-8'));
+  const state = JSON.parse(fs.readFileSync(f, 'utf-8'));
+  if (!state.privateKey || !state.overlaySecret) {
+    throw new Error('Lattice CA state is incomplete. Re-run lattice init in a clean state or migrate ca.json.');
+  }
+  return state;
 }
 
 // ─── Agents ──────────────────────────────────────────────────────────────────
 
-export function saveAgent(name: string, data: object): void {
-  fs.writeFileSync(agentPath(name), JSON.stringify(data, null, 2));
+export function saveAgent(name: string, data: AgentState): void {
+  writePrivateJson(agentPath(name), data);
 }
 
-export function loadAgent(name: string): any {
+export function loadAgent(name: string): AgentState {
   const f = agentPath(name);
   if (!fs.existsSync(f)) throw new Error(`Agent '${name}' not found`);
   return JSON.parse(fs.readFileSync(f, 'utf-8'));

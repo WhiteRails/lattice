@@ -58,6 +58,10 @@ export interface PolicyDecision {
   grant_id?: string;
 }
 
+export function capabilityRiskLevel(capability_class: string): number {
+  return RISK[capability_class] ?? 3;
+}
+
 // ─── WhitePolicy ─────────────────────────────────────────────────────────────
 
 const DEFAULT_PAS_THRESHOLD = 100;
@@ -110,7 +114,7 @@ export class WhitePolicy {
   // ─── Evaluation ─────────────────────────────────────────────────────────
 
   getRiskLevel(capability_class: string): number {
-    return RISK[capability_class] ?? 3;
+    return capabilityRiskLevel(capability_class);
   }
 
   isGrantValid(grant: PolicyGrant): boolean {

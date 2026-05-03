@@ -26,6 +26,7 @@ import { createBatch, generateProof } from '../node/batch';
 import { deployLatticeChain, submitCheckpoint, verifyCheckpointOnChain } from '../node/chain';
 import { LatticeCA }         from '../core/ca';
 import { generateKeyPair } from '../core/identity';
+import * as crypto from 'crypto';
 
 const program = new Command();
 program.name('lattice').description('Certified overlay network for autonomous AI agents').version('0.1.0');
@@ -45,7 +46,13 @@ program.command('init').description('Initialize Lattice (~/.lattice)').action(()
   if (isInitialized()) { console.log(chalk.yellow('Already initialized.')); return; }
   initDirs();
   const ca = new LatticeCA('ca.local');
-  saveCA({ caId: ca.id, publicKey: ca.publicKey, createdAt: new Date().toISOString() });
+  saveCA({
+    caId: ca.id,
+    publicKey: ca.publicKey,
+    privateKey: ca.privateKey,
+    overlaySecret: crypto.randomBytes(32).toString('base64'),
+    createdAt: new Date().toISOString(),
+  });
   ok(`Lattice initialized at ${chalk.cyan(LATTICE_DIR)}`);
   ok('Local CA created: ca.local');
   console.log(chalk.dim('\nNext steps:'));
@@ -67,13 +74,23 @@ agent.command('create <name>').description('Create an agent with a certificate')
     requireInit();
     if (agentExists(name)) err(`Agent '${name}' already exists`);
     const keys = generateKeyPair();
-    const ca = new LatticeCA('ca.local');
+    const caState = loadCA();
+    const ca = LatticeCA.fromKeyPair(caState.caId, {
+      publicKey: caState.publicKey,
+      privateKey: caState.privateKey,
+    });
     const signed = ca.issueAgentCert({
       agent_id: `agent:local:${name}`, owner_org: opts.org, agent_type: opts.type,
       version: '1.0', public_key: keys.publicKey,
       allowed_capability_classes: [], forbidden_capability_classes: [], expires_in_days: 365,
     });
-    saveAgent(name, { cert: signed.cert, publicKey: keys.publicKey, createdAt: new Date().toISOString() });
+    saveAgent(name, {
+      cert: signed.cert,
+      signedCert: signed,
+      publicKey: keys.publicKey,
+      privateKey: keys.privateKey,
+      createdAt: new Date().toISOString(),
+    });
     new PolicyLoader().deny(name, 'internet:*');
     ok(`Agent '${chalk.cyan(name)}' created`);
     console.log(chalk.dim(`  cert: ${signed.cert.id}`));
@@ -206,7 +223,7 @@ program.command('run').description('Run an agent command inside Lattice sandbox'
     try {
       await runAgent({
         agentName: opts.agent,
-        noInternet: opts.noInternet,
+        noInternet: opts.internet === false,
         useDocker: opts.docker,
         proxyPort: parseInt(opts.port),
         command,

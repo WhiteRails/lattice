@@ -25,7 +25,7 @@ export class RevocationFreshnessProver {
    * Checks if certHash is revoked and produces a signed freshness proof.
    */
   prove(certHash: string): RevocationFreshnessProof {
-    const not_revoked = !this.revocationNetwork.isRevoked(certHash);
+    const not_revoked = !this.revocationNetwork.isRevokedLegacy(certHash);
     const checked_at = new Date().toISOString();
 
     const unsigned = {

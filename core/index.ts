@@ -10,3 +10,4 @@ export * from './pas';
 export * from './ca';
 export * from './log';
 export * from './policy';
+export * from './keyVerification';
