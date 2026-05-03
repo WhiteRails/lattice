@@ -58,7 +58,7 @@ Lattice does **not** put agent actions or private prompts on a blockchain. Howev
 ### Installation
 
 ```bash
-git clone https://github.com/WhiteRails/LatticeNet.git
+git clone https://github.com/WhiteRails/lattice.git
 cd LatticeNet
 npm install
 ```
