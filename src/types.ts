@@ -136,3 +136,56 @@ export const SAAESchema = z.object({
 });
 
 export type SAAE = z.infer<typeof SAAESchema>;
+
+/**
+ * Revocation Record schema
+ */
+export const RevocationRecordSchema = z.object({
+  schema: z.literal('whitenet.revocation.v0.1'),
+  target_type: z.string(),
+  target_hash: z.string(),
+  revoked_by: z.string(),
+  reason: z.string(),
+  effective_at: z.string().datetime(),
+  signature: z.string(),
+});
+
+export type RevocationRecord = z.infer<typeof RevocationRecordSchema>;
+
+/**
+ * Registry Record schema
+ */
+export const RegistryRecordSchema = z.object({
+  address: z.string(),
+  public_key: z.string(),
+  certificate_chain: z.array(z.string()),
+  issuer: z.string(),
+  is_revoked: z.boolean(),
+  accepted_capabilities: z.array(z.string()),
+  protecting_gateways: z.array(z.string()),
+});
+
+export type RegistryRecord = z.infer<typeof RegistryRecordSchema>;
+
+/**
+ * Power Accumulation Score schema
+ */
+export const PASScoreSchema = z.object({
+  score: z.number().min(0),
+  factors: z.object({
+    compute_acquired: z.number().default(0),
+    money_accessible: z.number().default(0),
+    credentials_created: z.number().default(0),
+    infrastructure_modified: z.number().default(0),
+    code_deployed: z.number().default(0),
+    humans_contacted: z.number().default(0),
+    reach_expanded: z.number().default(0),
+    identity_multiplied: z.number().default(0),
+    persistence_increased: z.number().default(0),
+    agent_replication_attempted: z.number().default(0),
+    sensitive_data_accessed: z.number().default(0),
+  }),
+  last_updated: z.string().datetime(),
+});
+
+export type PASScore = z.infer<typeof PASScoreSchema>;
