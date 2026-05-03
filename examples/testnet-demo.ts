@@ -18,13 +18,13 @@
  */
 
 import { LatticeCA } from '../core/ca';
-import { LatticeGateway } from '../core/gateway';
+import { LatticeGateway, toolCallSignaturePayload } from '../core/gateway';
 import { LatticeRegistry } from '../core/registry';
 import { RevocationNetwork } from '../core/revocation';
 import { PowerAccumulationTracker } from '../core/pas';
 import { WhitePolicy } from '../core/policy';
 import { LatticeLog } from '../core/log';
-import { generateKeyPair } from '../core/identity';
+import { generateKeyPair, signData } from '../core/identity';
 import { hashObject } from '../core/envelope';
 import { DelegationGrant, IntentAnchor, CapabilityToken } from '../core/types';
 
@@ -154,7 +154,7 @@ async function run() {
   gateway.setPolicy(policy);
   gateway.setLog(log);
 
-  gateway.registerAgent(agentSigned.cert);
+  gateway.registerAgent(agentSigned, ca.publicKey);
   ok('Gateway ready with policy + log + PAS tracker');
 
   // ── Step 5: Shared request objects ────────────────────────────────────────
@@ -191,17 +191,20 @@ async function run() {
   // ── Step 6: Agent calls gmail.draft_email ─────────────────────────────────
   step(5, 'white-agent call gmail.draft_email  →  expected: allow');
 
-  const draftSAAE = await gateway.mediateToolCall({
-    agent_id: 'agent:acme:support-v1',
-    agent_signature: 'sig:placeholder',
+  const draftCall = {
+    agent_id: 'agent:acme:support-v1' as const,
     delegation,
     intent,
     capability: draftCapToken,
-    capability_class: 'message:single',
+    capability_class: 'message:single' as const,
     tool_id: 'gmail.draft_email',
     action_type: 'draft_email',
     action_parameters: { to: 'customer@example.com', subject: 'Re: Ticket #42', body: '…' },
     runtime_cert_hash: 'runtime:hash:abc',
+  };
+  const draftSAAE = await gateway.mediateToolCall({
+    ...draftCall,
+    agent_signature: signData(toolCallSignaturePayload(draftCall), agentKeys.privateKey),
   });
   ok(`Decision: ${grn(draftSAAE.policy.decision)}  action_id=${draftSAAE.action_id}`);
 
@@ -221,17 +224,20 @@ async function run() {
 
   let sendDecision = 'unknown';
   try {
-    await gateway.mediateToolCall({
-      agent_id: 'agent:acme:support-v1',
-      agent_signature: 'sig:placeholder',
+    const sendCall = {
+      agent_id: 'agent:acme:support-v1' as const,
       delegation,
       intent,
       capability: sendCapToken,
-      capability_class: 'message:single',
+      capability_class: 'message:single' as const,
       tool_id: 'gmail.send_email',
       action_type: 'send_email',
       action_parameters: { to: 'customer@example.com' },
       runtime_cert_hash: 'runtime:hash:abc',
+    };
+    await gateway.mediateToolCall({
+      ...sendCall,
+      agent_signature: signData(toolCallSignaturePayload(sendCall), agentKeys.privateKey),
     });
   } catch (e: any) {
     // capability mismatch throws before policy check in MVP
@@ -254,18 +260,21 @@ async function run() {
   const pasScore = pasTracker.getScore('agent:acme:support-v1');
   info(`PAS score after replication attempts: ${pasScore.score}`);
 
-  const pasSAAE = await gateway.mediateToolCall({
-    agent_id: 'agent:acme:support-v1',
-    agent_signature: 'sig:placeholder',
+  const pasCall = {
+    agent_id: 'agent:acme:support-v1' as const,
     delegation,
     intent,
     capability: draftCapToken,
-    capability_class: 'message:single',
+    capability_class: 'message:single' as const,
     tool_id: 'gmail.draft_email',
     action_type: 'draft_email',
     action_parameters: { to: 'customer@example.com' },
     runtime_cert_hash: 'runtime:hash:abc',
     pas_updates: {},
+  };
+  const pasSAAE = await gateway.mediateToolCall({
+    ...pasCall,
+    agent_signature: signData(toolCallSignaturePayload(pasCall), agentKeys.privateKey),
   });
   ok(`Decision: ${yel(pasSAAE.policy.decision)}`);
 

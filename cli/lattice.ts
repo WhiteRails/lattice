@@ -214,7 +214,8 @@ nodeCmd.command('start').description('Start a Lattice Overlay Node')
 // ── run ───────────────────────────────────────────────────────────────────────
 program.command('run').description('Run an agent command inside Lattice sandbox')
   .requiredOption('--agent <name>', 'Agent name')
-  .option('--no-internet', 'Block normal internet (requires Docker for real isolation)', false)
+  // Default true: allow internet unless user passes --no-internet (Commander stores as `internet`).
+  .option('--no-internet', 'Block normal internet (requires Docker for real isolation)', true)
   .option('--docker', 'Run inside Docker container', false)
   .option('--port <port>', 'Proxy port', String(DEFAULT_ENTRY_PORT))
   .argument('<command...>', 'Command to run')
