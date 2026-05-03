@@ -1,11 +1,24 @@
-import { AgentCert, CapabilityToken, DelegationGrant, IntentAnchor, SAAE } from './types';
+import { AgentCert, CapabilityToken, DelegationGrant, IntentAnchor, SAAE, PASScore } from './types';
 import { isCertValid, verifySignature, signData } from './identity';
 import { createSAAEBase, hashObject, signSAAE } from './envelope';
+import { RevocationNetwork } from './revocation';
+import { PowerAccumulationTracker } from './pas';
+import * as crypto from 'crypto';
 
 export class WhiteGateway {
   private registeredAgents: Map<string, AgentCert> = new Map();
+  private revocationNetwork?: RevocationNetwork;
+  private pasTracker?: PowerAccumulationTracker;
 
   constructor(public gatewayId: string, private gatewayPrivateKey: string) {}
+
+  setRevocationNetwork(rn: RevocationNetwork) {
+    this.revocationNetwork = rn;
+  }
+
+  setPASTracker(pas: PowerAccumulationTracker) {
+    this.pasTracker = pas;
+  }
 
   /**
    * Registers an agent certificate in the gateway.
@@ -30,10 +43,16 @@ export class WhiteGateway {
     action_type: string;
     action_parameters: any;
     runtime_cert_hash: string;
+    pas_updates?: Partial<PASScore['factors']>;
   }): Promise<SAAE> {
     const cert = this.registeredAgents.get(params.agent_id);
     if (!cert) {
       throw new Error(`Agent ${params.agent_id} is not registered`);
+    }
+
+    // Check revocation
+    if (this.revocationNetwork?.isRevoked(hashObject(cert))) {
+      throw new Error(`Agent certificate for ${params.agent_id} has been revoked`);
     }
 
     // Verify agent's signature on the intent and action (simplified for MVP)
@@ -41,9 +60,24 @@ export class WhiteGateway {
     // Here we assume the mediateToolCall itself is the request
 
     // 1. Policy & Capability check
-    this.checkPolicy(cert, params.capability, params.tool_id);
+    let decision: 'allow' | 'deny' | 'require_human_approval' = 'allow';
 
-    // 2. Create SAAE
+    try {
+      this.checkPolicy(cert, params.capability, params.tool_id);
+    } catch (e: any) {
+      decision = 'deny';
+      throw e;
+    }
+
+    // 2. PAS check & update
+    if (this.pasTracker && params.pas_updates) {
+      const newScore = this.pasTracker.recordAction(params.agent_id, params.pas_updates);
+      if (newScore.score > 100) {
+        decision = 'require_human_approval';
+      }
+    }
+
+    // 3. Create SAAE
     const action_id = `act_${crypto.randomUUID()}`;
     const baseEnvelope = createSAAEBase({
       action_id,
@@ -65,7 +99,7 @@ export class WhiteGateway {
         capability_class: params.capability.capability_id.split(':')[1] || 'default',
       },
       policy: {
-        decision: 'allow',
+        decision,
       },
       action: {
         type: params.action_type,
