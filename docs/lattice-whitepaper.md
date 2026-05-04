@@ -57,7 +57,7 @@ The central rule:
 
 ## 2. Why a New Network?
 
-White Protocol can exist over the normal internet. But long term, high-impact autonomous agents should operate through a separate network layer.
+Lattice Protocol can exist over the normal internet. But long term, high-impact autonomous agents should operate through a separate network layer.
 
 Why?
 
@@ -138,6 +138,8 @@ Certificate types:
 - `AuditorCert`
 
 No anonymous autonomous agents.
+
+Lattice may preserve pseudonymity at the network layer, but operational actions must be attributable to a certified subject under an accepted trust domain.
 
 ---
 
@@ -228,15 +230,15 @@ No company should own Lattice.
       |
       | signed request
       v
-[White Entry Node]
+[Lattice Entry Node]
       |
       | encrypted overlay route
       v
-[White Relay Network]
+[Lattice Relay Network]
       |
       | private transport
       v
-[White Service Gateway]
+[Lattice Service Gateway]
       |
       | identity + capability + policy
       v
@@ -249,22 +251,24 @@ No company should own Lattice.
 
 Lattice is composed of:
 
-1. White Addressing
-2. White Nodes
-3. White Relays
+1. Lattice Addressing
+2. Lattice Nodes
+3. Lattice Relays
 4. Lattice Gateways
-5. White Services
-6. White Registry
-7. White Certificate Authorities
-8. White Revocation Network
-9. White Action Logs
-10. White Evidence Stores
+5. Lattice Services
+6. Lattice Registry
+7. Lattice Certificate Authorities
+8. Lattice Revocation Network
+9. Lattice Action Logs
+10. Lattice Evidence Stores
 
 ---
 
-## 6. White Addressing
+## 6. Lattice Addressing
 
 Lattice services use cryptographic addresses.
+
+Lattice uses `lp://` as the canonical URI scheme for protocol-addressable services.
 
 Examples:
 
@@ -277,7 +281,7 @@ lp://agent-market.331k.lattice
 
 ### 6.1 Stable subject vs rotatable keys (normative)
 
-**A Lattice subject is not its signing key.** Every critical entity has a **stable subject identifier** (Traceveil DID / `did:traceveil:…` or a protocol-normalized `subject_id`). Signing, encryption, recovery, revocation, audit, and cold-root keys are **separate key records** with `key_id`, purpose, validity window, and lifecycle state. Rotating or revoking a key **does not** retire the subject.
+**A Lattice subject is not its signing key.** Every critical entity has a **stable subject identifier** (Lattice DID / `did:lattice:…` or a protocol-normalized `subject_id`). Signing, encryption, recovery, revocation, audit, and cold-root keys are **separate key records** with `key_id`, purpose, validity window, and lifecycle state. Rotating or revoking a key **does not** retire the subject.
 
 The `.lattice` suffix in `lp://…` addresses is derived from a **stable binding** — the **subject id** (or a registered namespace id committed to that subject) — **not** from the current operational public key:
 
@@ -289,7 +293,7 @@ Reference formula (reference implementations may use SHA-256 for the hash step):
 
 ```
 lattice_suffix = base32(sha256(utf8(subject_id)))[0:32]
-white_address  = lattice_suffix + ".lattice"
+lattice_address = lattice_suffix + ".lattice"
 ```
 
 The registry publishes **which signing key** is active for that subject at a given time, overlapping windows during rotation, and transparency events (`KEY_ROTATION`, `EMERGENCY_KEY_COMPROMISE`, `FREEZE_SUBJECT`). Verifiers evaluate historical signatures against **key state at the action timestamp**, including compromise windows (see Trust Model: Stable Subject & Key Lifecycle).
@@ -397,7 +401,7 @@ Resolves Lattice identities.
 Answers:
 
 - What is this `.lattice` address / name?
-- What **stable subject** (`did:traceveil:…` / `subject_id`) does it name?
+- What **stable subject** (`did:lattice:…` / `subject_id`) does it name?
 - What **signing key** (and other purposes) are registered, with which `key_id` and validity windows?
 - Which signing key is **active** (and which are deprecated / retired / revoked)?
 - What certificate chain does it use?
@@ -545,7 +549,7 @@ Gateway emits an action envelope:
   "evidence": {
     "request_hash": "sha256:...",
     "response_hash": "sha256:...",
-    "encrypted_bundle_ref": "wp-evidence://acme/act_001"
+    "encrypted_bundle_ref": "lattice-evidence://acme/act_001"
   },
   "signatures": {
     "agent": "...",
@@ -814,7 +818,7 @@ Purpose: prove policy and action custody.
 ### v1: Real Overlay
 
 - QUIC
-- White addresses
+- Lattice addresses
 - Certified nodes
 - Service discovery
 - Revocation-aware routing
@@ -942,7 +946,42 @@ Required governance:
 
 ---
 
-## 18. MVP
+## 18. Decentralized Trust and Public Checkpoints
+
+Lattice does not require every action to be on-chain. That does not scale and violates the privacy model.
+
+However, decentralized public checkpoints are critical for global trust without a central authority:
+
+- **No actions on-chain**: Only cryptographic commitments (Merkle roots) are optionally anchored.
+- **Namespace registry**: Global `.lattice` domain resolution backed by decentralized consensus.
+- **Issuer registry**: Public directory of trusted Certificate Authorities and their policies.
+- **Revocation root registry**: Fast, undeniable proofs of revocation state.
+- **Relay reputation**: Future mechanisms for node staking and slashing for malicious relays.
+- **Governance**: Decentralized protocol upgrades and parameters.
+
+---
+
+## 19. Local Runtime and Agent Sandboxing
+
+Lattice is not just an external network; it must also secure the agent's local environment.
+
+The protocol includes a local runtime component to isolate the agent and force it to communicate exclusively through Lattice:
+
+```bash
+lattice run --agent bot1 --no-internet -- python agent.py
+```
+
+The runtime ensures the agent cannot bypass the capability firewall by connecting directly to the public internet:
+
+- **latticed**: The local daemon managing keys, signatures, and routing.
+- **lp0 virtual interface**: Future virtual network interface to intercept agent traffic.
+- **Local proxy v0**: Intercepts API calls to route them into the Lattice overlay.
+- **Docker sandbox**: Isolates the agent's filesystem and process tree.
+- **Linux namespace / macOS utun**: Future OS-level enforcement of the `--no-internet` boundary.
+
+---
+
+## 20. MVP
 
 Do not start by building global routing.
 
@@ -952,13 +991,13 @@ Start with the part that matters: **enforcement**.
 
 | Component | Description |
 |-----------|-------------|
-| `white-ca` | Certificate authority |
-| `white-registry` | Identity registry |
-| `white-gateway` | Policy enforcement gateway |
-| `white-sdk` | Agent SDK |
-| `white-log` | Append-only action log |
-| `white-dashboard` | Audit dashboard |
-| `white-policy` | Policy engine |
+| `lattice-ca` | Certificate authority |
+| `lattice-registry` | Identity registry |
+| `lattice-gateway` | Policy enforcement gateway |
+| `lattice-sdk` | Agent SDK |
+| `lattice-log` | Append-only action log |
+| `lattice-dashboard` | Audit dashboard |
+| `lattice-policy` | Policy engine |
 
 ### MVP Demo
 
@@ -988,7 +1027,7 @@ That is enough for v0.
 
 ---
 
-## 19. Suggested Repository Structure
+## 21. Suggested Repository Structure
 
 ```
 lattice/
@@ -1000,13 +1039,13 @@ lattice/
     lattice-revocation.md
     lattice-policy.md
   crates/
-    white-ca/
-    white-registry/
-    white-gateway/
-    white-sdk/
-    white-log/
-    white-policy/
-    white-cli/
+    lattice-ca/
+    lattice-registry/
+    lattice-gateway/
+    lattice-sdk/
+    lattice-log/
+    lattice-policy/
+    lattice-cli/
   examples/
     gmail-proxy/
     github-proxy/
@@ -1023,7 +1062,7 @@ lattice/
 
 ---
 
-## 20. First Technical Milestone
+## 22. First Technical Milestone
 
 Build **Lattice Local Testnet v0**.
 
@@ -1040,35 +1079,35 @@ It should include:
 Flow:
 
 ```
-white-ca issue-org
-white-ca issue-agent
-white-ca issue-service
-white-policy grant capability
-white-agent call service
-white-gateway enforce
-white-log append
-white-dashboard inspect
-white-ca revoke-agent
-white-agent call again -> blocked
+lattice ca issue-org
+lattice ca issue-agent
+lattice ca issue-service
+lattice policy grant
+lattice agent call service
+lattice gateway enforce
+lattice log append
+lattice dashboard inspect
+lattice ca revoke-agent
+lattice agent call again -> blocked
 ```
 
 ---
 
-## 21. Lattice and White Protocol
+## 23. Lattice Protocol and Network
 
 Important distinction:
 
 | | |
 |-|-|
-| **White Protocol** | The standard for identity, delegation, signed actions, evidence, revocation. |
-| **Lattice** | The overlay network where agents and certified services communicate using White Protocol. |
+| **Lattice Protocol** | The standard for identity, delegation, signed actions, evidence, revocation. |
+| **Lattice Network** | The overlay network where agents and certified services communicate using Lattice Protocol. |
 
-White Protocol can run without Lattice.  
-Lattice cannot work without White Protocol.
+Lattice Protocol can run without the Lattice Network.  
+The Lattice Network cannot work without Lattice Protocol.
 
 ---
 
-## 22. Risk and Limitations
+## 24. Risk and Limitations
 
 **Lattice does not solve:**
 
@@ -1101,13 +1140,13 @@ That is strong enough. Do not overclaim.
 
 ---
 
-## 23. One-Sentence Definition
+## 25. One-Sentence Definition
 
 > Lattice is a Tor-like overlay network for AI agents, but inverted: private in transport, accountable in action, restricted by capability, and revocable by design.
 
 ---
 
-## 24. Short Pitch
+## 26. Short Pitch
 
 The internet needs a separate trust layer for non-human actors.
 
@@ -1118,7 +1157,7 @@ It is an **accountable web for autonomous intelligence**.
 
 ---
 
-## 25. Final Position
+## 27. Final Position
 
 The old internet asks:
 
