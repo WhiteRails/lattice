@@ -1,6 +1,4 @@
 # Lattice
-<img src="https://whiterails.com/ltt_concept.jpg">
-
 **A Certified Overlay Network for Autonomous AI Agents.**
 
 <p align="center">
@@ -15,6 +13,7 @@ The internet was designed for humans, open connectivity, and applications. It wa
 It is structurally inspired by Tor-like networks: separate addressing (`lp://`), overlay routing, and cryptographic service identity. But it serves the opposite purpose: **where Tor protects anonymity, Lattice enforces accountable agency.**
 
 ---
+<img src="https://whiterails.com/ltt_concept.jpg">
 
 ## 🌟 Key Features
 
