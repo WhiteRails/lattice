@@ -15,6 +15,143 @@
 5. [KMS Plugin Development](#kms-plugin-development)
 6. [Proxy Mode Network Limitation](#proxy-mode-network-limitation)
 7. [Signing Socket Reference](#signing-socket-reference)
+8. [F1 Distributed Public Overlay Bring-Up](#f1-distributed-public-overlay-bring-up)
+
+---
+
+## F1 Distributed Public Overlay Bring-Up
+
+> **Scope.** F1 proves a real distributed public overlay: Entry on one VPS reaches a Gateway on another VPS through a public Relay over WSS, without sharing `overlaySecret`. F1 is **not** hidden-service mode: gateway endpoints are public route hints. Outbound-only hidden gateways/rendezvous are F3.
+
+### Minimum topology
+
+- Chain VPS: Anvil JSON-RPC reachable by operators, e.g. `http://chain.example:8545`.
+- Relay VPS: `relay-1.example.com`, role `relay`, WSS `:8888`.
+- Gateway VPS: `gw-echo.example.com`, role `gateway`, WSS `:8889`, backend on localhost.
+- Entry VPS: `entry-1.example.com`, role `entry`, local HTTP proxy `127.0.0.1:7777`.
+
+For 10 VPS, use the same pattern with 1 Anvil, 3 relays, 3 gateways, and 3 entry/agent nodes. Give every node a stable `nodeId` (`relay-1`, `gateway-echo`, `entry-1`, etc.).
+
+### TLS / WSS
+
+On every public Relay/Gateway VPS:
+
+```bash
+sudo certbot certonly --standalone -d relay-1.example.com
+sudo certbot certonly --standalone -d gw-echo.example.com
+```
+
+Use the generated Let's Encrypt paths in `~/.lattice/node.yaml`:
+
+```yaml
+tls:
+  certFile: /etc/letsencrypt/live/<domain>/fullchain.pem
+  keyFile: /etc/letsencrypt/live/<domain>/privkey.pem
+```
+
+### Chain and namespace setup
+
+On the Chain VPS:
+
+```bash
+anvil --host 0.0.0.0 --port 8545
+npm run lattice -- chain deploy --rpc http://127.0.0.1:8545 --key-file /secure/operator.key
+npm run lattice -- chain cert-type register lattice-node --level 1 --rpc http://127.0.0.1:8545 --contract <contract> --key-file /secure/operator.key
+npm run lattice -- chain issuer register lattice-ops --type lattice-node --pub-key-hash 0x0000000000000000000000000000000000000000000000000000000000000000 --rpc http://127.0.0.1:8545 --contract <contract> --key-file /secure/operator.key
+```
+
+Register each node identity on-chain from that node after `lattice init`:
+
+```bash
+npm run lattice -- node register --label relay-1 --roles relay --rpc http://chain.example:8545 --contract <contract> --key-file /secure/operator.key
+npm run lattice -- node register --label gateway-echo --roles gateway --rpc http://chain.example:8545 --contract <contract> --key-file /secure/operator.key
+npm run lattice -- node register --label entry-1 --roles entry --rpc http://chain.example:8545 --contract <contract> --key-file /secure/operator.key
+```
+
+### Node configs
+
+Relay:
+
+```bash
+npm run lattice -- node init --distributed-mesh --node-id relay-1 --roles relay \
+  --relay-bind 0.0.0.0:8888 \
+  --public-relay wss://relay-1.example.com:8888 \
+  --chain-rpc http://chain.example:8545 --chain-contract <contract> \
+  --tls-cert-file /etc/letsencrypt/live/relay-1.example.com/fullchain.pem \
+  --tls-key-file /etc/letsencrypt/live/relay-1.example.com/privkey.pem
+```
+
+Gateway:
+
+```bash
+npm run lattice -- node init --distributed-mesh --node-id gateway-echo --roles gateway \
+  --gateway-bind 0.0.0.0:8889 \
+  --public-gateway wss://gw-echo.example.com:8889 \
+  --chain-rpc http://chain.example:8545 --chain-contract <contract> \
+  --tls-cert-file /etc/letsencrypt/live/gw-echo.example.com/fullchain.pem \
+  --tls-key-file /etc/letsencrypt/live/gw-echo.example.com/privkey.pem
+```
+
+Entry:
+
+```bash
+npm run lattice -- node init --distributed-mesh --node-id entry-1 --roles entry \
+  --entry-bind 127.0.0.1:7777 \
+  --upstream-relays relay-1=wss://relay-1.example.com:8888 \
+  --chain-rpc http://chain.example:8545 --chain-contract <contract>
+```
+
+### Service announce and route distribution
+
+On the Gateway VPS:
+
+```bash
+npm run services:echo
+npm run lattice -- gateway announce lp://echo.lattice \
+  --backend http://127.0.0.1:9001 \
+  --endpoint wss://gw-echo.example.com:8889 \
+  --gateway-node-label gateway-echo
+npm run lattice -- chain namespace register echo.lattice \
+  --owner-issuer lattice-ops --public \
+  --metadata-hash <metadataHash from gateway announce> \
+  --rpc http://chain.example:8545 --contract <contract> --key-file /secure/operator.key
+npm run lattice -- routing export --fqdn echo.lattice --out echo.route.json
+```
+
+Copy `echo.route.json` to every Relay that should route this service, then:
+
+```bash
+npm run lattice -- routing import --file echo.route.json --verify-chain --rpc http://chain.example:8545 --contract <contract>
+```
+
+### Start roles
+
+```bash
+# Relay VPS
+npm run lattice -- node start --role relay
+
+# Gateway VPS
+npm run lattice -- node start --role gateway --service lp://echo.lattice --target http://127.0.0.1:9001
+
+# Entry VPS
+npm run lattice -- node start --role entry
+```
+
+### Acceptance smoke
+
+On the Entry VPS:
+
+```bash
+npm run lattice -- agent create bot1
+npm run lattice -- mesh smoke --agent bot1 --entry http://127.0.0.1:7777 --host echo.lattice --path /ping --expect-status 200
+```
+
+Expected: HTTP 200 with the backend response body, Relay/Gateway logs showing the request, and trace progression through `entry`, `relay`, `gateway`.
+
+Negative checks:
+
+- Change a node's on-chain pubkey or use an unregistered `nodeId`: peers must reject it with an unauthenticated/unregistered node error.
+- Re-announce `echo.lattice` with a new Gateway endpoint, export/import the new route bundle, and confirm smoke recovers without changing Entry code.
 
 ---
 
@@ -341,6 +478,39 @@ lattice run --mode=docker <agent-name>
 ```
 
 Do not rely on proxy mode as a security boundary for agents with access to sensitive services.
+
+---
+
+## Distributed overlay (cross-host MVP)
+
+Operational pieces added for **Fase 1** (“distributed but not hidden”):
+
+| Artifact | Purpose |
+|---|---|
+| `~/.lattice/node.yaml` | Binds (`entry`/`relay`/`gateway`), `upstreamRelays`, optional `registry.chain`, TLS files, `distributedMesh`. |
+| `~/.lattice/routing-cache.json` | **HMAC-signed** local cache mapping `fqdn → { gatewayEndpoints, gatewayPubKeyB64 }` (must match chain `metadataHash` when namespaces are anchored). |
+| `LATTICE_HOME` | **Override lattice state directory** from `~/.lattice` (tests/isolated VMs). |
+
+### CLI recap
+
+```
+lattice node init-sample                 # scaffold node.yaml (edit before prod)
+lattice node register …                  # governance: LatticeChain.registerLatticeNode
+lattice routing announce …             # rewrite routing-cache row (+ optional --publish metadata)
+lattice peer add …                     # bootstrap relay pubkey hints when chain unreachable
+```
+
+### Environment
+
+- `LATTICE_CHAIN_RPC_URL` / `LATTICE_CHAIN_ADDRESS` — override YAML `registry.chain` for Entry/Relay resolvers.
+- `LATTICE_DISTRIBUTED_MESH=1` — force ECDH mesh signing (same as `distributedMesh: true` in YAML).
+- `LATTICE_PRIMARY_RELAY_LABEL` — label used to resolve relay overlay pubkey for Entry bootstrap.
+
+### References
+
+- Milestones: `docs/milestones/phase-*.md`
+- Decisions: `docs/decisions-distributed-overlay.md`
+- Example Anvil-only compose: `docker-compose.distributed.yml`
 
 ---
 

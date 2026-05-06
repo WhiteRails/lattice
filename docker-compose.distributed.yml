@@ -1,0 +1,15 @@
+# Example stack for cross-host overlay bring-up (manual wiring of lattice node start on each host).
+#
+# 1) Deploy LatticeChain: npm run build:contracts && npm run lattice -- chain deploy --rpc http://127.0.0.1:8545 --key-file ...
+# 2) Populate ~/.lattice/node.yaml + routing-cache (lattice node init-sample, lattice routing announce, lattice peer add).
+# 3) Run entry / relay / gateway with LATTICE_CHAIN_RPC_URL / LATTICE_CHAIN_ADDRESS or registry.chain in YAML.
+#
+# This file only ships a local Anvil; process-based nodes should be started on distinct hosts or compose services
+# you build (not included here to avoid pinning container images / keys in-repo).
+version: "3.8"
+services:
+  anvil:
+    image: ghcr.io/foundry-rs/foundry:stable
+    command: ["anvil", "--host", "0.0.0.0", "--port", "8545"]
+    ports:
+      - "8545:8545"

@@ -9,6 +9,8 @@ import { Command } from 'commander';
 import chalk from 'chalk';
 import * as fs from 'fs';
 import * as path from 'path';
+import * as http from 'http';
+import * as https from 'https';
 import {
   initDirs, isInitialized, saveCA, loadCA,
   saveAgent, loadAgent, agentExists, listAgents,
@@ -34,6 +36,10 @@ import {
   chainUpdateNamespaceServiceBinding,
   chainSetNamespaceAccessPolicy,
   chainGetNamespace,
+  chainRegisterLatticeNode,
+  LATTICE_CHAIN_ROLE_ENTRY,
+  LATTICE_CHAIN_ROLE_RELAY,
+  LATTICE_CHAIN_ROLE_GATEWAY,
   chainGetIssuer,
   chainGetCertType,
   chainIssuerCanIssue,
@@ -43,10 +49,23 @@ import {
   readPublicKeyHashFromFile,
   labelToBytes32,
   resolvePrivateKeyFromCli,
+  assertValidPublicLatticeFqdn,
 } from '../node/chain';
+import { loadNodeConfig, saveNodeConfig, nodeConfigPath, type LatticeNodeRole } from '../node/node-config';
+import { getOrCreateOverlayKeyPair } from '../node/state';
+import {
+  exportRoutingBundle,
+  importRoutingBundle,
+  upsertRoutingPayload,
+  ROUTING_PAYLOAD_VERSION,
+  upsertLatticeNodeLocalRecord,
+  type RoutingPayload,
+  type RoutingBundle,
+} from '../node/routing-cache';
+import { LpGatewayResolver } from '../node/lp-resolver';
 import { credentialMaskFromNames } from '../core/namespace-access';
 import { LatticeCA }         from '../core/ca';
-import { generateKeyPair } from '../core/identity';
+import { generateKeyPair, hashRequestBody, requestSignaturePayload, signData } from '../core/identity';
 import * as crypto from 'crypto';
 import { ethers } from 'ethers';
 
@@ -61,7 +80,7 @@ function requireInit() {
   }
 }
 function ok(msg: string) { console.log(`${chalk.green('✓')} ${msg}`); }
-function err(msg: string) { console.error(`${chalk.red('✗')} ${msg}`); process.exit(1); }
+function err(msg: string): never { console.error(`${chalk.red('✗')} ${msg}`); process.exit(1); }
 
 /** Private key for chain txs: use --key-file (outside repo) instead of raw --key when possible. */
 function requireChainPk(opts: { key?: string; keyFile?: string }): string {
@@ -71,6 +90,122 @@ function requireChainPk(opts: { key?: string; keyFile?: string }): string {
     err(e.message);
     throw e;
   }
+}
+
+function normalizeLatticeFqdn(input: string): string {
+  let fqdn = input.trim().toLowerCase();
+  fqdn = fqdn.replace(/^lp:\/\//, '');
+  const slash = fqdn.indexOf('/');
+  if (slash >= 0) fqdn = fqdn.slice(0, slash);
+  assertValidPublicLatticeFqdn(fqdn);
+  return fqdn;
+}
+
+function csvValues(input: string): string[] {
+  return input.split(',').map(s => s.trim()).filter(Boolean);
+}
+
+function parseNodeRoles(raw: string | undefined, fallback: LatticeNodeRole[] = ['entry']): LatticeNodeRole[] {
+  const parts = raw?.trim() ? csvValues(raw.toLowerCase()) : fallback;
+  const out: LatticeNodeRole[] = [];
+  for (const p of parts) {
+    if (p !== 'entry' && p !== 'relay' && p !== 'gateway') err(`Unknown role token: ${p}`);
+    out.push(p);
+  }
+  return [...new Set(out)];
+}
+
+function roleBitmaskFromRoles(roles: LatticeNodeRole[]): number {
+  return roles.reduce((acc, role) => {
+    if (role === 'entry') return acc | LATTICE_CHAIN_ROLE_ENTRY;
+    if (role === 'relay') return acc | LATTICE_CHAIN_ROLE_RELAY;
+    return acc | LATTICE_CHAIN_ROLE_GATEWAY;
+  }, 0);
+}
+
+function parseUpstreamRelaysForConfig(input: string | undefined, relayLabel?: string): Array<string | { label: string; url: string }> {
+  const urls = input?.trim() ? csvValues(input) : ['ws://127.0.0.1:8888'];
+  return urls.map((item, idx) => {
+    const eq = item.indexOf('=');
+    if (eq > 0) return { label: item.slice(0, eq).trim(), url: item.slice(eq + 1).trim() };
+    if (idx === 0 && relayLabel?.trim()) return { label: relayLabel.trim(), url: item };
+    return item;
+  });
+}
+
+async function announceRouting(opts: {
+  fqdn: string;
+  endpoints: string;
+  gatewayNodeLabel?: string;
+  gatewayPubkeyBase64?: string;
+  publish?: boolean;
+  serviceCertHash?: string;
+  rpc?: string;
+  contract?: string;
+  key?: string;
+  keyFile?: string;
+}): Promise<void> {
+  const fqdn = normalizeLatticeFqdn(opts.fqdn);
+  const eps = csvValues(opts.endpoints);
+  if (!eps.length) err('Provide comma-separated gateways via --endpoints or --endpoint');
+  const cfg = loadNodeConfig();
+
+  const payload: RoutingPayload = {
+    version: ROUTING_PAYLOAD_VERSION,
+    fqdn,
+    gatewayNodeLabel: opts.gatewayNodeLabel?.trim() || cfg?.nodeId?.trim() || undefined,
+    gatewayPubKeyB64: opts.gatewayPubkeyBase64?.trim() ?? getOrCreateOverlayKeyPair().publicKey.trim(),
+    gatewayEndpoints: eps,
+  };
+  if (cfg?.distributedMesh && !payload.gatewayNodeLabel) {
+    err('distributedMesh routing announce requires --gateway-node-label or nodeId in node.yaml');
+  }
+
+  const disk = upsertRoutingPayload(cfg, payload);
+  ok(`routing-cache row written → ${disk.cachePath}`);
+  ok(` commitment metadataHash=${chalk.green(disk.metadataHash)}`);
+
+  if (!opts.publish) return;
+
+  const rpcUrl = opts.rpc?.trim();
+  const contractAddr = opts.contract?.trim();
+  let pkSigner: string | undefined;
+  if (opts.key?.trim() || opts.keyFile?.trim()) pkSigner = resolvePrivateKeyFromCli(opts);
+
+  if (!rpcUrl || !contractAddr || !pkSigner)
+    err('Publishing requires --rpc, --contract, and (--key|--key-file)');
+
+  await chainUpdateNamespaceServiceBinding(
+    rpcUrl,
+    pkSigner,
+    contractAddr,
+    fqdn,
+    opts.serviceCertHash !== undefined ? opts.serviceCertHash : undefined,
+    disk.metadataHash,
+  );
+  ok(chalk.green('Published routing commitment on-chain'));
+}
+
+function addPeerCacheRow(opts: {
+  label?: string;
+  overlayPubkeyBase64?: string;
+  pubkey?: string;
+  roles?: string;
+  endpoint?: string;
+  tlsFingerprintSha256?: string;
+}): void {
+  const label = opts.label?.trim();
+  if (!label) err('Provide --label <label>');
+  const overlayPubkeyBase64 = opts.overlayPubkeyBase64?.trim() || opts.pubkey?.trim();
+  if (!overlayPubkeyBase64) err('Provide --pubkey <base64> or --overlay-pubkey-base64 <base64>');
+  const roleBitmask = opts.roles?.trim() ? roleBitmaskFromRoles(parseNodeRoles(opts.roles, [])).valueOf() : undefined;
+  upsertLatticeNodeLocalRecord(loadNodeConfig(), label, {
+    overlayPubKeyB64: overlayPubkeyBase64,
+    endpoint: opts.endpoint?.trim(),
+    roleBitmask,
+    tlsFingerprintSha256: opts.tlsFingerprintSha256?.trim(),
+  });
+  ok(`Inserted latticePeers cache bootstrap for '${label}'`);
 }
 
 // ── init ────────────────────────────────────────────────────────────────────
@@ -184,12 +319,41 @@ svc.command('list').description('List registered services').action(() => {
 });
 
 // ── resolve ──────────────────────────────────────────────────────────────────
-program.command('resolve <address>').description('Resolve a lp:// address').action((address) => {
+program.command('resolve <address>').description('Resolve a lp:// address (YAML service + overlay route)')
+.option('--offline', 'Only show ~/.lattice/services (no routing-cache / chain)', false)
+.action(async (address, opts: { offline?: boolean }) => {
   requireInit();
-  const name = address.replace('lp://', '').replace('.lattice', '');
-  if (!serviceExists(name)) err(`Service '${address}' not found`);
+  let addr = address.trim();
+  if (!addr.startsWith('lp://')) addr = `lp://${addr}`;
+  const slug = addr.replace('lp://', '').replace('.lattice', '');
+  const name = slug.split('/')[0] ?? '';
+
+  if (!opts.offline) {
+    const cfg = loadNodeConfig();
+    const chainCfg =
+      cfg?.registry?.chain?.rpcUrl?.trim() && cfg?.registry?.chain?.contractAddress?.trim()
+        ? { rpcUrl: cfg.registry.chain.rpcUrl.trim(), contractAddress: cfg.registry.chain.contractAddress.trim() }
+        : process.env.LATTICE_CHAIN_RPC_URL?.trim() && process.env.LATTICE_CHAIN_ADDRESS?.trim()
+          ? {
+              rpcUrl: process.env.LATTICE_CHAIN_RPC_URL.trim(),
+              contractAddress: process.env.LATTICE_CHAIN_ADDRESS.trim(),
+            }
+          : null;
+    try {
+      const resolver = new LpGatewayResolver(cfg ?? null, chainCfg);
+      const r = await resolver.resolveDestination(addr);
+      console.log(chalk.bold(`Overlay routing: ${r.lpDestination}`));
+      console.log(`  ${chalk.dim('gateway endpoints')}  ${chalk.cyan(r.gatewayEndpoints.join(', '))}`);
+      console.log(`  ${chalk.dim('metadataHash')}           ${chalk.dim(r.metadataHash)}`);
+      if (r.serviceCertHash) console.log(`  ${chalk.dim('serviceCertHash')}        ${chalk.dim(r.serviceCertHash)}`);
+    } catch (e: any) {
+      console.log(chalk.yellow(`overlay route: ${e?.message ?? e}`));
+    }
+  }
+
+  if (!serviceExists(name)) err(`Service '${addr}' not found in ~/.lattice/services (run: lattice service add ${name} --url <url>)`);
   const s = loadService(name);
-  console.log(chalk.bold(`Resolved: ${address}`));
+  console.log(chalk.bold(`\nYAML service: ${addr}`));
   Object.entries(s).forEach(([k, v]) => console.log(`  ${chalk.dim(k + ':')}  ${v}`));
 });
 
@@ -225,22 +389,349 @@ const nodeCmd = program.command('node').description('Manage Lattice Overlay Node
 nodeCmd.command('start').description('Start a Lattice Overlay Node')
   .requiredOption('--role <role>', 'Role of the node: entry, relay, or gateway')
   .option('--port <port>', 'Port to listen on')
+  .option('--bind <host:port>', 'Override ~/.lattice/node.yaml bind for this role')
   .option('--service <wp_url>', 'For gateway: The Lattice service address (e.g. lp://echo.lattice)')
   .option('--target <http_url>', 'For gateway: The internal HTTP backend to proxy to')
+  .option('--relay <urls>', 'Comma-separated upstream relay URLs for entry role (override YAML)')
   .action((opts) => {
     requireInit();
     const port = opts.port ? parseInt(opts.port, 10) : undefined;
-    
+    const yaml = loadNodeConfig();
+    const relayUrls = typeof opts.relay === 'string' && opts.relay.trim()
+      ? opts.relay.split(',').map((s: string) => s.trim()).filter(Boolean)
+      : undefined;
+
     if (opts.role === 'entry') {
-      new EntryNode(port || DEFAULT_ENTRY_PORT);
+      new EntryNode({
+        port: port ?? DEFAULT_ENTRY_PORT,
+        bindHostPort: opts.bind,
+        relayUrls,
+        nodeConfig: yaml,
+      });
     } else if (opts.role === 'relay') {
-      new RelayNode(port || DEFAULT_RELAY_PORT);
+      new RelayNode({ port: port ?? DEFAULT_RELAY_PORT, bindHostPort: opts.bind, nodeConfig: yaml });
     } else if (opts.role === 'gateway') {
       if (!opts.service || !opts.target) err('Gateway role requires --service and --target');
-      new ServiceGateway(opts.service, opts.target, port || 8889);
+      new ServiceGateway(opts.service, opts.target, {
+        port: port ?? 8889,
+        bindHostPort: opts.bind,
+        nodeConfig: yaml,
+      });
     } else {
       err(`Unknown role: ${opts.role}`);
     }
+  });
+
+nodeCmd
+  .command('init')
+  .alias('init-sample')
+  .description('Write ~/.lattice/node.yaml starter template')
+  .option('--node-id <id>', 'Stable lattice node label used on-chain')
+  .option('--roles <roles>', 'Comma-separated entry,relay,gateway roles', 'entry')
+  .option('--distributed-mesh', 'Enable strict ECDH between distinct Lattice nodes', false)
+  .option('--upstream-relays <urls>', 'comma-separated websocket relay URLs')
+  .option('--relay-label <label>', 'canonical label stored in caches / pubkey lookup hints')
+  .option('--entry-bind <host:port>', 'Entry HTTP bind')
+  .option('--relay-bind <host:port>', 'Relay WS/WSS bind')
+  .option('--gateway-bind <host:port>', 'Gateway WS/WSS bind')
+  .option('--public-entry <url>', 'Public Entry URL hint')
+  .option('--public-relay <url>', 'Public Relay URL hint')
+  .option('--public-gateway <url>', 'Public Gateway URL hint')
+  .option('--chain-rpc <url>', 'LatticeChain JSON-RPC URL')
+  .option('--chain-contract <address>', 'LatticeChain contract address')
+  .option('--cache-file <path>', 'Routing cache path')
+  .option('--tls-cert-file <path>', "Let's Encrypt fullchain.pem")
+  .option('--tls-key-file <path>', "Let's Encrypt privkey.pem")
+  .option('--tls-ca-file <path>', 'Optional CA bundle for self-signed peer certs')
+  .action(opts => {
+    requireInit();
+    const distributed = Boolean(opts.distributedMesh);
+    if (distributed && !opts.nodeId?.trim()) err('--node-id is required with --distributed-mesh');
+    const roles = parseNodeRoles(opts.roles, ['entry']);
+    const relays = parseUpstreamRelaysForConfig(opts.upstreamRelays, opts.relayLabel);
+
+    saveNodeConfig({
+      nodeId: opts.nodeId?.trim() || undefined,
+      roles,
+      distributedMesh: distributed,
+      bind: {
+        entry: opts.entryBind?.trim() || '127.0.0.1:7777',
+        relay: opts.relayBind?.trim() || (distributed ? '0.0.0.0:8888' : '127.0.0.1:8888'),
+        gateway: opts.gatewayBind?.trim() || (distributed ? '0.0.0.0:8889' : '127.0.0.1:8889'),
+      },
+      public: {
+        entry: opts.publicEntry?.trim() || undefined,
+        relay: opts.publicRelay?.trim() || undefined,
+        gateway: opts.publicGateway?.trim() || undefined,
+      },
+      upstreamRelays: relays,
+      primaryUpstreamRelayLabel:
+        typeof opts.relayLabel === 'string' && opts.relayLabel.trim().length ?
+          opts.relayLabel.trim()
+        : 'local-relay',
+      registry: {
+        chain:
+          opts.chainRpc?.trim() && opts.chainContract?.trim()
+            ? { rpcUrl: opts.chainRpc.trim(), contractAddress: opts.chainContract.trim() }
+            : undefined,
+        cacheFile: opts.cacheFile?.trim() || undefined,
+      },
+      tls: {
+        certFile: opts.tlsCertFile?.trim() || undefined,
+        keyFile: opts.tlsKeyFile?.trim() || undefined,
+        caFile: opts.tlsCaFile?.trim() || undefined,
+      },
+    });
+
+    ok(`Sample node YAML → ${chalk.cyan(nodeConfigPath())}`);
+    console.log(
+      chalk.dim('Add registry.chain { rpcUrl, contractAddress } to enable hybrid resolution + ECDH relays.'),
+    );
+  });
+
+nodeCmd
+  .command('register')
+  .description('Chain owner publishes this host overlay pubkey (registerLatticeNode)')
+  .requiredOption('--label <label>', 'Stable node label')
+  .requiredOption('--roles <roles>', 'Comma-separated entry,relay,gateway flags')
+  .requiredOption('--rpc <url>', 'JSON-RPC')
+  .requiredOption('--contract <address>', 'LatticeChain contract')
+  .option('--key <hex>')
+  .option('--key-file <path>')
+  .option('--tls-fingerprint-sha256 <hex>', 'Optional pinning hash (hex bytes32)')
+  .action(async opts => {
+    requireInit();
+    const pkSigner = requireChainPk(opts);
+    const bitmask = roleBitmaskFromRoles(parseNodeRoles(opts.roles, []));
+    if (!bitmask) err('Provide at least one role flag');
+
+    const overlayPk = getOrCreateOverlayKeyPair().publicKey.trim();
+    const fp = opts.tlsFingerprintSha256?.trim();
+    const tx = await chainRegisterLatticeNode(
+      opts.rpc.trim(),
+      pkSigner,
+      opts.contract.trim(),
+      opts.label.trim(),
+      overlayPk,
+      fp && fp.length ? fp : undefined,
+      bitmask,
+    );
+    ok(`registerLatticeNode tx=${chalk.green(tx)}`);
+    upsertLatticeNodeLocalRecord(loadNodeConfig(), opts.label.trim(), {
+      overlayPubKeyB64: overlayPk,
+      roleBitmask: bitmask,
+      tlsFingerprintSha256: fp,
+    });
+    ok('Updated routing-cache latticeNodes bootstrap row');
+  });
+
+const routingCli = program.command('routing').description('Signed routing hints (routing-cache.json)');
+
+routingCli
+  .command('announce')
+  .description('Upsert signed routing-cache row (optionally publishes metadata hash on LatticeChain)')
+  .requiredOption('--fqdn <fqdn>', '*.lattice fqdn')
+  .requiredOption('--endpoints <csv>', 'Comma-separated gateway ws/wss endpoints')
+  .option('--gateway-node-label <label>', 'registered lattice node label for the gateway')
+  .option('--gateway-pubkey-base64 <base64>', 'explicit gateway pubkey; default local overlay pubkey')
+  .option('--publish', 'Call updateNamespaceServiceBinding with metadata commitment', false)
+  .option('--service-cert-hash <0x>', 'Optional serviceCertHash arg when publishing')
+  .option('--rpc <url>')
+  .option('--contract <address>')
+  .option('--key <hex>')
+  .option('--key-file <path>')
+  .action(async (opts: {
+    fqdn: string;
+    endpoints: string;
+    gatewayNodeLabel?: string;
+    gatewayPubkeyBase64?: string;
+    publish?: boolean;
+    serviceCertHash?: string;
+    rpc?: string;
+    contract?: string;
+    key?: string;
+    keyFile?: string;
+  }) => {
+    requireInit();
+    await announceRouting(opts);
+  });
+
+routingCli
+  .command('export')
+  .description('Export a chain-committed routing hint bundle for another node')
+  .requiredOption('--fqdn <fqdn>', '*.lattice fqdn')
+  .requiredOption('--out <file>', 'Output JSON bundle path')
+  .action(opts => {
+    requireInit();
+    const fqdn = normalizeLatticeFqdn(opts.fqdn);
+    const bundle = exportRoutingBundle(loadNodeConfig(), fqdn);
+    const out = path.isAbsolute(opts.out) ? opts.out : path.resolve(process.cwd(), opts.out);
+    fs.writeFileSync(out, JSON.stringify(bundle, null, 2), { mode: 0o600 });
+    ok(`routing bundle exported → ${out}`);
+    ok(` metadataHash=${chalk.green(bundle.metadataHash)}`);
+  });
+
+routingCli
+  .command('import')
+  .description('Import a routing hint bundle and re-sign it for this local node')
+  .requiredOption('--file <file>', 'Routing bundle JSON')
+  .option('--verify-chain', 'Require metadataHash to match the namespace on-chain', false)
+  .option('--rpc <url>')
+  .option('--contract <address>')
+  .action(async opts => {
+    requireInit();
+    const filePath = path.isAbsolute(opts.file) ? opts.file : path.resolve(process.cwd(), opts.file);
+    if (!fs.existsSync(filePath)) err(`Routing bundle not found: ${filePath}`);
+    const bundle = JSON.parse(fs.readFileSync(filePath, 'utf8')) as RoutingBundle;
+    if (opts.verifyChain) {
+      const rpc = opts.rpc?.trim() || loadNodeConfig()?.registry?.chain?.rpcUrl?.trim();
+      const contract = opts.contract?.trim() || loadNodeConfig()?.registry?.chain?.contractAddress?.trim();
+      if (!rpc || !contract) err('--verify-chain requires --rpc and --contract, or registry.chain in node.yaml');
+      const ns = await chainGetNamespace(rpc, contract, bundle.route.fqdn);
+      if (!ns.active || ns.metadataHash.toLowerCase() !== bundle.metadataHash.toLowerCase()) {
+        err(`Routing bundle does not match on-chain metadataHash for ${bundle.route.fqdn}`);
+      }
+    }
+    const disk = importRoutingBundle(loadNodeConfig(), bundle);
+    ok(`routing bundle imported → ${disk.cachePath}`);
+    ok(` metadataHash=${chalk.green(disk.metadataHash)}`);
+  });
+
+const gatewayCli = program.command('gateway').description('Manage Service Gateway announcements');
+
+gatewayCli
+  .command('announce <address>')
+  .description('Announce a gateway endpoint for lp://*.lattice into routing-cache and optionally chain')
+  .requiredOption('--backend <url>', 'Local backend URL for the service catalog')
+  .requiredOption('--endpoint <url>', 'Gateway ws/wss endpoint')
+  .option('--gateway-node-label <label>', 'registered lattice node label for the gateway')
+  .option('--gateway-pubkey-base64 <base64>', 'explicit gateway pubkey; default local overlay pubkey')
+  .option('--publish', 'Call updateNamespaceServiceBinding with metadata commitment', false)
+  .option('--service-cert-hash <0x>', 'Optional serviceCertHash arg when publishing')
+  .option('--rpc <url>')
+  .option('--contract <address>')
+  .option('--key <hex>')
+  .option('--key-file <path>')
+  .action(async (address, opts: {
+    backend: string;
+    endpoint: string;
+    gatewayNodeLabel?: string;
+    gatewayPubkeyBase64?: string;
+    publish?: boolean;
+    serviceCertHash?: string;
+    rpc?: string;
+    contract?: string;
+    key?: string;
+    keyFile?: string;
+  }) => {
+    requireInit();
+    const fqdn = normalizeLatticeFqdn(address);
+    const serviceName = fqdn.replace(/\.lattice$/, '');
+    saveService(serviceName, {
+      name: serviceName,
+      address: `lp://${fqdn}`,
+      url: opts.backend.trim(),
+      policy_profile: 'default',
+      registeredAt: new Date().toISOString(),
+    });
+    ok(`Service '${chalk.cyan(`lp://${fqdn}`)}' → ${opts.backend.trim()}`);
+    await announceRouting({
+      fqdn,
+      endpoints: opts.endpoint,
+      gatewayNodeLabel: opts.gatewayNodeLabel,
+      gatewayPubkeyBase64: opts.gatewayPubkeyBase64,
+      publish: opts.publish,
+      serviceCertHash: opts.serviceCertHash,
+      rpc: opts.rpc,
+      contract: opts.contract,
+      key: opts.key,
+      keyFile: opts.keyFile,
+    });
+  });
+
+const peerCli = program
+  .command('peer')
+  .description('Bootstrap lattice node pubkey hints into ~/.lattice/routing-cache latticeNodes{}');
+
+peerCli
+  .command('add')
+  .description('Bootstrap a lattice node pubkey hint into ~/.lattice/routing-cache latticeNodes{}')
+  .option('--label <label>', 'Matches chain lattice node registration label')
+  .option('--pubkey <base64>', 'Base64 DER X25519 SPKI')
+  .option('--overlay-pubkey-base64 <base64>', 'Base64 DER X25519 SPKI')
+  .option('--roles <roles>', 'Comma-separated entry,relay,gateway roles for local bootstrap validation')
+  .option('--endpoint <url>', 'Optional relay/gateway websocket URL shortcut')
+  .option('--tls-fingerprint-sha256 <hex>', 'Optional TLS pinning hash recorded locally')
+  .action(opts => {
+    requireInit();
+    addPeerCacheRow(opts);
+  });
+
+const meshCli = program.command('mesh').description('Distributed mesh operations');
+
+meshCli
+  .command('smoke')
+  .description('Signed round-trip smoke test through an Entry node')
+  .requiredOption('--agent <name>', 'Local agent identity to sign the request')
+  .requiredOption('--entry <url>', 'Entry HTTP/HTTPS base URL, e.g. http://127.0.0.1:7777')
+  .requiredOption('--host <fqdn>', 'Lattice Host header, e.g. echo.lattice')
+  .option('--path <path>', 'Request path', '/ping')
+  .option('--expect-status <code>', 'Expected HTTP status', '200')
+  .action(async opts => {
+    requireInit();
+    const agent = loadAgent(opts.agent);
+    const method = 'GET';
+    const reqPath = String(opts.path || '/ping').startsWith('/') ? String(opts.path || '/ping') : `/${opts.path}`;
+    const body = Buffer.alloc(0);
+    const timestamp = new Date().toISOString();
+    const nonce = crypto.randomBytes(12).toString('hex');
+    const payload = requestSignaturePayload({
+      method,
+      host: opts.host,
+      url: reqPath,
+      timestamp,
+      bodyHash: hashRequestBody(body),
+    });
+    const signature = signData(payload, agent.privateKey);
+    const entry = new URL(opts.entry);
+    const expected = parseInt(String(opts.expectStatus), 10);
+    const client = entry.protocol === 'https:' ? https : http;
+
+    const result = await new Promise<{ status: number; body: string }>((resolve, reject) => {
+      const req = client.request(
+        {
+          protocol: entry.protocol,
+          hostname: entry.hostname,
+          port: entry.port || (entry.protocol === 'https:' ? 443 : 80),
+          path: reqPath,
+          method,
+          headers: {
+            host: opts.host,
+            'x-lattice-agent': opts.agent,
+            'x-lattice-signature': signature,
+            'x-lattice-timestamp': timestamp,
+            'x-lattice-nonce': nonce,
+          },
+        },
+        res => {
+          const chunks: Buffer[] = [];
+          res.on('data', d => chunks.push(Buffer.from(d)));
+          res.on('end', () => resolve({
+            status: res.statusCode ?? 0,
+            body: Buffer.concat(chunks).toString('utf8'),
+          }));
+        },
+      );
+      req.on('error', reject);
+      req.end();
+    });
+
+    if (result.status !== expected) {
+      console.error(result.body);
+      err(`mesh smoke failed: status ${result.status}, expected ${expected}`);
+    }
+    ok(`mesh smoke passed: ${opts.host}${reqPath} → ${result.status}`);
+    if (result.body.trim()) console.log(result.body);
   });
 
 // ── run ───────────────────────────────────────────────────────────────────────

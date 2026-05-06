@@ -402,6 +402,91 @@ export async function chainSetReservedOfficialSlug(
   return receipt.hash;
 }
 
+export const LATTICE_CHAIN_ROLE_ENTRY = 1;
+export const LATTICE_CHAIN_ROLE_RELAY = 2;
+export const LATTICE_CHAIN_ROLE_GATEWAY = 4;
+
+export function latticeNodeIdBytes32(nodeLabel: string): string {
+  return ethers.keccak256(ethers.toUtf8Bytes(nodeLabel.trim()));
+}
+
+export async function chainRegisterLatticeNode(
+  rpcUrl: string,
+  privateKey: string,
+  contractAddress: string,
+  nodeLabel: string,
+  overlayPubKeyB64: string,
+  tlsFingerprintSha256Hex: string | undefined,
+  roleBitmask: number,
+): Promise<string> {
+  const c = getSignerContract(rpcUrl, privateKey, contractAddress);
+  const pk = Buffer.from(overlayPubKeyB64.trim(), 'base64');
+  const overlayBytes = ethers.getBytes(pk);
+  const tls =
+    tlsFingerprintSha256Hex?.trim() !== undefined && tlsFingerprintSha256Hex.trim() !== ''
+      ? parseBytes32HexOrZero(tlsFingerprintSha256Hex.trim())
+      : ethers.ZeroHash;
+  const tx = await c.registerLatticeNode(nodeLabel.trim(), overlayBytes, tls, roleBitmask);
+  const receipt = await tx.wait();
+  return receipt.hash;
+}
+
+export async function chainSetLatticeNodeActive(
+  rpcUrl: string,
+  privateKey: string,
+  contractAddress: string,
+  nodeLabel: string,
+  active: boolean,
+): Promise<string> {
+  const c = getSignerContract(rpcUrl, privateKey, contractAddress);
+  const tx = await c.setLatticeNodeActive(nodeLabel.trim(), active);
+  const receipt = await tx.wait();
+  return receipt.hash;
+}
+
+export interface ChainLatticeNodeRecord {
+  overlayPubKeyB64: string;
+  tlsFingerprintSha256: string;
+  roleBitmask: number;
+  active: boolean;
+}
+
+/** Returns null if lattice node was never registered on-chain. */
+export async function chainGetLatticeNode(
+  rpcUrl: string,
+  contractAddress: string,
+  nodeLabel: string,
+): Promise<ChainLatticeNodeRecord | null> {
+  const id = latticeNodeIdBytes32(nodeLabel);
+  const c = getReadContract(rpcUrl, contractAddress);
+  const row = await c.latticeNodes(id);
+  /** ethers v6: `bytes` is `0x`-prefixed hex string. */
+  let rawPk: string;
+  if (typeof row.overlayPubKey === 'string') {
+    rawPk = row.overlayPubKey;
+  } else {
+    rawPk = ethers.hexlify(row.overlayPubKey as Uint8Array);
+  }
+  const pkDecoded = ethers.getBytes(rawPk);
+  if (pkDecoded.length === 0) return null;
+
+  const tlsFingerprintSha256 =
+    typeof row.tlsFingerprintSha256 === 'string'
+      ? row.tlsFingerprintSha256
+      : ethers.hexlify(row.tlsFingerprintSha256);
+
+  const roleBitmask =
+    typeof row.roleBitmask === 'bigint' ? Number(row.roleBitmask) : Number(row.roleBitmask ?? 0);
+  const active = Boolean(row.active);
+
+  return {
+    overlayPubKeyB64: Buffer.from(pkDecoded).toString('base64'),
+    tlsFingerprintSha256,
+    roleBitmask,
+    active,
+  };
+}
+
 export function createKMSFromCli(opts: { key?: string; keyFile?: string; kmsBackend?: string; kmsPlugin?: string }): KMSBackend {
   if (opts.kmsBackend) {
     return createKMSBackend({ backend: opts.kmsBackend, pluginCommand: opts.kmsPlugin });

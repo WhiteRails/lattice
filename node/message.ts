@@ -1,4 +1,5 @@
 import * as crypto from 'crypto';
+import type { LatticeNodeRole } from './node-config';
 
 export interface OverlayMessage {
   id: string;             // Unique message ID
@@ -26,9 +27,11 @@ export interface OverlayMessage {
 
   // Per-peer ECDH: sender's X25519 public key (base64 SPKI DER)
   source_pubkey?: string;
+  source_node_label?: string;
+  source_node_role?: LatticeNodeRole;
 }
 
-function stableStringify(value: any): string {
+export function stableStringify(value: any): string {
   if (value === null || typeof value !== 'object') return JSON.stringify(value);
   if (Array.isArray(value)) return `[${value.map(stableStringify).join(',')}]`;
   const keys = Object.keys(value).sort();

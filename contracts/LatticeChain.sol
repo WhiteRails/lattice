@@ -71,6 +71,17 @@ contract LatticeChain {
     }
     mapping(bytes32 => NamespaceRecord) public namespaces;
 
+    /// @notice Public overlay identities for Lattice nodes (Entry / Relay / Gateway). Governance-only writes.
+    /// @dev `overlayPubKey` is opaque X25519 SPKI DER (base64-encoded off-chain becomes raw bytes here).
+    ///      `tlsFingerprintSha256` is optional pin (zeros = TLS chain validation only).
+    struct LatticeNode {
+        bytes overlayPubKey;
+        bytes32 tlsFingerprintSha256;
+        uint8 roleBitmask; // 1 = ENTRY | 2 = RELAY | 4 = GATEWAY (OR allowed)
+        bool active;
+    }
+    mapping(bytes32 => LatticeNode) public latticeNodes;
+
     /** keccak256(ascii lowercase slug) where slug is the label before `.lattice`. */
     mapping(bytes32 => bool) public reservedOfficialLatticeSlugs;
 
@@ -182,6 +193,11 @@ contract LatticeChain {
     event RecoveryPolicySet(bytes32 indexed subjectId, uint8 threshold, uint64 timelockSeconds);
     event KeyRevocationEvent(bytes32 indexed subjectId, bytes32 targetKeyId, bytes32 reasonCode);
     event SubjectFreezeSet(bytes32 indexed subjectId, bool active);
+    event LatticeNodeRegistered(bytes32 indexed nodeIdHash, string nodeLabel);
+
+    uint8 public constant LATTICE_ROLE_ENTRY = 1;
+    uint8 public constant LATTICE_ROLE_RELAY = 2;
+    uint8 public constant LATTICE_ROLE_GATEWAY = 4;
 
     // --- Ownership ---
 
@@ -293,6 +309,26 @@ contract LatticeChain {
         n.credentialMask = credentialMask;
         n.minAssuranceLevel = minAssuranceLevel;
         emit NamespacePolicyUpdated(nameHash, publicAccess, credentialMask, minAssuranceLevel);
+    }
+
+    function registerLatticeNode(
+        string calldata nodeLabel,
+        bytes calldata overlayPubKey,
+        bytes32 tlsFingerprintSha256,
+        uint8 roleBitmask
+    ) external onlyOwner {
+        require(bytes(nodeLabel).length != 0, "Empty nodeLabel");
+        require(roleBitmask != 0, "No role flags");
+        require(overlayPubKey.length > 0, "Missing overlay pubkey");
+        bytes32 id = keccak256(bytes(nodeLabel));
+        latticeNodes[id] = LatticeNode(overlayPubKey, tlsFingerprintSha256, roleBitmask, true);
+        emit LatticeNodeRegistered(id, nodeLabel);
+    }
+
+    function setLatticeNodeActive(string calldata nodeLabel, bool active) external onlyOwner {
+        bytes32 id = keccak256(bytes(nodeLabel));
+        require(latticeNodes[id].overlayPubKey.length != 0, "Unknown lattice node");
+        latticeNodes[id].active = active;
     }
 
     function anchorRevocation(bytes32 _issuerId, bytes32 _merkleRoot, uint64 _validFrom, uint64 _validTo) external onlyOwner {

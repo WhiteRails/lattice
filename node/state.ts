@@ -18,7 +18,10 @@ import * as os from 'os';
 import { PowerAccumulationTracker } from '../core/pas';
 import { NodeKeyPair, generateNodeKeyPair } from './session';
 
-export const LATTICE_DIR = path.join(os.homedir(), '.lattice');
+export const LATTICE_DIR =
+  typeof process.env.LATTICE_HOME === 'string' && process.env.LATTICE_HOME.trim().length > 0 ?
+    path.resolve(process.env.LATTICE_HOME.trim())
+  : path.join(os.homedir(), '.lattice');
 
 const dirs = ['ca', 'agents', 'policies', 'services', 'logs', 'revocations', 'evidence'];
 const PRIVATE_FILE_MODE = 0o600;
