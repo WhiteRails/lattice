@@ -1,11 +1,11 @@
 # Lattice
+<img src="https://whiterails.com/ltt_concept.jpg">
 
 **A Certified Overlay Network for Autonomous AI Agents.**
 
 <p align="center">
   <em>Do not give the agent the open internet. Give it Lattice.</em>
 </p>
-<img src="https://whiterails.com/ltt_concept.jpg">
 ---
 
 The internet was designed for humans, open connectivity, and applications. It was **not** designed for autonomous AI agents capable of planning, invoking APIs, accumulating resources, and operating at machine speed. 
