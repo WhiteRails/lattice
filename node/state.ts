@@ -15,6 +15,8 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
+import { PowerAccumulationTracker } from '../core/pas';
+import { NodeKeyPair, generateNodeKeyPair } from './session';
 
 export const LATTICE_DIR = path.join(os.homedir(), '.lattice');
 
@@ -28,6 +30,7 @@ export interface CAState {
   privateKey: string;
   overlaySecret: string;
   createdAt: string;
+  overlayNodeKeyPair?: NodeKeyPair;  // X25519 keys for per-peer ECDH sessions
 }
 
 export interface AgentState {
@@ -73,6 +76,14 @@ export function loadCA(): CAState {
     throw new Error('Lattice CA state is incomplete. Re-run lattice init in a clean state or migrate ca.json.');
   }
   return state;
+}
+
+export function getOrCreateOverlayKeyPair(): NodeKeyPair {
+  const ca = loadCA();
+  if (ca.overlayNodeKeyPair) return ca.overlayNodeKeyPair;
+  const kp = generateNodeKeyPair();
+  saveCA({ ...ca, overlayNodeKeyPair: kp });
+  return kp;
 }
 
 // ─── Agents ──────────────────────────────────────────────────────────────────
@@ -167,4 +178,18 @@ export function tailLog(n: number = 50): object[] {
 
 export function logPath(): string {
   return path.join(LATTICE_DIR, 'logs', 'actions.jsonl');
+}
+
+// ─── PAS State ───────────────────────────────────────────────────────────────
+
+export const PAS_STATE_PATH = path.join(LATTICE_DIR, 'pas-state.json');
+
+export function savePAS(tracker: PowerAccumulationTracker, hmacKey: string): void {
+  tracker.save(PAS_STATE_PATH, hmacKey);
+}
+
+export function loadPAS(tracker: PowerAccumulationTracker, hmacKey: string): void {
+  if (fs.existsSync(PAS_STATE_PATH)) {
+    tracker.load(PAS_STATE_PATH, hmacKey);
+  }
 }

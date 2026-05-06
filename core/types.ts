@@ -401,9 +401,9 @@ export const SAAESchema = z.object({
     bundle_hash: z.string().optional(),
   }),
   signatures: z.object({
-    agent_signature: z.string(),
+    agent_action_signature: z.string(),
     runtime_signature: z.string().optional(),
-    gateway_signature: z.string().optional(),
+    gateway_witness_signature: z.string().optional(),
     tool_signature: z.string().optional(),
   }),
 });

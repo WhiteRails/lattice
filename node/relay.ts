@@ -1,13 +1,17 @@
 import { WebSocketServer, WebSocket } from 'ws';
 import { OverlayMessage, signOverlayMessage, verifyOverlayMessage } from './message';
-import { loadCA } from './state';
+import { loadCA, getOrCreateOverlayKeyPair } from './state';
+import { SessionManager } from './session';
 import chalk from 'chalk';
 
 export const DEFAULT_RELAY_PORT = 8888;
 
 export class RelayNode {
   private wss: WebSocketServer;
-  
+  private myPublicKey: string;
+  private upstreamMgr: SessionManager;   // sessions with entry nodes
+  private downstreamMgr: SessionManager; // sessions with gateway nodes
+
   // Fake Federated Registry for the testnet
   // Maps destination -> Gateway WS URL
   private registry: Record<string, string> = {
@@ -18,6 +22,11 @@ export class RelayNode {
   };
 
   constructor(port = DEFAULT_RELAY_PORT) {
+    const relayKeyPair = getOrCreateOverlayKeyPair();
+    this.myPublicKey = relayKeyPair.publicKey;
+    this.upstreamMgr = new SessionManager('relay-upstream', relayKeyPair.privateKey);
+    this.downstreamMgr = new SessionManager('relay-downstream', relayKeyPair.privateKey);
+
     this.wss = new WebSocketServer({ port, host: '127.0.0.1' });
     
     this.wss.on('connection', (ws) => {
@@ -34,7 +43,12 @@ export class RelayNode {
     } catch { return; }
 
     const overlaySecret = loadCA().overlaySecret;
-    if (!verifyOverlayMessage(msg, overlaySecret)) {
+
+    // Verify inbound from entry: use per-peer session key if entry provided its pubkey
+    const entryVerifyKey = msg.source_pubkey
+      ? this.upstreamMgr.getSessionKey(msg.source, msg.source_pubkey)
+      : overlaySecret;
+    if (!verifyOverlayMessage(msg, entryVerifyKey)) {
       this.sendError(clientWs, msg, 'Unauthenticated overlay request');
       return;
     }
@@ -49,24 +63,41 @@ export class RelayNode {
       return;
     }
 
+    // Re-sign the message for the downstream gateway with relay's own pubkey
+    const downstreamMsg = signOverlayMessage({
+      ...msg,
+      auth: undefined,
+      source_pubkey: this.myPublicKey,
+    }, overlaySecret);
+
     // Connect to the Gateway
     const gatewayWs = new WebSocket(targetUrl);
-    
+
     gatewayWs.on('open', () => {
-      gatewayWs.send(JSON.stringify(msg));
+      gatewayWs.send(JSON.stringify(downstreamMsg));
     });
 
     gatewayWs.on('message', (gwData) => {
       // Forward response back to the Entry Node
       const response: OverlayMessage = JSON.parse(gwData.toString());
-      if (!verifyOverlayMessage(response, overlaySecret)) {
+      // Verify gateway response: use per-peer key if gateway provided its pubkey
+      const gwVerifyKey = response.source_pubkey
+        ? this.downstreamMgr.getSessionKey(response.source, response.source_pubkey)
+        : overlaySecret;
+      if (!verifyOverlayMessage(response, gwVerifyKey)) {
         this.sendError(clientWs, msg, 'Unauthenticated gateway response');
         gatewayWs.close();
         return;
       }
       response.trace.push('relay');
+      // Re-sign for upstream entry with relay's pubkey
+      const upstreamResponse = signOverlayMessage({
+        ...response,
+        auth: undefined,
+        source_pubkey: this.myPublicKey,
+      }, overlaySecret);
       if (clientWs.readyState === WebSocket.OPEN) {
-        clientWs.send(JSON.stringify(response));
+        clientWs.send(JSON.stringify(upstreamResponse));
       }
       gatewayWs.close();
     });
@@ -83,7 +114,8 @@ export class RelayNode {
       source: 'relay',
       destination: req.source,
       payload: { status: 502, headers: { 'content-type': 'application/json' }, body: Buffer.from(JSON.stringify({ error })).toString('base64') },
-      trace: [...req.trace]
+      trace: [...req.trace],
+      source_pubkey: this.myPublicKey,
     }, loadCA().overlaySecret);
     if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(res));
   }

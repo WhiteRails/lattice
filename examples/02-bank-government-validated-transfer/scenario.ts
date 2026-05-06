@@ -3,7 +3,7 @@
  *
  * Run: npm run example:bank
  */
-import { LatticeGateway, toolCallSignaturePayload } from '../../core/gateway';
+import { LatticeGateway } from '../../core/gateway';
 import { WhitePolicy } from '../../core/policy';
 import { LatticeCA, SignedCert } from '../../core/ca';
 import { AgentCert, CapabilityToken, DelegationGrant, IntentAnchor, WhiteCertificate } from '../../core/types';
@@ -146,9 +146,11 @@ async function main() {
     runtime_cert_hash: 'runtime:hash:bank-sandbox',
   };
 
+  const callActionTimestamp = new Date().toISOString();
   const saae = await gateway.mediateToolCall({
     ...call,
-    agent_signature: signData(toolCallSignaturePayload(call), bankAgentKeys.privateKey),
+    action_timestamp: callActionTimestamp,
+    agent_signature: signData(JSON.stringify({ agent_id: call.agent_id, tool_id: call.tool_id, action_type: call.action_type, action_parameters: call.action_parameters, capability_id: capability.capability_id, timestamp: callActionTimestamp }), bankAgentKeys.privateKey),
   });
 
   console.log('Government approval: signature valid against registered gov CA public key.');

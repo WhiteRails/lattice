@@ -18,7 +18,7 @@
  */
 
 import { LatticeCA } from '../core/ca';
-import { LatticeGateway, toolCallSignaturePayload } from '../core/gateway';
+import { LatticeGateway } from '../core/gateway';
 import { LatticeRegistry } from '../core/registry';
 import { RevocationNetwork } from '../core/revocation';
 import { PowerAccumulationTracker } from '../core/pas';
@@ -202,9 +202,11 @@ async function run() {
     action_parameters: { to: 'customer@example.com', subject: 'Re: Ticket #42', body: '…' },
     runtime_cert_hash: 'runtime:hash:abc',
   };
+  const draftActionTimestamp = new Date().toISOString();
   const draftSAAE = await gateway.mediateToolCall({
     ...draftCall,
-    agent_signature: signData(toolCallSignaturePayload(draftCall), agentKeys.privateKey),
+    action_timestamp: draftActionTimestamp,
+    agent_signature: signData(JSON.stringify({ agent_id: draftCall.agent_id, tool_id: draftCall.tool_id, action_type: draftCall.action_type, action_parameters: draftCall.action_parameters, capability_id: draftCapToken.capability_id, timestamp: draftActionTimestamp }), agentKeys.privateKey),
   });
   ok(`Decision: ${grn(draftSAAE.policy.decision)}  action_id=${draftSAAE.action_id}`);
 
@@ -235,9 +237,11 @@ async function run() {
       action_parameters: { to: 'customer@example.com' },
       runtime_cert_hash: 'runtime:hash:abc',
     };
+    const sendActionTimestamp = new Date().toISOString();
     await gateway.mediateToolCall({
       ...sendCall,
-      agent_signature: signData(toolCallSignaturePayload(sendCall), agentKeys.privateKey),
+      action_timestamp: sendActionTimestamp,
+      agent_signature: signData(JSON.stringify({ agent_id: sendCall.agent_id, tool_id: sendCall.tool_id, action_type: sendCall.action_type, action_parameters: sendCall.action_parameters, capability_id: sendCapToken.capability_id, timestamp: sendActionTimestamp }), agentKeys.privateKey),
     });
   } catch (e: any) {
     // capability mismatch throws before policy check in MVP
@@ -272,9 +276,11 @@ async function run() {
     runtime_cert_hash: 'runtime:hash:abc',
     pas_updates: {},
   };
+  const pasActionTimestamp = new Date().toISOString();
   const pasSAAE = await gateway.mediateToolCall({
     ...pasCall,
-    agent_signature: signData(toolCallSignaturePayload(pasCall), agentKeys.privateKey),
+    action_timestamp: pasActionTimestamp,
+    agent_signature: signData(JSON.stringify({ agent_id: pasCall.agent_id, tool_id: pasCall.tool_id, action_type: pasCall.action_type, action_parameters: pasCall.action_parameters, capability_id: draftCapToken.capability_id, timestamp: pasActionTimestamp }), agentKeys.privateKey),
   });
   ok(`Decision: ${yel(pasSAAE.policy.decision)}`);
 
@@ -323,6 +329,7 @@ async function run() {
     await gateway.mediateToolCall({
       agent_id: 'agent:acme:support-v1',
       agent_signature: 'sig:placeholder',
+      action_timestamp: new Date().toISOString(),
       delegation,
       intent,
       capability: draftCapToken,

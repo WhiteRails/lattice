@@ -5,24 +5,27 @@ export interface OverlayMessage {
   type: 'request' | 'response';
   source: string;         // e.g. agent:bot1 or relay:xyz
   destination: string;    // e.g. lp://github.lattice
-  
+
   // The encapsulated HTTP request/response
   payload: {
     method?: string;
     url?: string;
     headers?: Record<string, string>;
     body?: string;
-    
+
     // For response
     status?: number;
   };
-  
+
   // Overlay circuit trace
   trace: string[];
   auth?: {
     key_id: string;
     signature: string;
   };
+
+  // Per-peer ECDH: sender's X25519 public key (base64 SPKI DER)
+  source_pubkey?: string;
 }
 
 function stableStringify(value: any): string {
@@ -37,17 +40,22 @@ function overlayAuthPayload(message: OverlayMessage): string {
   return stableStringify(signed);
 }
 
-export function signOverlayMessage(message: OverlayMessage, secret: string): OverlayMessage {
+// Accept either a Buffer (per-peer session key) or string (legacy shared secret)
+function toHmacKey(key: Buffer | string): Buffer {
+  return Buffer.isBuffer(key) ? key : Buffer.from(key, 'utf-8');
+}
+
+export function signOverlayMessage(message: OverlayMessage, key: Buffer | string): OverlayMessage {
   const signature = crypto
-    .createHmac('sha256', secret)
+    .createHmac('sha256', toHmacKey(key))
     .update(overlayAuthPayload(message))
     .digest('base64');
   return { ...message, auth: { key_id: 'local-overlay', signature } };
 }
 
-export function verifyOverlayMessage(message: OverlayMessage, secret: string): boolean {
+export function verifyOverlayMessage(message: OverlayMessage, key: Buffer | string): boolean {
   if (!message.auth?.signature) return false;
-  const expected = signOverlayMessage({ ...message, auth: undefined }, secret).auth!.signature;
+  const expected = signOverlayMessage({ ...message, auth: undefined }, key).auth!.signature;
   try {
     return crypto.timingSafeEqual(Buffer.from(message.auth.signature), Buffer.from(expected));
   } catch {

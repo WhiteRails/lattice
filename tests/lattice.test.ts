@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { generateKeyPair, createAgentCert, signData } from '../core/identity';
-import { LatticeGateway, toolCallSignaturePayload } from '../core/gateway';
+import { LatticeGateway } from '../core/gateway';
 import { LatticeRegistry } from '../core/registry';
 import { RevocationNetwork } from '../core/revocation';
 import { PowerAccumulationTracker } from '../core/pas';
@@ -95,9 +95,20 @@ describe('Lattice MVP Flow', () => {
       runtime_cert_hash: 'hash',
     };
 
+    const actionTimestamp = new Date().toISOString();
+    const agentActionPayload = JSON.stringify({
+      agent_id: request.agent_id,
+      tool_id: request.tool_id,
+      action_type: request.action_type,
+      action_parameters: request.action_parameters,
+      capability_id: mockCapability.capability_id,
+      timestamp: actionTimestamp,
+    });
+
     const saae = await gateway.mediateToolCall({
       ...request,
-      agent_signature: signData(toolCallSignaturePayload(request), agentKeys.privateKey),
+      action_timestamp: actionTimestamp,
+      agent_signature: signData(agentActionPayload, agentKeys.privateKey),
     });
 
     expect(saae.policy.decision).toBe('allow');
@@ -126,9 +137,11 @@ describe('Lattice MVP Flow', () => {
           action_parameters: {},
           runtime_cert_hash: 'hash',
         };
+        const ts = new Date().toISOString();
         return gateway.mediateToolCall({
           ...request,
-          agent_signature: signData(toolCallSignaturePayload(request), agentKeys.privateKey),
+          action_timestamp: ts,
+          agent_signature: signData(JSON.stringify({ agent_id: request.agent_id, tool_id: request.tool_id, action_type: request.action_type, action_parameters: request.action_parameters, capability_id: mockCapability.capability_id, timestamp: ts }), agentKeys.privateKey),
         });
       })(),
     ).rejects.toThrow('Agent certificate for agent-1 has been revoked');
@@ -147,9 +160,19 @@ describe('Lattice MVP Flow', () => {
         runtime_cert_hash: 'hash',
         pas_updates: { agent_replication_attempted: 3 },
       };
+    const actionTimestamp = new Date().toISOString();
+    const agentActionPayload = JSON.stringify({
+      agent_id: request.agent_id,
+      tool_id: request.tool_id,
+      action_type: request.action_type,
+      action_parameters: request.action_parameters,
+      capability_id: mockCapability.capability_id,
+      timestamp: actionTimestamp,
+    });
     const saae = await gateway.mediateToolCall({
       ...request,
-      agent_signature: signData(toolCallSignaturePayload(request), agentKeys.privateKey),
+      action_timestamp: actionTimestamp,
+      agent_signature: signData(agentActionPayload, agentKeys.privateKey),
     });
 
     expect(saae.policy.decision).toBe('require_human_approval');
@@ -218,9 +241,11 @@ describe('Lattice MVP Flow', () => {
           action_parameters: {},
           runtime_cert_hash: 'hash',
         };
+        const ts = new Date().toISOString();
         return gateway.mediateToolCall({
           ...request,
-          agent_signature: signData(toolCallSignaturePayload(request), agentKeys.privateKey),
+          action_timestamp: ts,
+          agent_signature: signData(JSON.stringify({ agent_id: request.agent_id, tool_id: request.tool_id, action_type: request.action_type, action_parameters: request.action_parameters, capability_id: massCap.capability_id, timestamp: ts }), agentKeys.privateKey),
         });
       })(),
     ).rejects.toThrow('Subject frozen');

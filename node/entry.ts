@@ -2,9 +2,13 @@ import * as http from 'http';
 import * as crypto from 'crypto';
 import { WebSocket } from 'ws';
 import { OverlayMessage, signOverlayMessage, verifyOverlayMessage } from './message';
-import { isRevoked, loadAgent, loadCA } from './state';
+import { isRevoked, loadAgent, loadCA, getOrCreateOverlayKeyPair } from './state';
 import { hashRequestBody, requestSignaturePayload, verifySignature } from '../core/identity';
+import { SessionManager } from './session';
 import chalk from 'chalk';
+import { NonceStore, getReplayWindowMs } from './nonce-store';
+
+const nonceStore = new NonceStore();
 
 export const DEFAULT_ENTRY_PORT = 7777;
 
@@ -13,8 +17,14 @@ export class EntryNode {
   // In a real system, we'd look up the relay from a Federated Registry.
   // For MVP, we hardcode to our local testnet relay.
   private relayUrl = 'ws://127.0.0.1:8888';
+  private myPublicKey: string;
+  private sessionMgr: SessionManager;
 
   constructor(port = DEFAULT_ENTRY_PORT) {
+    const myKeyPair = getOrCreateOverlayKeyPair();
+    this.myPublicKey = myKeyPair.publicKey;
+    this.sessionMgr = new SessionManager('entry', myKeyPair.privateKey);
+
     this.server = http.createServer((req, res) => this.handleHttp(req, res));
     this.server.listen(port, '127.0.0.1', () =>
       console.log(chalk.cyan(`[EntryNode]`) + ` Listening for agents on 127.0.0.1:${port}`)
@@ -57,7 +67,8 @@ export class EntryNode {
           headers: req.headers as Record<string, string>,
           body
         },
-        trace: ['entry']
+        trace: ['entry'],
+        source_pubkey: this.myPublicKey,
       }, loadCA().overlaySecret);
 
       console.log(chalk.cyan(`[EntryNode]`) + ` Routing ${req.method} ${req.url} -> ${resource} via Relay`);
@@ -74,7 +85,11 @@ export class EntryNode {
 
     ws.on('message', (data) => {
       const response: OverlayMessage = JSON.parse(data.toString());
-      if (!verifyOverlayMessage(response, loadCA().overlaySecret)) {
+      // Derive per-peer session key if relay provided its public key; fall back to shared secret
+      const verifyKey = response.source_pubkey
+        ? this.sessionMgr.getSessionKey('relay', response.source_pubkey)
+        : loadCA().overlaySecret;
+      if (!verifyOverlayMessage(response, verifyKey)) {
         res.writeHead(502, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ error: 'Unauthenticated overlay response' }));
         ws.close();
@@ -123,6 +138,16 @@ export class EntryNode {
     const ageMs = Math.abs(Date.now() - new Date(timestamp).getTime());
     if (!Number.isFinite(ageMs) || ageMs > 5 * 60_000) {
       return { ok: false, status: 401, error: 'Stale Lattice agent signature' };
+    }
+
+    const nonce = singleHeader(req.headers['x-lattice-nonce']);
+    if (!nonce) {
+      return { ok: false, status: 401, error: 'Missing x-lattice-nonce header' };
+    }
+    const compositeKey = `${timestamp}:${nonce}`;
+    const replayWindow = getReplayWindowMs();
+    if (!nonceStore.add(compositeKey, replayWindow)) {
+      return { ok: false, status: 401, error: 'REPLAY_DETECTED' };
     }
 
     const payload = requestSignaturePayload({

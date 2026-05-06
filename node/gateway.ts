@@ -3,18 +3,42 @@ import * as http from 'http';
 import * as crypto from 'crypto';
 import { OverlayMessage, signOverlayMessage, verifyOverlayMessage } from './message';
 import { PolicyLoader } from './policy-loader';
-import { appendLog, loadCA } from './state';
+import { appendLog, isRevoked, loadCA, getOrCreateOverlayKeyPair } from './state';
+import { SessionManager } from './session';
 import chalk from 'chalk';
+import { controlBus } from './agent-control';
+import { PowerAccumulationTracker } from '../core/pas';
 
 export class ServiceGateway {
   private wss: WebSocketServer;
   private policy = new PolicyLoader();
+  private pasTracker?: PowerAccumulationTracker;
+  private pasThreshold = 100;
+  private myPublicKey: string;
+  private sessionMgr: SessionManager;
+
+  setPASTracker(tracker: PowerAccumulationTracker, threshold = 100): void {
+    this.pasTracker = tracker;
+    this.pasThreshold = threshold;
+  }
+
+  private checkPASAndMaybePause(agent: string): void {
+    if (!this.pasTracker) return;
+    const score = this.pasTracker.getScore(agent);
+    if (score && score.score >= this.pasThreshold * 2) {
+      controlBus.pauseAgent(agent);
+    }
+  }
 
   constructor(
     private serviceAddress: string, // e.g. lp://echo.lattice
     private targetHttpBase: string, // e.g. http://127.0.0.1:9001
     port: number
   ) {
+    const gwKeyPair = getOrCreateOverlayKeyPair();
+    this.myPublicKey = gwKeyPair.publicKey;
+    this.sessionMgr = new SessionManager('gateway', gwKeyPair.privateKey);
+
     this.wss = new WebSocketServer({ port, host: '127.0.0.1' });
     
     this.wss.on('connection', (ws) => {
@@ -27,7 +51,11 @@ export class ServiceGateway {
   private handleMessage(ws: WebSocket, data: string) {
     let msg: OverlayMessage;
     try { msg = JSON.parse(data); } catch { return; }
-    if (!verifyOverlayMessage(msg, loadCA().overlaySecret)) {
+    // Verify with per-peer session key if sender provided pubkey; fall back to shared secret
+    const verifyKey = msg.source_pubkey
+      ? this.sessionMgr.getSessionKey(msg.source, msg.source_pubkey)
+      : loadCA().overlaySecret;
+    if (!verifyOverlayMessage(msg, verifyKey)) {
       this.sendResponse(ws, {
         id: msg.id,
         type: 'response',
@@ -41,7 +69,14 @@ export class ServiceGateway {
 
     msg.trace.push('gateway');
     const agent = msg.source;
-    
+
+    // 0. Check revocation before any policy evaluation
+    if (isRevoked(agent)) {
+      this.log(agent, 'request', 'deny', 'AGENT_REVOKED');
+      this.sendResponse(ws, msg, 403, { error: 'AGENT_REVOKED' });
+      return;
+    }
+
     // 1. Evaluate Policy at the Gateway!
     const reqUrlStr = msg.payload.url || '/';
     const action = this.inferAction(msg.payload.method ?? 'GET', reqUrlStr);
@@ -59,7 +94,10 @@ export class ServiceGateway {
       return;
     }
 
-    // 2. Forward to actual HTTP backend
+    // 2. Check PAS score and pause agent if critically exceeded
+    this.checkPASAndMaybePause(agent);
+
+    // 3. Forward to actual HTTP backend
     this.forwardHttp(msg, ws, action, check.reason);
   }
 
@@ -90,8 +128,9 @@ export class ServiceGateway {
           source: this.serviceAddress,
           destination: msg.source,
           payload: { status: res.statusCode, headers: res.headers as any, body: bodyStr },
-          trace: msg.trace
-        }, loadCA().overlaySecret);
+          trace: msg.trace,
+          source_pubkey: this.myPublicKey,
+        }, this.signKey(msg.source, msg.source_pubkey));
         ws.send(JSON.stringify(outMsg));
       });
     });
@@ -117,12 +156,18 @@ export class ServiceGateway {
     appendLog({ timestamp: new Date().toISOString(), agent, resource: this.serviceAddress, action, decision, reason, ...extra });
   }
 
+  private signKey(peerSource: string, peerPubKey?: string): Buffer | string {
+    if (peerPubKey) return this.sessionMgr.getSessionKey(peerSource, peerPubKey);
+    return loadCA().overlaySecret;
+  }
+
   private sendResponse(ws: WebSocket, req: OverlayMessage, status: number, bodyObj: object) {
     const res = signOverlayMessage({
       id: req.id, type: 'response', source: this.serviceAddress, destination: req.source,
       payload: { status, headers: { 'content-type': 'application/json' }, body: Buffer.from(JSON.stringify(bodyObj)).toString('base64') },
-      trace: req.trace
-    }, loadCA().overlaySecret);
+      trace: req.trace,
+      source_pubkey: this.myPublicKey,
+    }, this.signKey(req.source, req.source_pubkey));
     ws.send(JSON.stringify(res));
   }
 }

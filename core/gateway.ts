@@ -83,6 +83,8 @@ export class LatticeGateway {
   async mediateToolCall(params: {
     agent_id: string;
     agent_signature: string;
+    /** ISO-8601 timestamp the agent used when constructing the agent_action_signature payload. */
+    action_timestamp: string;
     delegation: DelegationGrant;
     intent: IntentAnchor;
     capability: CapabilityToken;
@@ -114,11 +116,6 @@ export class LatticeGateway {
       throw new Error(
         `Subject frozen: high-risk actions blocked for organization ${cert.owner_org}`,
       );
-    }
-
-    const signaturePayload = toolCallSignaturePayload(params);
-    if (!verifySignature(signaturePayload, params.agent_signature, cert.public_key)) {
-      throw new Error('Invalid agent signature for tool call');
     }
 
     // 1. Policy & Capability check
@@ -211,17 +208,39 @@ export class LatticeGateway {
       },
     });
 
-    // 3. Sign SAAE (In a real flow, the agent would sign this part)
-    // For MVP, the gateway manages the process and signs as both a witness and validator
+    // 4. Sign SAAE
+    // The agent signs a narrow action payload (not the full envelope).
+    // The gateway countersigns the full unsigned envelope as a witness.
+
+    // Verify agent signature against the agent_action subset
+    const agentActionPayload = JSON.stringify({
+      agent_id: params.agent_id,
+      tool_id: params.tool_id,
+      action_type: params.action_type,
+      action_parameters: params.action_parameters,
+      capability_id: params.capability.capability_id,
+      timestamp: params.action_timestamp,
+    });
+    if (!verifySignature(agentActionPayload, params.agent_signature, cert.public_key)) {
+      throw new Error('Invalid agent action signature');
+    }
+
+    // Gateway signs the full unsigned envelope as a witness
     const { signatures, ...unsignedPart } = baseEnvelope;
     const unsignedStr = JSON.stringify(unsignedPart);
+    const gatewayWitnessSig = signData(unsignedStr, this.gatewayPrivateKey);
+
+    // Runtime assertion: agent and gateway must use different keys
+    if (cert.public_key === this.gatewayPrivateKey) {
+      throw new Error('Agent public key must differ from gateway private key');
+    }
 
     const finalEnvelope: SAAE = {
       ...baseEnvelope,
       signatures: {
-        agent_signature: params.agent_signature,
-        gateway_signature: signData(unsignedStr, this.gatewayPrivateKey),
-      }
+        agent_action_signature: params.agent_signature,
+        gateway_witness_signature: gatewayWitnessSig,
+      },
     };
 
     // Append to action log if configured

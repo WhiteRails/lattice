@@ -2,6 +2,7 @@ import { ethers } from 'ethers';
 import * as fs from 'fs';
 import * as path from 'path';
 import { BatchMetadata } from './batch';
+import { createKMSBackend, KMSBackend } from './kms/index';
 
 function getContractArtifacts() {
   const dir = path.join(__dirname, '../contracts');
@@ -399,4 +400,21 @@ export async function chainSetReservedOfficialSlug(
   const tx = await c.setReservedOfficialSlug(slug.trim(), reserved);
   const receipt = await tx.wait();
   return receipt.hash;
+}
+
+export function createKMSFromCli(opts: { key?: string; keyFile?: string; kmsBackend?: string; kmsPlugin?: string }): KMSBackend {
+  if (opts.kmsBackend) {
+    return createKMSBackend({ backend: opts.kmsBackend, pluginCommand: opts.kmsPlugin });
+  }
+  // Legacy: --key or --key-file → use local backend with inline key
+  const key = resolvePrivateKeyFromCli(opts);
+  return {
+    type: 'local',
+    async getKey(_keyId: string) { return key; },
+    async sign(_keyId: string, payload: string) {
+      const crypto = require('crypto');
+      const keyObj = crypto.createPrivateKey({ key: Buffer.from(key, 'hex'), format: 'der', type: 'pkcs8' });
+      return crypto.sign(null, Buffer.from(payload), keyObj).toString('base64');
+    }
+  };
 }

@@ -1,6 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as yaml from 'js-yaml';
+import { z } from 'zod';
 import { LATTICE_DIR } from './state';
 
 export interface PolicyRule { resource: string; actions?: string[]; }
@@ -13,13 +14,35 @@ export interface AgentPolicy {
 }
 export interface PolicyCheck { allowed: boolean; requires_approval: boolean; reason: string; }
 
+const PolicyRuleSchema = z.object({
+  resource: z.string(),
+  actions: z.array(z.string()).optional(),
+}).strict();
+
+const AgentPolicySchema = z.object({
+  agent: z.string(),
+  network: z.object({ default: z.enum(['deny', 'allow']) }).strict(),
+  allow: z.array(PolicyRuleSchema),
+  deny: z.array(PolicyRuleSchema),
+  approval_required: z.array(PolicyRuleSchema),
+}).strict();
+
 export class PolicyLoader {
   private dir = path.join(LATTICE_DIR, 'policies');
 
   load(name: string): AgentPolicy {
     const f = this.policyPath(name);
-    if (!fs.existsSync(f)) return this.defaultPolicy(name);
-    return yaml.load(fs.readFileSync(f, 'utf-8')) as AgentPolicy;
+    if (!fs.existsSync(f)) {
+      console.warn(JSON.stringify({ level: "WARN", event: "default_policy_activated", agent: name, reason: "policy_file_missing", policy: "default-deny+internet-blocked" }));
+      return this.defaultPolicy(name);
+    }
+    const raw = yaml.load(fs.readFileSync(f, 'utf-8'));
+    const result = AgentPolicySchema.safeParse(raw);
+    if (!result.success) {
+      const issue = result.error.issues[0];
+      throw new Error(`Policy file for '${name}' is invalid: ${issue.path.join('.')} - ${issue.message}`);
+    }
+    return result.data;
   }
 
   save(name: string, policy: AgentPolicy): void {
@@ -82,9 +105,11 @@ export class PolicyLoader {
   }
 
   private match(pattern: string, resource: string): boolean {
+    if (pattern === '*') return true;
     if (pattern === resource) return true;
     if (pattern === 'internet:*') return !resource.startsWith('lp://');
-    if (pattern.endsWith(':*')) return resource.startsWith(pattern.slice(0, -2));
+    if (pattern.endsWith(':*')) return resource.startsWith(pattern.slice(0, -1));
+    if (pattern.endsWith('*')) return resource.startsWith(pattern.slice(0, -1));
     return false;
   }
 

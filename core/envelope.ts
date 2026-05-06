@@ -24,7 +24,7 @@ export function createSAAEBase(params: Omit<SAAE, 'signatures' | 'schema'>): SAA
     schema: 'white-protocol.action-envelope.v0.1',
     ...params,
     signatures: {
-      agent_signature: '', // To be filled
+      agent_action_signature: '', // To be filled
     }
   };
   return envelope;
@@ -43,7 +43,7 @@ export function signSAAE(envelope: SAAE, privateKey: string): SAAE {
     ...envelope,
     signatures: {
       ...envelope.signatures,
-      agent_signature: signature,
+      agent_action_signature: signature,
     }
   };
 }

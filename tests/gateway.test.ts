@@ -54,6 +54,7 @@ describe('Lattice Gateway', () => {
       },
     };
 
+    const actionTimestamp = new Date().toISOString();
     const request = {
       agent_id: 'agent:test',
       delegation,
@@ -66,15 +67,25 @@ describe('Lattice Gateway', () => {
       runtime_cert_hash: 'sha256:runtime',
     };
 
+    const agentActionPayload = JSON.stringify({
+      agent_id: request.agent_id,
+      tool_id: request.tool_id,
+      action_type: request.action_type,
+      action_parameters: request.action_parameters,
+      capability_id: capability.capability_id,
+      timestamp: actionTimestamp,
+    });
+
     const envelope = await gateway.mediateToolCall({
       ...request,
-      agent_signature: signData(toolCallSignaturePayload(request), agentKeyPair.privateKey),
+      action_timestamp: actionTimestamp,
+      agent_signature: signData(agentActionPayload, agentKeyPair.privateKey),
     });
 
     expect(envelope.actor.agent_id).toBe('agent:test');
-    expect(envelope.signatures.agent_signature).not.toBe('PENDING_AGENT_SIG');
-    expect(envelope.signatures.gateway_signature).toBeDefined();
-    expect(envelope.signatures.gateway_signature).not.toBe('GATEWAY_SIGNATURE_PLACEHOLDER');
+    expect(envelope.signatures.agent_action_signature).not.toBe('PENDING_AGENT_SIG');
+    expect(envelope.signatures.gateway_witness_signature).toBeDefined();
+    expect(envelope.signatures.gateway_witness_signature).not.toBe('GATEWAY_SIGNATURE_PLACEHOLDER');
   });
 
   it('should throw if agent is not registered', async () => {
