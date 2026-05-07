@@ -266,41 +266,71 @@ Lattice is composed of:
 
 ## 6. Lattice Addressing
 
-Lattice services use cryptographic addresses.
+Lattice uses `lp://` as the canonical URI scheme. Two address families exist:
 
-Lattice uses `lp://` as the canonical URI scheme for protocol-addressable services.
+| Address | Format | Trust anchor | Use case |
+|---|---|---|---|
+| `*.lattice` | human label | On-chain `LatticeChain` | Named public/private services |
+| `*.id` | `lp://<hex_pubkey>.id` | Pubkey embedded in address | Direct node-to-node, no chain needed |
 
-Examples:
+### 6.1 Named service addresses (`*.lattice`)
 
-```
-lp://github-gateway.ab72k.lattice
-lp://stripe-proxy.91fa.lattice
-lp://cloud-registry.00ac.lattice
-lp://agent-market.331k.lattice
-```
+Human-readable names registered on-chain. The chain is the sole authority — without a valid on-chain namespace record, a `*.lattice` name can be hijacked by any federation announcement.
 
-### 6.1 Stable subject vs rotatable keys (normative)
-
-**A Lattice subject is not its signing key.** Every critical entity has a **stable subject identifier** (Lattice DID / `did:lattice:…` or a protocol-normalized `subject_id`). Signing, encryption, recovery, revocation, audit, and cold-root keys are **separate key records** with `key_id`, purpose, validity window, and lifecycle state. Rotating or revoking a key **does not** retire the subject.
-
-The `.lattice` suffix in `lp://…` addresses is derived from a **stable binding** — the **subject id** (or a registered namespace id committed to that subject) — **not** from the current operational public key:
+**v0 implementation (current):** Labels are registered directly as human-readable slugs (`echo.lattice`, `github.lattice`) in `LatticeChain.sol`. The registry binds:
 
 ```
-subject_id -> hash -> base32 -> .lattice suffix
+label.lattice  →  metadataHash (keccak256 of routing commitment)
+               →  serviceCertHash
+               →  ownerIssuerId
+               →  active flag
 ```
 
-Reference formula (reference implementations may use SHA-256 for the hash step):
+The `metadataHash` is the on-chain commitment of the routing payload (gateway pubkey + endpoints). If the resolver's local routing-cache does not match the chain commitment, the resolution fails — this is the anti-hijack guarantee.
+
+**v1 target (normative):** The `.lattice` suffix should be derived from a stable subject identifier, not chosen arbitrarily:
 
 ```
 lattice_suffix = base32(sha256(utf8(subject_id)))[0:32]
 lattice_address = lattice_suffix + ".lattice"
 ```
 
-The registry publishes **which signing key** is active for that subject at a given time, overlapping windows during rotation, and transparency events (`KEY_ROTATION`, `EMERGENCY_KEY_COMPROMISE`, `FREEZE_SUBJECT`). Verifiers evaluate historical signatures against **key state at the action timestamp**, including compromise windows (see Trust Model: Stable Subject & Key Lifecycle).
+A Lattice subject is not its signing key. Signing, encryption, and revocation keys are separate records with `key_id`, purpose, and validity windows. Rotating a key does not retire the subject. Implementations MUST migrate to subject-bound addressing before v1.
 
-### 6.2 Legacy note
+### 6.2 Self-authenticating addresses (`*.id`)
 
-Earlier drafts tied the suffix directly to `hash(public_key)`. That model is **deprecated**: it collapses identity and key material and prevents clean rotation. Implementations MUST migrate to subject-bound addressing.
+```
+lp://<hex64(raw_x25519_pubkey)>.id
+```
+
+The public key is embedded directly in the address. No chain lookup, no registry — the address IS the identity.
+
+**Properties:**
+- Resolve from routing-cache or federation registries to get endpoints
+- At resolution time, verify: `hex(payload.gatewayPubKeyB64) + ".id" == fqdn` — a poisoned federation entry with a different pubkey is rejected before connection
+- Rotation requires a new address (the key is the identity)
+- Suitable for ephemeral nodes, direct agent-to-agent channels, and nodes that cannot or do not want to register on-chain
+
+**Comparison to Tor onion v3:**
+
+| | Tor v3 | Lattice `.id` |
+|---|---|---|
+| Format | `base32(sha3(ed25519_pubkey))` | `hex(x25519_pubkey)` |
+| Pubkey in address | No (one-way hash) | Yes (inline) |
+| DHT lookup needed | Yes | No |
+| Length | 52 chars | 64 chars + `.id` |
+
+The inline pubkey is slightly longer but enables direct verification without a DHT or registry lookup.
+
+**CLI:**
+
+```bash
+lattice id
+# Self-authenticating address:
+#   lp:// URL : lp://deadbeef...cafebabe.id
+#   fqdn      : deadbeef...cafebabe.id
+#   pubkey    : <base64>
+```
 
 ---
 
@@ -803,49 +833,54 @@ Lattice's scalable integrity layer:
 
 ## 14. Lattice Overlay Routing
 
-Lattice can evolve in stages.
+Lattice evolves in stages. Current implementation status is noted.
 
-### v0: Simulated Network
+### v0: Simulated Network ✓ complete
 
-- HTTPS
-- mTLS
-- Central/federated registry
-- Gateway enforcement
-- Signed action logs
+- WebSocket overlay (WS/WSS)
+- Local CA with HMAC-signed routing-cache
+- YAML capability policies and default-deny enforcement
+- Signed Agent Action Envelopes (SAAE) — JSONL transparency log
+- Merkle batch + on-chain checkpoint (`LatticeChain.sol`)
+- Single-machine smoke test (`lattice up --echo`)
 
-Purpose: prove policy and action custody.
+Purpose: prove policy enforcement and action custody end-to-end.
 
-### v1: Real Overlay
+### v1: Distributed Public Overlay ✓ complete
 
-- QUIC
-- Lattice addresses
-- Certified nodes
-- Service discovery
-- Revocation-aware routing
-- Gateway mediation
+- Multi-host WSS overlay (Entry → Relay → Gateway)
+- TLS termination on public relay and gateway nodes (`node.yaml` cert config)
+- `*.lattice` namespaces anchored on-chain (`LatticeChain.sol` + EVM)
+- HMAC-signed local routing-cache as trust anchor in distributed mesh
+- Federation registries with HMAC-authenticated announce/fetch
+- Self-authenticating `*.id` addresses (pubkey embedded, no chain lookup)
+- Node identity on-chain (`chainRegisterLatticeNode`)
+- ECDH session keys between registered nodes in distributed mesh
+- Routing bundles: export / import / verify-chain
+- `lattice id`, `lattice mesh smoke`, `lattice routing announce/export/import`
 
-Purpose: separate agent traffic from normal web traffic.
+Purpose: operational multi-VPS network where `lp://service.lattice` resolves across machines with chain-backed namespace authority.
 
-### v2: Multi-Hop Routing
+### v2: Hidden Services + P2P Discovery (in progress)
 
-- Entry nodes
-- Relay nodes
-- Service nodes
-- Encrypted circuits
-- Witnessed logs
-- Federated trust registries
+- Hidden gateway mode: outbound-only connection to relay rendezvous points
+  (gateway never opens an inbound port — IP not exposed to entry node)
+- `*.id` + rendezvous relay as full location-privacy primitive
+- P2P service discovery: DHT or gossip-based `*.lattice` announcements
+- Multi-hop circuit construction with per-hop encryption
+- Relay selection and circuit management
+- Witnessed logs: cross-relay Merkle checkpoint cross-signing
 
-Purpose: Tor-like network structure, without anonymous agent action.
+Purpose: Tor-like location privacy for gateways, without anonymous agent action.
 
 ### v3: Global Federation
 
-- Multiple issuers
-- Multiple trust registries
-- National profiles
-- Industry profiles
-- Critical infrastructure profiles
+- Multiple issuers and trust registries
+- Subject-bound `*.lattice` addressing (v1 normative spec)
+- National / industry / critical infrastructure profiles
 - Cross-jurisdiction revocation
-- Public conformance tests
+- Public conformance test suite
+- Neutral governance body
 
 ---
 
