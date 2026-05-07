@@ -16,9 +16,14 @@ import {
   parseBindHostPort,
   requireDistributedNodeId,
   resolveNodeChainConfig,
+  resolveGatewayMode,
+  resolveRendezvousRelays,
+  resolveHiddenServiceAddress,
+  resolveFederationUrls,
 } from './node-config';
-import { bindOverlayWebSocketServer } from './ws-stack';
+import { bindOverlayWebSocketServer, wsTlsClientOptions } from './ws-stack';
 import { validateDistributedPeer } from './peer-identity';
+import { postFederationAnnounce } from './federation-registry';
 
 export interface ServiceGatewayOptions {
   port?: number;
@@ -27,8 +32,8 @@ export interface ServiceGatewayOptions {
 }
 
 export class ServiceGateway {
-  private wss: WebSocketServer;
-  private closeStack: () => void;
+  private wss: WebSocketServer | null = null;
+  private closeStack: () => void = () => {};
   private policy = new PolicyLoader();
   private pasTracker?: PowerAccumulationTracker;
   private pasThreshold = 100;
@@ -38,6 +43,12 @@ export class ServiceGateway {
   private distributedMesh: boolean;
   private chain: NodeChainConfig | null;
   private nodeLabel: string | undefined;
+  /** Active outbound connections to relay rendezvous points (hidden mode). */
+  private rendezvousConnections: WebSocket[] = [];
+  /** Whether we're in hidden (outbound-only) mode. */
+  private hiddenMode: boolean = false;
+  /** Heartbeat timers for rendezvous connections. */
+  private heartbeatTimers: ReturnType<typeof setInterval>[] = [];
 
   setPASTracker(tracker: PowerAccumulationTracker, threshold = 100): void {
     this.pasTracker = tracker;
@@ -78,38 +89,179 @@ export class ServiceGateway {
     this.myPublicKey = gwKeyPair.publicKey;
     this.sessionMgr = new SessionManager('gateway', gwKeyPair.privateKey);
 
-    const defaultPort =
-      cfgFromDisk?.bind?.gateway ?
-        parseBindHostPort(cfgFromDisk.bind.gateway, '127.0.0.1', portInput ?? 8889).port
-      : (portInput ?? 8889);
+    const gatewayMode = resolveGatewayMode(cfgFromDisk);
+    this.hiddenMode = gatewayMode === 'hidden';
 
-    const { host: bindHost, port: bindPort } = parseBindHostPort(
-      cfgFromDisk?.bind?.gateway ?? opts.bindHostPort,
-      '127.0.0.1',
-      defaultPort,
-    );
-
-    const bound = bindOverlayWebSocketServer(bindHost, bindPort, cfgFromDisk?.tls);
-    this.wss = bound.wss;
-    this.closeStack = bound.close;
-
-    this.wss.on('connection', (ws) => {
-      ws.on('message', (data) => this.handleMessage(ws, data.toString()));
-    });
-
-    bound.wss.once('listening', () => {
-      const scheme =
-        cfgFromDisk?.tls?.certFile?.trim() && cfgFromDisk?.tls?.keyFile?.trim() ? 'wss' : 'ws';
+    if (this.hiddenMode) {
+      // Hidden mode: dial outbound to rendezvous relays instead of listening
+      const rendezvousRelays = resolveRendezvousRelays(cfgFromDisk);
+      const hiddenAddr = resolveHiddenServiceAddress(cfgFromDisk) ?? serviceAddress;
       console.log(
         chalk.green('[Gateway]') +
-          ` ${serviceAddress} listening on ${scheme}://${bindHost}:${bindPort} -> routing to ${targetHttpBase}`,
+          ` ${hiddenAddr} starting in HIDDEN mode → rendezvous with ${rendezvousRelays.length} relay(s)`,
       );
-    });
-    bound.wss.once('error', e => console.error(chalk.red('[Gateway] listen'), e.message));
+      this.startHiddenMode(rendezvousRelays, hiddenAddr, cfgFromDisk);
+      this.announceFederation(cfgFromDisk, hiddenAddr, []);
+    } else {
+      // Public mode: bind inbound WebSocket port
+      const defaultPort =
+        cfgFromDisk?.bind?.gateway ?
+          parseBindHostPort(cfgFromDisk.bind.gateway, '127.0.0.1', portInput ?? 8889).port
+        : (portInput ?? 8889);
+
+      const { host: bindHost, port: bindPort } = parseBindHostPort(
+        cfgFromDisk?.bind?.gateway ?? opts.bindHostPort,
+        '127.0.0.1',
+        defaultPort,
+      );
+
+      const bound = bindOverlayWebSocketServer(bindHost, bindPort, cfgFromDisk?.tls);
+      this.wss = bound.wss;
+      this.closeStack = bound.close;
+
+      this.wss.on('connection', (ws) => {
+        ws.on('message', (data) => this.handleMessage(ws, data.toString()));
+      });
+
+      bound.wss.once('listening', () => {
+        const scheme =
+          cfgFromDisk?.tls?.certFile?.trim() && cfgFromDisk?.tls?.keyFile?.trim() ? 'wss' : 'ws';
+        const endpoint = cfgFromDisk?.public?.gateway ?? `${scheme}://${bindHost}:${bindPort}`;
+        console.log(
+          chalk.green('[Gateway]') +
+            ` ${serviceAddress} listening on ${scheme}://${bindHost}:${bindPort} -> routing to ${targetHttpBase}`,
+        );
+        // Announce to federation registries if configured
+        const fedUrls = resolveFederationUrls(cfgFromDisk);
+        if (fedUrls.length) {
+          this.announceFederation(cfgFromDisk, serviceAddress, [endpoint]);
+        }
+      });
+      bound.wss.once('error', e => console.error(chalk.red('[Gateway] listen'), e.message));
+    }
   }
 
   close(): void {
     this.closeStack();
+    for (const t of this.heartbeatTimers) clearInterval(t);
+    for (const ws of this.rendezvousConnections) {
+      if (ws.readyState === WebSocket.OPEN) ws.close();
+    }
+    this.rendezvousConnections = [];
+  }
+
+  // ─── Hidden-mode internals ────────────────────────────────────────────────
+
+  private startHiddenMode(
+    relayUrls: string[],
+    serviceAddress: string,
+    cfg: LatticeNodeYaml | null,
+  ): void {
+    for (const url of relayUrls) {
+      this.connectToRendezvousRelay(url, serviceAddress, cfg, 0);
+    }
+  }
+
+  private connectToRendezvousRelay(
+    relayUrl: string,
+    serviceAddress: string,
+    cfg: LatticeNodeYaml | null,
+    attempt: number,
+  ): void {
+    const tlsOpts = wsTlsClientOptions(cfg);
+    const ws = new WebSocket(relayUrl, undefined, { rejectUnauthorized: true, ...tlsOpts });
+    this.rendezvousConnections.push(ws);
+
+    ws.on('open', () => {
+      attempt = 0; // reset backoff on successful connection
+      console.log(chalk.green('[Gateway]') + ` Connected to rendezvous relay: ${relayUrl}`);
+
+      // Register with relay
+      const regMsg = signOverlayMessage(
+        {
+          id: `reg_${crypto.randomBytes(6).toString('hex')}`,
+          type: 'register',
+          source: serviceAddress,
+          destination: 'relay',
+          payload: {},
+          trace: [],
+          source_pubkey: this.myPublicKey,
+          source_node_label: this.nodeLabel,
+          source_node_role: 'gateway',
+        },
+        loadCA().overlaySecret,
+      );
+      ws.send(JSON.stringify(regMsg));
+
+      // Keepalive heartbeat every 30 s
+      const hb = setInterval(() => {
+        if (ws.readyState !== WebSocket.OPEN) { clearInterval(hb); return; }
+        const heartbeat: OverlayMessage = {
+          id: `hb_${crypto.randomBytes(4).toString('hex')}`,
+          type: 'heartbeat',
+          source: serviceAddress,
+          destination: 'relay',
+          payload: {},
+          trace: [],
+          source_pubkey: this.myPublicKey,
+          source_node_role: 'gateway',
+        };
+        ws.send(JSON.stringify(heartbeat));
+      }, 30_000);
+      this.heartbeatTimers.push(hb);
+    });
+
+    ws.on('message', (data) => {
+      const raw = data.toString();
+      let msg: OverlayMessage;
+      try { msg = JSON.parse(raw); } catch { return; }
+      // register_ack — nothing to do
+      if (msg.type === 'register_ack') return;
+      // Normal request routed from relay → handle as if inbound WS
+      this.handleMessage(ws, raw);
+    });
+
+    ws.on('close', () => {
+      this.rendezvousConnections = this.rendezvousConnections.filter(c => c !== ws);
+      const delay = Math.min(30_000, 1_000 * Math.pow(2, Math.min(attempt, 5)));
+      console.log(chalk.yellow('[Gateway]') + ` Rendezvous disconnected (${relayUrl}), retry in ${delay}ms`);
+      setTimeout(
+        () => this.connectToRendezvousRelay(relayUrl, serviceAddress, cfg, attempt + 1),
+        delay,
+      );
+    });
+
+    ws.on('error', (e) => {
+      console.warn(chalk.yellow('[Gateway]') + ` Rendezvous error (${relayUrl}): ${e.message}`);
+    });
+  }
+
+  /** Announce this gateway's lp:// address + endpoints to all configured federation registries. */
+  private announceFederation(
+    cfg: LatticeNodeYaml | null,
+    serviceAddress: string,
+    gatewayEndpoints: string[],
+  ): void {
+    const fedUrls = resolveFederationUrls(cfg);
+    if (!fedUrls.length) return;
+    const fqdn = serviceAddress.replace(/^lp:\/\//, '').split('/')[0] ?? '';
+    if (!fqdn.endsWith('.lattice')) return;
+    const ttl = cfg?.gateway?.announceTtlSeconds ?? 300;
+    for (const url of fedUrls) {
+      postFederationAnnounce(
+        url,
+        {
+          version: 2,
+          fqdn,
+          gatewayPubKeyB64: this.myPublicKey,
+          gatewayEndpoints,
+          gatewayNodeLabel: this.nodeLabel,
+        },
+        { ttlSeconds: ttl, announcerPubKey: this.myPublicKey },
+      ).catch(() => {});
+    }
+    // Re-announce at half the TTL
+    setTimeout(() => this.announceFederation(cfg, serviceAddress, gatewayEndpoints), (ttl / 2) * 1000).unref?.();
   }
 
   private relaySignMaterial(relayPub?: string): Buffer | string {

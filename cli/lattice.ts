@@ -51,7 +51,14 @@ import {
   resolvePrivateKeyFromCli,
   assertValidPublicLatticeFqdn,
 } from '../node/chain';
-import { loadNodeConfig, saveNodeConfig, nodeConfigPath, type LatticeNodeRole } from '../node/node-config';
+import { loadNodeConfig, saveNodeConfig, nodeConfigPath, parseBindHostPort, type LatticeNodeRole } from '../node/node-config';
+import {
+  FederationRegistryServer,
+  fetchFederationRoutes,
+  postFederationAnnounce,
+  FEDERATION_DEFAULT_PORT,
+  FEDERATION_DEFAULT_TTL_SECONDS,
+} from '../node/federation-registry';
 import { getOrCreateOverlayKeyPair } from '../node/state';
 import {
   exportRoutingBundle,
@@ -1209,6 +1216,100 @@ program.command('proof <action_id>').description('Generate and verify Merkle pro
       }
       console.log();
     } catch (e: any) { err(e.message); }
+  });
+
+// ── registry — Federation Registry ──────────────────────────────────────────
+const registryCli = program.command('registry').description('Federation Registry: share lp:// routing across nodes');
+
+registryCli
+  .command('serve')
+  .description('Run a federation registry HTTP server that other nodes can poll for lp:// routes')
+  .option('--bind <host:port>', 'Bind address (default: 0.0.0.0:9000)')
+  .action((opts: { bind?: string }) => {
+    requireInit();
+    const cfg = loadNodeConfig();
+    const { host, port } = parseBindHostPort(opts.bind ?? '0.0.0.0:9000', '0.0.0.0', FEDERATION_DEFAULT_PORT);
+    const ca = loadCA();
+    const server = new FederationRegistryServer(host, port, ca.overlaySecret, cfg?.tls);
+    server.start();
+    console.log(chalk.cyan('[Registry]') + ' Federation server running. Press Ctrl+C to stop.');
+    process.on('SIGINT', () => { server.stop(); process.exit(0); });
+    process.on('SIGTERM', () => { server.stop(); process.exit(0); });
+  });
+
+registryCli
+  .command('announce')
+  .description('Announce a gateway service to a federation registry')
+  .requiredOption('--service <lp://name.lattice>', 'The lp:// service address being announced')
+  .requiredOption('--endpoint <wss://host:port>', 'Public WebSocket endpoint of the gateway')
+  .option('--pubkey <base64>', 'X25519 public key of the gateway (default: this node\'s overlay key)')
+  .option('--registry <url>', 'Federation registry URL (default: http://127.0.0.1:9000)')
+  .option('--ttl <seconds>', `Announcement TTL in seconds (default: ${FEDERATION_DEFAULT_TTL_SECONDS})`, String(FEDERATION_DEFAULT_TTL_SECONDS))
+  .option('--node-label <label>', 'Gateway node label for distributed mesh routing')
+  .action(async (opts: {
+    service: string;
+    endpoint: string;
+    pubkey?: string;
+    registry?: string;
+    ttl?: string;
+    nodeLabel?: string;
+  }) => {
+    requireInit();
+    const fqdn = opts.service.replace(/^lp:\/\//, '').split('/')[0] ?? '';
+    if (!fqdn.endsWith('.lattice')) err('--service must be an lp:// address ending in .lattice');
+    const pubkey = opts.pubkey?.trim() || getOrCreateOverlayKeyPair().publicKey;
+    const registryUrl = opts.registry ?? 'http://127.0.0.1:9000';
+    const ttl = parseInt(opts.ttl ?? String(FEDERATION_DEFAULT_TTL_SECONDS), 10);
+    if (!Number.isFinite(ttl) || ttl < 30) err('--ttl must be >= 30');
+    const payload: RoutingPayload = {
+      version: ROUTING_PAYLOAD_VERSION,
+      fqdn,
+      gatewayPubKeyB64: pubkey,
+      gatewayEndpoints: [opts.endpoint.trim()],
+      gatewayNodeLabel: opts.nodeLabel?.trim() || undefined,
+    };
+    ok(`Announcing ${opts.service} → ${opts.endpoint} to ${registryUrl}`);
+    const success = await postFederationAnnounce(registryUrl, payload, {
+      ttlSeconds: ttl,
+      announcerPubKey: pubkey,
+    });
+    if (success) ok(`Announced (TTL ${ttl}s)`);
+    else err('Announce failed — is the registry server running?');
+  });
+
+registryCli
+  .command('list')
+  .description('List all routes registered with a federation registry')
+  .option('--registry <url>', 'Federation registry URL (default: http://127.0.0.1:9000)')
+  .option('--verify-sig', 'Verify response HMAC using local CA overlaySecret')
+  .action(async (opts: { registry?: string; verifySig?: boolean }) => {
+    requireInit();
+    const registryUrl = opts.registry ?? 'http://127.0.0.1:9000';
+    const ca = opts.verifySig ? loadCA() : null;
+    const resp = await fetchFederationRoutes(registryUrl, {
+      overlaySecret: ca?.overlaySecret,
+    });
+    if (!resp) err(`Could not fetch routes from ${registryUrl}`);
+    const now = Date.now();
+    const entries = Object.entries(resp.routes);
+    if (!entries.length) {
+      console.log(chalk.dim('No routes registered.'));
+      return;
+    }
+    console.log(chalk.cyan(`Federation routes from ${registryUrl}`) + chalk.dim(` (generated ${resp.generatedAt})`));
+    for (const [fqdn, entry] of entries) {
+      const expired = new Date(entry.expiresAt).getTime() < now;
+      const ttlRemaining = Math.max(0, Math.round((new Date(entry.expiresAt).getTime() - now) / 1000));
+      const status = expired ? chalk.red('[EXPIRED]') : chalk.green(`[TTL ${ttlRemaining}s]`);
+      console.log(`  ${chalk.bold('lp://' + fqdn)} ${status}`);
+      for (const ep of entry.payload.gatewayEndpoints) {
+        console.log(`    → ${chalk.cyan(ep)}`);
+      }
+      if (entry.payload.gatewayNodeLabel) {
+        console.log(`    label: ${chalk.dim(entry.payload.gatewayNodeLabel)}`);
+      }
+      console.log(`    pubkey: ${chalk.dim((entry.payload.gatewayPubKeyB64 ?? '').slice(0, 20))}…`);
+    }
   });
 
 program.parse(process.argv);

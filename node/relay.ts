@@ -1,4 +1,5 @@
 import { WebSocketServer, WebSocket } from 'ws';
+import * as crypto from 'crypto';
 import { OverlayMessage, signOverlayMessage } from './message';
 import { loadCA, getOrCreateOverlayKeyPair } from './state';
 import { SessionManager } from './session';
@@ -15,6 +16,7 @@ import {
 import { LpGatewayResolver, LpRoutingNotFoundError } from './lp-resolver';
 import { bindOverlayWebSocketServer, wsTlsClientOptions } from './ws-stack';
 import { overlayPubkeysEqual, validateDistributedPeer } from './peer-identity';
+import { fqdnFromLpAddress } from './routing-cache';
 
 export const DEFAULT_RELAY_PORT = 8888;
 
@@ -35,6 +37,12 @@ export class RelayNode {
   private resolver: LpGatewayResolver;
   private chain: NodeChainConfig | null;
   private nodeLabel: string | undefined;
+  /**
+   * Hidden-service rendezvous table.
+   * Key: fqdn (e.g. "echo.lattice")
+   * Value: the outbound WebSocket the gateway dialled into us.
+   */
+  private hiddenGateways: Map<string, WebSocket> = new Map();
 
   constructor(opts: RelayNodeOptions = {}) {
     const cfgFromDisk = opts.nodeConfig !== undefined ? opts.nodeConfig : loadNodeConfig();
@@ -83,6 +91,67 @@ export class RelayNode {
     this.closeStack();
   }
 
+  /** Called when a hidden gateway dials in and sends a 'register' message. */
+  private handleGatewayRegister(gatewayWs: WebSocket, msg: OverlayMessage): void {
+    const ok = verifyIncomingOverlayFromPeer({
+      distributedMesh: this.distributedMesh,
+      mgr: this.downstreamMgr,
+      overlaySecret: loadCA().overlaySecret,
+      peerPubFromMessage: msg.source_pubkey,
+      msg,
+    });
+    if (!ok) {
+      console.warn(chalk.yellow('[RelayNode]') + ` Hidden gateway register rejected: bad auth (source=${msg.source})`);
+      return;
+    }
+
+    let fqdn: string;
+    try {
+      fqdn = fqdnFromLpAddress(msg.source);
+    } catch {
+      console.warn(chalk.yellow('[RelayNode]') + ` Invalid hidden gateway address: ${msg.source}`);
+      return;
+    }
+
+    // Replace any stale connection for this service
+    const existing = this.hiddenGateways.get(fqdn);
+    if (existing && existing !== gatewayWs && existing.readyState === WebSocket.OPEN) {
+      existing.close();
+    }
+    this.hiddenGateways.set(fqdn, gatewayWs);
+    console.log(chalk.magenta('[RelayNode]') + ` Hidden gateway registered: ${fqdn} (pubkey ${msg.source_pubkey?.slice(0, 12)}…)`);
+
+    // Clean up on disconnect
+    gatewayWs.once('close', () => {
+      if (this.hiddenGateways.get(fqdn) === gatewayWs) {
+        this.hiddenGateways.delete(fqdn);
+        console.log(chalk.magenta('[RelayNode]') + ` Hidden gateway disconnected: ${fqdn}`);
+      }
+    });
+
+    // Send register_ack
+    const ack: OverlayMessage = {
+      id: `ack_${crypto.randomBytes(6).toString('hex')}`,
+      type: 'register_ack',
+      source: 'relay',
+      destination: msg.source,
+      payload: {},
+      trace: [],
+      source_pubkey: this.myPublicKey,
+      source_node_label: this.nodeLabel,
+      source_node_role: 'relay',
+    };
+    const signKey = chooseOverlaySignKey(
+      this.downstreamMgr,
+      this.distributedMesh,
+      loadCA().overlaySecret,
+      msg.source_pubkey,
+    );
+    if (gatewayWs.readyState === WebSocket.OPEN) {
+      gatewayWs.send(JSON.stringify(signOverlayMessage(ack, signKey)));
+    }
+  }
+
   private async handleMessage(clientWs: WebSocket, data: string) {
     let msg: OverlayMessage;
     try {
@@ -90,6 +159,15 @@ export class RelayNode {
     } catch {
       return;
     }
+
+    // Hidden gateway rendezvous: gateway dials relay and registers itself
+    if (msg.type === 'register') {
+      this.handleGatewayRegister(clientWs, msg);
+      return;
+    }
+
+    // Keepalive heartbeats from hidden gateways — no response needed
+    if (msg.type === 'heartbeat') return;
 
     const entryPubOk = verifyIncomingOverlayFromPeer({
       distributedMesh: this.distributedMesh,
@@ -137,6 +215,92 @@ export class RelayNode {
     }
 
     const tlsOpts = wsTlsClientOptions(this.cfg);
+
+    // Check if a hidden gateway has registered for this fqdn
+    const hiddenWs = this.hiddenGateways.get(route.fqdn);
+    if (hiddenWs && hiddenWs.readyState === WebSocket.OPEN) {
+      console.log(chalk.magenta('[RelayNode]') + ` Routing ${msg.id} to hidden gateway: ${route.fqdn}`);
+      try {
+        const relaySignKeyDown = chooseOverlaySignKey(
+          this.downstreamMgr,
+          this.distributedMesh,
+          loadCA().overlaySecret,
+          route.gatewayPubKeyB64,
+        );
+        const downstreamMsg = signOverlayMessage(
+          {
+            ...msg,
+            auth: undefined,
+            source_pubkey: this.myPublicKey,
+            source_node_label: this.nodeLabel,
+            source_node_role: 'relay',
+          },
+          relaySignKeyDown,
+        );
+
+        hiddenWs.send(JSON.stringify(downstreamMsg));
+
+        // Wait for response on the existing persistent connection
+        const responsePromise = new Promise<OverlayMessage>((resolve, reject) => {
+          const timeout = setTimeout(() => reject(new Error('hidden gateway timeout')), 30_000);
+          const onMsg = (gwData: import('ws').RawData) => {
+            clearTimeout(timeout);
+            hiddenWs.off('message', onMsg);
+            try {
+              resolve(JSON.parse(gwData.toString()) as OverlayMessage);
+            } catch {
+              reject(new Error('invalid JSON from hidden gateway'));
+            }
+          };
+          hiddenWs.on('message', onMsg);
+        });
+
+        let response: OverlayMessage;
+        try {
+          response = await responsePromise;
+        } catch (e: any) {
+          this.sendError(clientWs, msg, e?.message ?? 'hidden gateway error');
+          return;
+        }
+
+        const okGwPub = verifyIncomingOverlayFromPeer({
+          distributedMesh: this.distributedMesh,
+          mgr: this.downstreamMgr,
+          overlaySecret: loadCA().overlaySecret,
+          peerPubFromMessage: response.source_pubkey,
+          msg: response,
+        });
+
+        if (!okGwPub) {
+          this.sendError(clientWs, msg, 'Hidden gateway response auth failed');
+          return;
+        }
+
+        response.trace.push('relay');
+        const upstreamSignKey = chooseOverlaySignKey(
+          this.upstreamMgr,
+          this.distributedMesh,
+          loadCA().overlaySecret,
+          entryPub,
+        );
+        const upstreamResponse = signOverlayMessage(
+          {
+            ...response,
+            auth: undefined,
+            source_pubkey: this.myPublicKey,
+            source_node_label: this.nodeLabel,
+            source_node_role: 'relay',
+          },
+          upstreamSignKey,
+        );
+        if (clientWs.readyState === WebSocket.OPEN) {
+          clientWs.send(JSON.stringify(upstreamResponse));
+        }
+      } catch (e: any) {
+        this.sendError(clientWs, msg, e?.message ?? 'hidden gateway routing failed');
+      }
+      return;
+    }
 
     const tryEndpoint = async (idx: number): Promise<void> => {
       if (idx >= route.gatewayEndpoints.length) {

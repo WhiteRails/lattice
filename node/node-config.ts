@@ -80,6 +80,32 @@ const latticeNodeConfigSchema = z.object({
     .object({
       chain: chainSchema,
       cacheFile: z.string().min(1).optional(),
+      /** HTTP URLs of federation registry servers to poll for lp:// routing. */
+      federationUrls: z.array(z.string().url()).optional(),
+    })
+    .strict()
+    .optional(),
+
+  /** Hidden-service / rendezvous config for gateways that dial out to relays. */
+  gateway: z
+    .object({
+      /** 'public' (default) = listen for inbound WS; 'hidden' = dial out to rendezvousRelays. */
+      mode: z.enum(['public', 'hidden']).optional(),
+      /** lp:// address this gateway serves (required for hidden mode). */
+      hiddenServiceAddress: z.string().optional(),
+      /** Relay URLs to dial when mode=hidden (rendezvous relays). */
+      rendezvousRelays: z.array(z.string().url()).optional(),
+      /** TTL in seconds for federation announcements (default 300). */
+      announceTtlSeconds: z.number().int().positive().optional(),
+    })
+    .strict()
+    .optional(),
+
+  /** Run a local federation registry HTTP server on this node. */
+  federation: z
+    .object({
+      serve: z.boolean().optional(),
+      bindHostPort: bindHostPort,
     })
     .strict()
     .optional(),
@@ -92,6 +118,22 @@ const latticeNodeConfigSchema = z.object({
       path: ['nodeId'],
       message: 'nodeId is required when distributedMesh is true',
     });
+  }
+  if (cfg.gateway?.mode === 'hidden') {
+    if (!cfg.gateway.hiddenServiceAddress?.trim()) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['gateway', 'hiddenServiceAddress'],
+        message: 'hiddenServiceAddress is required when gateway.mode is hidden',
+      });
+    }
+    if (!cfg.gateway.rendezvousRelays?.length) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['gateway', 'rendezvousRelays'],
+        message: 'rendezvousRelays must be non-empty when gateway.mode is hidden',
+      });
+    }
   }
 });
 
@@ -188,3 +230,26 @@ export function resolveNodeChainConfig(cfg: LatticeNodeYaml | null): NodeChainCo
 }
 
 export type ResolvedBind = ReturnType<typeof parseBindHostPort>;
+
+export function resolveFederationUrls(cfg: LatticeNodeYaml | null): string[] {
+  return cfg?.registry?.federationUrls ?? [];
+}
+
+export function resolveGatewayMode(cfg: LatticeNodeYaml | null): 'public' | 'hidden' {
+  return cfg?.gateway?.mode ?? 'public';
+}
+
+export function resolveRendezvousRelays(cfg: LatticeNodeYaml | null): string[] {
+  return cfg?.gateway?.rendezvousRelays ?? [];
+}
+
+export function resolveHiddenServiceAddress(cfg: LatticeNodeYaml | null): string | undefined {
+  return cfg?.gateway?.hiddenServiceAddress?.trim() || undefined;
+}
+
+export function resolveFederationServe(cfg: LatticeNodeYaml | null): { serve: boolean; bindHostPort: string } {
+  return {
+    serve: cfg?.federation?.serve ?? false,
+    bindHostPort: cfg?.federation?.bindHostPort ?? '127.0.0.1:9000',
+  };
+}

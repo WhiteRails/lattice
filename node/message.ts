@@ -3,7 +3,12 @@ import type { LatticeNodeRole } from './node-config';
 
 export interface OverlayMessage {
   id: string;             // Unique message ID
-  type: 'request' | 'response';
+  /** request/response: normal overlay traffic.
+   *  register: hidden gateway dials relay and registers its lp:// address.
+   *  register_ack: relay confirms registration.
+   *  heartbeat: keepalive ping from gateway to relay.
+   */
+  type: 'request' | 'response' | 'register' | 'register_ack' | 'heartbeat';
   source: string;         // e.g. agent:bot1 or relay:xyz
   destination: string;    // e.g. lp://github.lattice
 
