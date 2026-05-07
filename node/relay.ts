@@ -16,7 +16,7 @@ import {
 import { LpGatewayResolver, LpRoutingNotFoundError } from './lp-resolver';
 import { bindOverlayWebSocketServer, wsTlsClientOptions } from './ws-stack';
 import { overlayPubkeysEqual, validateDistributedPeer } from './peer-identity';
-import { fqdnFromLpAddress } from './routing-cache';
+import { fqdnFromLpAddress, lookupRoutingPayload } from './routing-cache';
 
 export const DEFAULT_RELAY_PORT = 8888;
 
@@ -110,6 +110,16 @@ export class RelayNode {
       fqdn = fqdnFromLpAddress(msg.source);
     } catch {
       console.warn(chalk.yellow('[RelayNode]') + ` Invalid hidden gateway address: ${msg.source}`);
+      return;
+    }
+
+    // Verify the registering gateway owns the fqdn (pubkey must match cached entry if one exists)
+    const cachedRoute = lookupRoutingPayload(this.cfg, fqdn, { requireLocalSig: false });
+    if (cachedRoute?.gatewayPubKeyB64 && !overlayPubkeysEqual(cachedRoute.gatewayPubKeyB64, msg.source_pubkey ?? '')) {
+      console.warn(
+        chalk.yellow('[RelayNode]') +
+          ` Hidden gateway register rejected: pubkey mismatch for ${fqdn} (got ${msg.source_pubkey?.slice(0, 12)}…)`,
+      );
       return;
     }
 
@@ -240,17 +250,24 @@ export class RelayNode {
 
         hiddenWs.send(JSON.stringify(downstreamMsg));
 
-        // Wait for response on the existing persistent connection
+        // Wait for the response matching our request id on the persistent connection
         const responsePromise = new Promise<OverlayMessage>((resolve, reject) => {
-          const timeout = setTimeout(() => reject(new Error('hidden gateway timeout')), 30_000);
+          const timeout = setTimeout(() => {
+            hiddenWs.off('message', onMsg);
+            reject(new Error('hidden gateway timeout'));
+          }, 30_000);
           const onMsg = (gwData: import('ws').RawData) => {
+            let parsed: OverlayMessage;
+            try {
+              parsed = JSON.parse(gwData.toString()) as OverlayMessage;
+            } catch {
+              return; // ignore non-JSON frames, keep waiting
+            }
+            // Only resolve for the response to our specific request
+            if (parsed.id !== msg.id) return;
             clearTimeout(timeout);
             hiddenWs.off('message', onMsg);
-            try {
-              resolve(JSON.parse(gwData.toString()) as OverlayMessage);
-            } catch {
-              reject(new Error('invalid JSON from hidden gateway'));
-            }
+            resolve(parsed);
           };
           hiddenWs.on('message', onMsg);
         });

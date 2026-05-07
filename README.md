@@ -1,170 +1,337 @@
 # Lattice
-**A Certified Overlay Network for Autonomous AI Agents.**
+
+**A certified overlay network for autonomous AI agents.**
 
 <p align="center">
-  <em>Do not give the agent the open internet. Give it Lattice.</em>
+  <em>Don't give the agent the open internet. Give it Lattice.</em>
 </p>
----
 
-The internet was designed for humans, open connectivity, and applications. It was **not** designed for autonomous AI agents capable of planning, invoking APIs, accumulating resources, and operating at machine speed. 
+The internet was designed for humans: open connectivity, implicit trust, applications that assume a person is in control. It was not designed for autonomous AI agents capable of planning, invoking APIs, accumulating resources, and operating at machine speed.
 
-**Lattice** is an overlay network and cryptographic runtime that structurally isolates agents from the open web. It replaces implicit trust (API keys, loose firewalls) with explicit cryptographic identity, default-deny network routing, and undeniable cryptographic action provenance. 
+**Lattice** is an overlay network and cryptographic runtime that structurally isolates agents from the open web. It replaces implicit trust (API keys, loose firewalls) with explicit cryptographic identity, default-deny network routing, and undeniable cryptographic action provenance.
 
-It is structurally inspired by Tor-like networks: separate addressing (`lp://`), overlay routing, and cryptographic service identity. But it serves the opposite purpose: **where Tor protects anonymity, Lattice enforces accountable agency.**
-
----
-<img src="https://whiterails.com/ltt_concept.jpg">
-
-## 🌟 Key Features
-
-### 1. Two-Layer Architecture
-Lattice is built as a complete ecosystem:
-- **Protocol SDK (`src/`)**: A TypeScript library for building Lattice-compliant gateways, CAs, and registries.
-- **Local Runtime (`daemon/`, `cmd/`)**: The `latticed` proxy and CLI tool that sit on the host machine to enforce policy at the network boundary.
-
-### 2. Cryptographic Identity & Addressing (`lp://`)
-Agents, humans, and services do not use IP addresses for trust. They use **Lattice Certificates**.
-Services are registered under `lp://` addresses (e.g., `lp://github.lattice`), which mathematically bind the service location to a known cryptographic identity. 
-
-### 3. `latticed` Default-Deny Proxy Firewall
-The core of the local runtime. `latticed` intercepts all outbound HTTP/HTTPS traffic from your agent.
-- **Agent Sandbox:** Agents are run in isolated environments (e.g., Docker with `--network none`) where their only exit node is `latticed`.
-- **YAML Policies:** Agents operate under strict, human-readable YAML policies. If an agent tries to access `http://google.com`, the proxy blocks it. If it tries to `repo.delete` on `lp://github.lattice` without permission, the proxy blocks it.
-
-### 4. Multi-Issuer Agent PKI (Traceveil Trust Chain)
-Lattice implements a federated PKI architecture allowing multiple levels of certification for a single action:
-- **User/Enterprise/Gov Certs**: Proves human identity or organizational authorization.
-- **Model Provider Certs**: Certifies model provenance, config, and encrypted prompt evidence.
-- **Agent & Tool Certs**: Cryptographically links the executing agent and the target API.
-
-### 5. Post-Quantum Crypto-Agility
-Lattice is built to withstand "harvest now, decrypt later" attacks. The protocol enforces algorithm agility via:
-- Hybrid Handshakes: `X25519` + `ML-KEM-768`
-- Hybrid Signatures: `Ed25519` + `ML-DSA-65`
-- Hashing: `SHA3-512` for long-term Merkle Trees.
-
-### 6. Federated Trust Registries
-A decentralized system (`LatticeRegistry`) to resolve `lp://` names to cryptographic public keys, certificate issuers, and network locations, completely independent of global DNS.
-
-### 5. Cryptographic Action Provenance (SAAE)
-Every single action an agent takes through the network is recorded as a **Signed Agent Action Envelope (SAAE)**. 
-- The proxy hashes the request and response.
-- The action is appended to an immutable JSONL transparency log.
-- This provides mathematically undeniable proof of *what* the agent did, *when*, and under *whose authority*.
-
-### 6. LatticeChain: Public Trust Anchor
-Lattice does **not** put agent actions or private prompts on a blockchain. However, to prevent silent log modification and to decentralize trust, Lattice uses EVM-compatible chains as a **Public Trust Anchor**.
-- The runtime periodically batches off-chain SAAE logs into **Merkle Trees**.
-- Only the **Merkle Root** is submitted to the `LatticeChain.sol` smart contract.
-- Anyone can use the CLI to generate a zero-knowledge inclusion proof validating that a specific action existed at a specific time, without revealing the rest of the logs.
+Structurally inspired by Tor-like networks — separate addressing (`lp://`), overlay routing, cryptographic service identity — but serving the opposite purpose: **where Tor protects anonymity, Lattice enforces accountable agency.**
 
 ---
 
-## 🚀 Getting Started
+## How it works
 
-### Prerequisites
-- Node.js v20+
-- Docker (for sandbox isolation)
+```
+Agent
+  → Entry node (default-deny proxy)
+    → Relay mesh (overlay routing)
+      → Gateway (policy enforcement + SAAE log)
+        → Real service
+```
 
-### Installation
+Agents never touch raw IP addresses or DNS. They request `lp://service.lattice` and Lattice resolves the cryptographic route, enforces capability policy, and records every action in a signed, tamper-evident log.
+
+---
+
+## Key Concepts
+
+### Two addressing modes
+
+| Address | Format | Trust anchor | Use case |
+|---|---|---|---|
+| `*.lattice` | human name | On-chain `LatticeChain` | Public/named services |
+| `*.id` | `lp://<hex_pubkey>.id` | Pubkey embedded in address | Direct node-to-node |
+
+`*.lattice` names are policy registries. The chain is the only authority — without it, a name can be hijacked. `*.id` addresses are self-authenticating: the pubkey *is* the identity, no lookup needed.
+
+### Signed Agent Action Envelopes (SAAE)
+
+Every action an agent takes through the network is recorded:
+
+```json
+{
+  "agent_id": "...",
+  "capability_used": "echo.ping",
+  "request_hash": "0x...",
+  "response_hash": "0x...",
+  "gateway_signature": "...",
+  "timestamp": "..."
+}
+```
+
+Logs are JSONL, HMAC-signed, and periodically batched into Merkle trees. Only the root goes on-chain — prompts and payloads stay off-chain and private.
+
+### Default-deny policy
+
+Agents operate under YAML capability policies. If an agent tries to reach a resource it wasn't granted, the request is blocked at the Entry node before it leaves the machine.
+
+---
+
+## Requirements
+
+- Node.js 20+
+- Docker (recommended for network namespace isolation)
+- For distributed deployment: VPS(s) + TLS (Let's Encrypt) + an EVM-compatible chain
+
+## Installation
 
 ```bash
-git clone https://github.com/WhiteRails/lattice.git
-cd LatticeNet
 npm install
 ```
 
-### 1. Initialize the Runtime
-This generates your local Certificate Authority (CA) and creates the `~/.lattice/` state directory.
+---
+
+## Local quickstart (dev only)
+
+Single-machine smoke test — entry + relay + gateway + echo service.
+
 ```bash
 npm run lattice -- init
+npm run lattice -- up --echo
 ```
 
-### 2. Create an Agent & Define Policy
+Expected output:
+
+```
+[RelayNode]  Listening for overlay traffic on ws://127.0.0.1:8888
+[Gateway]    lp://echo.lattice listening on ws://127.0.0.1:8889 -> http://127.0.0.1:9001
+[Entry]      Listening for agent requests on http://127.0.0.1:7777
+```
+
+Create an agent, grant a capability, and run it:
+
 ```bash
-# Issue a cryptographic certificate for your agent
 npm run lattice -- agent create bot1
-
-# Add a service to your local registry
-npm run lattice -- service add echo --url http://127.0.0.1:9001
-
-# Grant specific capabilities to the agent
 npm run lattice -- grant bot1 lp://echo.lattice echo.ping
+npm run lattice -- run --agent bot1 -- node your_agent.js
 ```
 
-### 3. Start the Gateway Proxy
-```bash
-npm run lattice -- gateway start --port 7777
-```
+Tail the live transparency log:
 
-### 4. Run your Agent securely
-This runs your agent with proxy environment variables injected. (Use `--docker` for true network namespace isolation).
-```bash
-npm run lattice -- run --agent bot1 --no-internet -- node your_agent.js
-```
-
-### 5. Audit the Actions
-Tail the live transparency logs to see exactly what your agent is doing:
 ```bash
 npm run lattice -- logs tail --follow
 ```
 
+> **Note:** Local mode uses a shared `overlaySecret` and no chain. `*.lattice` names are not protected against hijacking in this mode. Use it for development only.
+
 ---
 
-## 🔗 LatticeChain Verification (Phase 2)
+## Distributed deployment (canonical path)
 
-Lattice includes a minimal Solidity smart contract (`contracts/LatticeChain.sol`) to anchor your logs publicly.
+**Goal:** an Entry on VPS-A reaches a Gateway on VPS-C through a public Relay on VPS-B over WSS, with `*.lattice` anchored on `LatticeChain`.
 
-**Create a Merkle Batch:**
+Full operational guide: `RUNBOOK.md` → "F1 Distributed Public Overlay Bring-Up".
+
+### Minimum topology
+
+- **Chain VPS** — EVM JSON-RPC (e.g. Anvil), accessible to operators
+- **Relay VPS** — role `relay`, WSS `:8888`
+- **Gateway VPS** — role `gateway`, WSS `:8889`, local HTTP backend
+- **Entry VPS** — role `entry`, local HTTP proxy `127.0.0.1:7777`
+
+### 1) TLS on Relay and Gateway
+
 ```bash
+sudo certbot certonly --standalone -d relay-1.example.com
+sudo certbot certonly --standalone -d gw-echo.example.com
+```
+
+`~/.lattice/node.yaml`:
+
+```yaml
+tls:
+  certFile: /etc/letsencrypt/live/<domain>/fullchain.pem
+  keyFile: /etc/letsencrypt/live/<domain>/privkey.pem
+```
+
+### 2) Deploy chain + register nodes
+
+On the Chain VPS:
+
+```bash
+anvil --host 0.0.0.0 --port 8545
+npm run lattice -- init
+npm run lattice -- chain deploy --rpc http://127.0.0.1:8545 --key-file /secure/operator.key
+```
+
+On each VPS after `init`, register the node identity on-chain:
+
+```bash
+npm run lattice -- node register --label relay-1 --roles relay \
+  --rpc http://chain.example:8545 --contract <contract> --key-file /secure/operator.key
+
+npm run lattice -- node register --label gateway-echo --roles gateway \
+  --rpc http://chain.example:8545 --contract <contract> --key-file /secure/operator.key
+
+npm run lattice -- node register --label entry-1 --roles entry \
+  --rpc http://chain.example:8545 --contract <contract> --key-file /secure/operator.key
+```
+
+### 3) Configure `node.yaml` per role
+
+**Relay:**
+
+```bash
+npm run lattice -- node init --distributed-mesh --node-id relay-1 --roles relay \
+  --relay-bind 0.0.0.0:8888 \
+  --public-relay wss://relay-1.example.com:8888 \
+  --chain-rpc http://chain.example:8545 --chain-contract <contract> \
+  --tls-cert-file /etc/letsencrypt/live/relay-1.example.com/fullchain.pem \
+  --tls-key-file /etc/letsencrypt/live/relay-1.example.com/privkey.pem
+```
+
+**Gateway:**
+
+```bash
+npm run lattice -- node init --distributed-mesh --node-id gateway-echo --roles gateway \
+  --gateway-bind 0.0.0.0:8889 \
+  --public-gateway wss://gw-echo.example.com:8889 \
+  --chain-rpc http://chain.example:8545 --chain-contract <contract> \
+  --tls-cert-file /etc/letsencrypt/live/gw-echo.example.com/fullchain.pem \
+  --tls-key-file /etc/letsencrypt/live/gw-echo.example.com/privkey.pem
+```
+
+**Entry:**
+
+```bash
+npm run lattice -- node init --distributed-mesh --node-id entry-1 --roles entry \
+  --entry-bind 127.0.0.1:7777 \
+  --upstream-relays relay-1=wss://relay-1.example.com:8888 \
+  --chain-rpc http://chain.example:8545 --chain-contract <contract>
+```
+
+### 4) Publish a service
+
+On the Gateway VPS:
+
+```bash
+npm run services:echo
+npm run lattice -- gateway announce lp://echo.lattice \
+  --backend http://127.0.0.1:9001 \
+  --endpoint wss://gw-echo.example.com:8889 \
+  --gateway-node-label gateway-echo
+```
+
+This produces a `metadataHash` (routing commitment). Register the namespace on-chain:
+
+```bash
+npm run lattice -- chain namespace register echo.lattice \
+  --owner-issuer lattice-ops --public \
+  --metadata-hash <metadataHash> \
+  --rpc http://chain.example:8545 --contract <contract> --key-file /secure/operator.key
+```
+
+Export the routing bundle and distribute it to relays:
+
+```bash
+npm run lattice -- routing export --fqdn echo.lattice --out echo.route.json
+```
+
+On each Relay:
+
+```bash
+npm run lattice -- routing import --file echo.route.json \
+  --verify-chain --rpc http://chain.example:8545 --contract <contract>
+```
+
+### 5) Start all roles
+
+```bash
+# Relay VPS
+npm run lattice -- node start --role relay
+
+# Gateway VPS
+npm run lattice -- node start --role gateway --service lp://echo.lattice --target http://127.0.0.1:9001
+
+# Entry VPS
+npm run lattice -- node start --role entry
+```
+
+### 6) End-to-end smoke test
+
+From the Entry VPS:
+
+```bash
+npm run lattice -- agent create bot1
+npm run lattice -- mesh smoke --agent bot1 \
+  --entry http://127.0.0.1:7777 --host echo.lattice --path /ping --expect-status 200
+```
+
+---
+
+## LatticeChain: public trust anchor
+
+Lattice does not put agent actions or private prompts on a blockchain. It uses EVM-compatible chains only as a **public trust anchor** for namespace ownership and log integrity.
+
+- SAAE logs are batched off-chain into Merkle trees
+- Only the Merkle root is submitted to `LatticeChain.sol`
+- Anyone can generate a zero-knowledge inclusion proof for a specific action without revealing the rest of the logs
+
+```bash
+# Create a batch
 npm run lattice -- logs batch
-> Created batch_d075dbe77157 with 42 actions.
-> Merkle root: 0x41096fd...
+
+# Anchor on-chain
+npm run lattice -- checkpoint submit --batch <batch_id> \
+  --rpc <RPC_URL> --key-file <key> --contract <ADDRESS>
+
+# Verify an action
+npm run lattice -- proof <action_id>
 ```
 
-**Anchor it on-chain (must use contract owner key):**
+---
+
+## Self-authenticating node identity (`*.id`)
+
+Every Lattice node has a self-authenticating address derived from its overlay public key:
+
 ```bash
-npm run lattice -- checkpoint submit --batch batch_d075dbe77157 --rpc <RPC_URL> --key-file <PATH_OUTSIDE_REPO> --contract <ADDRESS>
+npm run lattice -- id
+# Self-authenticating address:
+#   lp:// URL : lp://deadbeef...cafebabe.id
+#   fqdn      : deadbeef...cafebabe.id
+#   pubkey    : <base64>
 ```
 
-**Verify an action cryptographically:**
-```bash
-npm run lattice -- proof act_0f7b53976546
-> Action: act_0f7b53976546
-> Included in batch: batch_d075dbe77157
-> Merkle root: 0x41096fd...
-> Checkpoint: on-chain (verified)
+`*.id` addresses require no chain lookup. The pubkey is embedded in the address — at connection time, Lattice verifies the remote endpoint's pubkey matches the address. A poisoned federation entry with a different pubkey is rejected at resolution.
+
+---
+
+## Repository structure
+
+```
+cli/        CLI (npm run lattice -- ...)
+contracts/  LatticeChain.sol
+core/       Types, PKI, policy helpers
+docs/       Architecture decisions and specs
+node/       Entry / Relay / Gateway + resolver + routing-cache
+services/   Example backends (echo, proxies)
+tests/      Vitest
 ```
 
-**Namespaces (`*.lattice` on-chain):** Only ASCII lowercase `label.lattice` (single label, `[a-z0-9-]+`). Reserved official slugs (`governments`, `lattice`, `system`, `registry` by default) can **only** be registered by the **contract owner**. See [`docs/lattice-uri-scheme.md`](docs/lattice-uri-scheme.md) for the `lattice://` mapping and [`docs/Operator-key-security.md`](docs/Operator-key-security.md) for storing owner keys outside the repo.
+<details>
+<summary><b>Useful commands</b></summary>
 
 ```bash
-npm run lattice -- chain cert-type register AgentCert --level 1 --rpc <RPC> --key-file ~/.secrets/lattice/owner.hex --contract <ADDR>
-npm run lattice -- chain issuer register gov:ux:root --type government --pub-key-file ./gov-pub.pem --rpc <RPC> --key-file ~/.secrets/lattice/owner.hex --contract <ADDR>
-npm run lattice -- chain issuer permit gov:ux:root AgentCert --rpc <RPC> --key-file ~/.secrets/lattice/owner.hex --contract <ADDR>
-# Official governments host (owner key only):
-npm run lattice -- chain namespace register governments.lattice --owner-issuer gov:ux:root --rpc <RPC> --key-file ~/.secrets/lattice/owner.hex --contract <ADDR>
-# Public echo host (any wallet with gas):
-npm run lattice -- chain namespace register echo.lattice --owner-issuer gov:ux:root --rpc <RPC> --key-file ~/.secrets/lattice/user.hex --contract <ADDR>
+npm test
 
-npm run lattice -- chain namespace hash governments.lattice
-npm run lattice -- chain namespace show governments.lattice --rpc <RPC> --contract <ADDR>
+# Diagnostics
+npm run lattice -- id
+npm run lattice -- resolve lp://echo.lattice
+npm run lattice -- logs tail --n 50
+
+# Chain
+npm run lattice -- chain namespace show echo.lattice --rpc <RPC> --contract <ADDR>
+
+# Routing bundles
+npm run lattice -- routing export --fqdn echo.lattice --out echo.route.json
+npm run lattice -- routing import --file echo.route.json --verify-chain --rpc <RPC> --contract <ADDR>
+
+# On-chain namespaces (owner-only slugs)
+npm run lattice -- chain cert-type register AgentCert --level 1 --rpc <RPC> --key-file <key> --contract <ADDR>
+npm run lattice -- chain issuer register lattice-ops --type operator --pub-key-file ./ops.pem --rpc <RPC> --key-file <key> --contract <ADDR>
 npm run lattice -- chain reserved show governments --rpc <RPC> --contract <ADDR>
 ```
 
+</details>
+
 ---
 
-## 🛠 Project Structure
+## License
 
-```text
-├── src/                  # Layer 1: Protocol SDK (Types, Crypto, Gateways)
-├── daemon/               # Layer 2: latticed Proxy, Policy Engine, State Manager
-├── cmd/                  # Layer 2: `lattice` CLI framework
-├── contracts/            # Layer 3: LatticeChain Trust Anchor (Solidity)
-├── services/             # Mock lp:// services for local development
-├── examples/             # Demo agents and API usage
-└── testnet/              # Docker compose testnet bootstrap
-```
-
-## 📜 License
 MIT

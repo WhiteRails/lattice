@@ -62,8 +62,11 @@ export function fqdnFromLpAddress(lp: string): string {
   let s = lp.trim();
   if (s.startsWith('lp://')) s = s.slice(5);
   s = s.split('/')[0] ?? '';
-  if (!s.endsWith('.lattice')) throw new Error(`Invalid Lattice service address (expected *.lattice): ${lp}`);
-  return s.toLowerCase();
+  const lower = s.toLowerCase();
+  if (!lower.endsWith('.lattice') && !lower.endsWith('.id')) {
+    throw new Error(`Invalid Lattice service address (expected *.lattice or *.id): ${lp}`);
+  }
+  return lower;
 }
 
 export function lpFromFqdn(fqdn: string): string {

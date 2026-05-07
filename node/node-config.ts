@@ -110,6 +110,20 @@ const latticeNodeConfigSchema = z.object({
     .strict()
     .optional(),
 
+  /**
+   * Declarative service definitions used by `lattice up`.
+   * Each entry maps an lp:// address to an internal HTTP backend.
+   */
+  services: z
+    .array(
+      z.object({
+        address: z.string().min(1),   // e.g. lp://echo.lattice
+        target: z.string().url(),     // e.g. http://127.0.0.1:9001
+        port: z.number().int().positive().optional(), // gateway WS port (auto-assigned if omitted)
+      }).strict(),
+    )
+    .optional(),
+
   tls: tlsSchema,
 }).strict().superRefine((cfg, ctx) => {
   if (cfg.distributedMesh && !cfg.nodeId?.trim()) {

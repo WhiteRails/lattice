@@ -52,6 +52,8 @@ export interface AnnounceRequest {
   payload: RoutingPayload;
   ttlSeconds?: number;
   announcerPubKey?: string;
+  /** HMAC-SHA256(overlaySecret, stableStringify({payload, ttlSeconds, announcerPubKey})) */
+  announceHmac?: string;
 }
 
 // ─── Server ─────────────────────────────────────────────────────────────────
@@ -152,10 +154,13 @@ export class FederationRegistryServer {
   private async handleRequest(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
     const url = req.url?.split('?')[0] ?? '/';
 
-    // CORS for dev tooling
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    // CORS restricted to localhost dev tooling only — never wildcard on announce
+    const origin = req.headers['origin'];
+    if (origin && /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) {
+      res.setHeader('Access-Control-Allow-Origin', origin);
+      res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    }
     if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
 
     if (req.method === 'GET' && url === FEDERATION_HEALTH_PATH) {
@@ -183,6 +188,29 @@ export class FederationRegistryServer {
         res.end(JSON.stringify({ error: `Invalid announce body: ${e?.message}` }));
         return;
       }
+
+      // Verify HMAC authentication on announce requests
+      const hmacBody: Record<string, unknown> = { payload: announce.payload };
+      if (announce.ttlSeconds !== undefined) hmacBody.ttlSeconds = announce.ttlSeconds;
+      if (announce.announcerPubKey !== undefined) hmacBody.announcerPubKey = announce.announcerPubKey;
+      const expectedHmac = crypto
+        .createHmac('sha256', Buffer.from(this.overlaySecret, 'utf8'))
+        .update(stableStringify(hmacBody), 'utf8')
+        .digest('hex');
+      const providedHmac = announce.announceHmac ?? '';
+      let hmacOk = false;
+      try {
+        hmacOk = providedHmac.length > 0 &&
+          crypto.timingSafeEqual(Buffer.from(providedHmac, 'hex'), Buffer.from(expectedHmac, 'hex'));
+      } catch {
+        hmacOk = false;
+      }
+      if (!hmacOk) {
+        res.writeHead(401, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Announce authentication failed' }));
+        return;
+      }
+
       const ttl = Math.max(30, Math.min(announce.ttlSeconds ?? FEDERATION_DEFAULT_TTL_SECONDS, 3600));
       this.upsertEntry(announce.payload, ttl, announce.announcerPubKey);
       res.writeHead(200, { 'content-type': 'application/json' });
@@ -208,8 +236,12 @@ export async function fetchFederationRoutes(
     const parsed = JSON.parse(raw) as FederationRoutesResponse;
     if (parsed.version !== 1 || !parsed.routes) return null;
 
-    // Optional HMAC verification when we share the overlay secret
-    if (opts.overlaySecret && parsed.serverSig) {
+    // Mandatory HMAC verification when we share the overlay secret
+    if (opts.overlaySecret) {
+      if (!parsed.serverSig) {
+        console.warn(chalk.yellow('[Federation]') + ` No serverSig from ${registryUrl} — ignoring unsigned response`);
+        return null;
+      }
       const { serverSig, ...body } = parsed;
       const expected = crypto
         .createHmac('sha256', Buffer.from(opts.overlaySecret, 'utf8'))
@@ -231,14 +263,23 @@ export async function fetchFederationRoutes(
 export async function postFederationAnnounce(
   registryUrl: string,
   payload: RoutingPayload,
-  opts: { ttlSeconds?: number; announcerPubKey?: string; timeoutMs?: number } = {},
+  opts: { ttlSeconds?: number; announcerPubKey?: string; timeoutMs?: number; overlaySecret?: string } = {},
 ): Promise<boolean> {
   const url = `${registryUrl.replace(/\/$/, '')}${FEDERATION_ANNOUNCE_PATH}`;
-  const body: AnnounceRequest = {
-    payload: normalizeRoutingPayload(payload),
-    ttlSeconds: opts.ttlSeconds ?? FEDERATION_DEFAULT_TTL_SECONDS,
-    announcerPubKey: opts.announcerPubKey,
-  };
+  const normalizedPayload = normalizeRoutingPayload(payload);
+  const ttlSeconds = opts.ttlSeconds ?? FEDERATION_DEFAULT_TTL_SECONDS;
+  const body: AnnounceRequest = { payload: normalizedPayload, ttlSeconds };
+  if (opts.announcerPubKey) body.announcerPubKey = opts.announcerPubKey;
+
+  // Compute announce HMAC when overlaySecret is available
+  if (opts.overlaySecret) {
+    const hmacBody: Record<string, unknown> = { payload: normalizedPayload, ttlSeconds };
+    if (opts.announcerPubKey) hmacBody.announcerPubKey = opts.announcerPubKey;
+    body.announceHmac = crypto
+      .createHmac('sha256', Buffer.from(opts.overlaySecret, 'utf8'))
+      .update(stableStringify(hmacBody), 'utf8')
+      .digest('hex');
+  }
   try {
     await httpPost(url, JSON.stringify(body), opts.timeoutMs ?? 5000);
     return true;
@@ -291,10 +332,21 @@ function httpPost(url: string, body: string, timeoutMs: number): Promise<string>
   });
 }
 
+const MAX_ANNOUNCE_BODY_BYTES = 65_536; // 64 KiB
+
 function readBody(req: http.IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
-    req.on('data', (d: Buffer) => chunks.push(d));
+    let totalBytes = 0;
+    req.on('data', (d: Buffer) => {
+      totalBytes += d.length;
+      if (totalBytes > MAX_ANNOUNCE_BODY_BYTES) {
+        req.destroy(new Error('request body too large'));
+        reject(new Error('request body too large'));
+        return;
+      }
+      chunks.push(d);
+    });
     req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
     req.on('error', reject);
   });

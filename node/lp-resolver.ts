@@ -22,8 +22,9 @@ import {
   type RoutingPayload,
 } from './routing-cache';
 import { LOCAL_FALLBACK_WS_REGISTRY } from './local-relay-registry';
-import { getOrCreateOverlayKeyPair } from './state';
+import { getOrCreateOverlayKeyPair, loadCA } from './state';
 import { fetchFederationRoutes } from './federation-registry';
+import { isSelfAuthAddress, pubkeyFromSelfAuthFqdn, deriveSelfAuthAddress } from './self-auth';
 
 export class LpRoutingNotFoundError extends Error {
   constructor(msg: string) {
@@ -63,7 +64,7 @@ export class LpGatewayResolver {
     if (!urls.length) return null;
     const now = Date.now();
     for (const url of urls) {
-      const resp = await fetchFederationRoutes(url);
+      const resp = await fetchFederationRoutes(url, { overlaySecret: loadCA().overlaySecret });
       if (!resp?.routes) continue;
       const entry = resp.routes[fqdn];
       if (!entry) continue;
@@ -96,16 +97,74 @@ export class LpGatewayResolver {
     }
   }
 
+  /**
+   * Resolve a self-authenticating lp://<hex>.id address.
+   * The pubkey is embedded in the address — no chain lookup needed.
+   * Routing-cache/federation provide the endpoints; pubkey provides identity.
+   */
+  private async resolveSelfAuth(fqdn: string, lpDestination: string): Promise<ResolvedGatewayRoute> {
+    const pubkeyB64 = pubkeyFromSelfAuthFqdn(fqdn);
+    if (!pubkeyB64) throw new LpRoutingNotFoundError(`Invalid self-auth address: ${fqdn}`);
+
+    // Step 1: Local routing-cache (no HMAC required — pubkey is the trust anchor)
+    let payload = lookupRoutingPayload(this.cfg, fqdn, { requireLocalSig: false });
+
+    // Step 2: Federation (allowed for .id — pubkey in address verifies identity)
+    if (!payload || !payload.gatewayEndpoints.length) {
+      payload = (await this.resolveFederation(fqdn)) ?? undefined;
+    }
+
+    if (!payload || !payload.gatewayEndpoints.length) {
+      throw new LpRoutingNotFoundError(
+        `No routing found for self-auth address ${fqdn}. ` +
+        `The gateway must announce lp://${fqdn} to federation or routing-cache.`,
+      );
+    }
+
+    // Verify the routing payload's pubkey matches the address (trust verification)
+    if (deriveSelfAuthAddress(payload.gatewayPubKeyB64) !== fqdn) {
+      throw new LpRoutingNotFoundError(
+        `Self-auth pubkey mismatch for ${fqdn}: ` +
+        `routing entry pubkey does not match address. Possible hijack attempt.`,
+      );
+    }
+
+    return {
+      fqdn,
+      lpDestination,
+      gatewayNodeLabel: payload.gatewayNodeLabel,
+      gatewayPubKeyB64: pubkeyB64,
+      gatewayEndpoints: [...payload.gatewayEndpoints],
+      metadataHash: routingCommitmentHex(payload),
+      serviceCertHash: '',
+    };
+  }
+
   async resolveDestination(lpDestination: string): Promise<ResolvedGatewayRoute> {
     const fqdn = fqdnFromLpAddress(lpDestination);
+
+    // Self-authenticating .id address — pubkey IS the identity, no chain needed
+    if (isSelfAuthAddress(fqdn)) {
+      return this.resolveSelfAuth(fqdn, lpDestination);
+    }
+
+    const mesh = distributedMeshEffective(this.cfg);
     const cached = lookupRoutingPayload(this.cfg, fqdn, { requireLocalSig: !this.chain });
 
     if (!this.chain) {
-      const mesh = distributedMeshEffective(this.cfg);
       let payload = cached;
 
-      // Step 2: Try federation registries if cache miss
+      // Step 2: Federation registries — but ONLY allowed without chain in non-mesh mode.
+      // In distributed mesh, signed routing-cache is the trust anchor; federation without
+      // on-chain namespace verification can be hijacked by any authenticated node.
       if (!payload || !payload.gatewayEndpoints.length) {
+        if (mesh) {
+          throw new LpRoutingNotFoundError(
+            `Distributed mesh requires a signed routing-cache entry or chain config for ${fqdn}. ` +
+            `Run: lattice routing announce --fqdn ${fqdn} (or set registry.chain in node.yaml). ` +
+            `Without on-chain verification, federation alone cannot be trusted as a namespace authority.`,
+          );
+        }
         const fedPayload = await this.resolveFederation(fqdn);
         if (fedPayload) payload = fedPayload;
       }
@@ -158,7 +217,6 @@ export class LpGatewayResolver {
 
     const chainMeta = ns.metadataHash === ethers.ZeroHash ? '' : String(ns.metadataHash).toLowerCase();
     const svc = ns.serviceCertHash === ethers.ZeroHash ? '' : String(ns.serviceCertHash).toLowerCase();
-    const mesh = distributedMeshEffective(this.cfg);
 
     let payload = cached;
     if (mesh && !chainMeta) {

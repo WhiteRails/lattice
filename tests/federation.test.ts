@@ -13,10 +13,11 @@ import * as os from 'os';
 import * as path from 'path';
 import * as crypto from 'crypto';
 import * as http from 'http';
+import { stableStringify } from '../node/message';
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-async function freshLatticeHome(): Promise<{ home: string }> {
+async function freshLatticeHome(): Promise<{ home: string; overlaySecret: string }> {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'lat-fed-'));
   process.env.LATTICE_HOME = home;
   vi.resetModules();
@@ -24,14 +25,29 @@ async function freshLatticeHome(): Promise<{ home: string }> {
   const { LatticeCA } = await import('../core/ca');
   initDirs();
   const ca = new LatticeCA('ca.test');
+  const overlaySecret = crypto.randomBytes(32).toString('base64');
   saveCA({
     caId: ca.id,
     publicKey: ca.publicKey,
     privateKey: ca.privateKey,
-    overlaySecret: crypto.randomBytes(32).toString('base64'),
+    overlaySecret,
     createdAt: new Date().toISOString(),
   });
-  return { home };
+  return { home, overlaySecret };
+}
+
+/** Compute the HMAC that POST /v1/announce requires (matches server-side logic). */
+function computeAnnounceHmac(
+  overlaySecret: string,
+  payload: object,
+  opts: { ttlSeconds?: number; announcerPubKey?: string } = {},
+): string {
+  const hmacBody: Record<string, unknown> = { payload };
+  if (opts.ttlSeconds !== undefined) hmacBody.ttlSeconds = opts.ttlSeconds;
+  if (opts.announcerPubKey !== undefined) hmacBody.announcerPubKey = opts.announcerPubKey;
+  return crypto.createHmac('sha256', Buffer.from(overlaySecret, 'utf8'))
+    .update(stableStringify(hmacBody), 'utf8')
+    .digest('hex');
 }
 
 function freePort(): Promise<number> {
@@ -94,7 +110,11 @@ describe('FederationRegistryServer', () => {
     };
     const announceResp = await httpPost(
       `http://127.0.0.1:${port}/v1/announce`,
-      JSON.stringify({ payload, ttlSeconds: 120 }),
+      JSON.stringify({
+        payload,
+        ttlSeconds: 120,
+        announceHmac: computeAnnounceHmac(overlaySecret, payload, { ttlSeconds: 120 }),
+      }),
     );
     expect(JSON.parse(announceResp).ok).toBe(true);
 
@@ -105,23 +125,24 @@ describe('FederationRegistryServer', () => {
 
   it('signs response with serverSig HMAC', async () => {
     // Announce something first
+    const announcePayload = {
+      version: 2,
+      fqdn: 'test.lattice',
+      gatewayPubKeyB64: 'abc=',
+      gatewayEndpoints: ['wss://1.2.3.4:9000'],
+    };
     await httpPost(
       `http://127.0.0.1:${port}/v1/announce`,
       JSON.stringify({
-        payload: {
-          version: 2,
-          fqdn: 'test.lattice',
-          gatewayPubKeyB64: 'abc=',
-          gatewayEndpoints: ['wss://1.2.3.4:9000'],
-        },
+        payload: announcePayload,
+        announceHmac: computeAnnounceHmac(overlaySecret, announcePayload),
       }),
     );
     const raw = await httpGet(`http://127.0.0.1:${port}/v1/routes`);
     const body = JSON.parse(raw) as { serverSig: string; [k: string]: unknown };
     expect(body.serverSig).toBeTruthy();
 
-    // Verify it matches expected HMAC
-    const { stableStringify } = await import('../node/message');
+    // Verify it matches expected HMAC (stableStringify imported at top)
     const { serverSig, ...rest } = body;
     const expected = crypto
       .createHmac('sha256', Buffer.from(overlaySecret, 'utf8'))
@@ -217,14 +238,16 @@ describe('fetchFederationRoutes', () => {
 describe('LpGatewayResolver — federation resolution', () => {
   let fedServer: import('../node/federation-registry').FederationRegistryServer;
   let fedPort: number;
-  const overlaySecret = crypto.randomBytes(32).toString('base64');
+  let caOverlaySecret: string;
 
   beforeEach(async () => {
-    await freshLatticeHome();
+    // Use the CA overlaySecret so lp-resolver HMAC verification matches the server
+    const { overlaySecret } = await freshLatticeHome();
+    caOverlaySecret = overlaySecret;
     fedPort = await freePort();
     vi.resetModules();
     const { FederationRegistryServer } = await import('../node/federation-registry');
-    fedServer = new FederationRegistryServer('127.0.0.1', fedPort, overlaySecret);
+    fedServer = new FederationRegistryServer('127.0.0.1', fedPort, caOverlaySecret);
     fedServer.start();
     await sleep(100);
   });
@@ -300,7 +323,7 @@ describe('postFederationAnnounce', () => {
         gatewayPubKeyB64: pubkey,
         gatewayEndpoints: ['wss://5.5.5.5:8889'],
       },
-      { ttlSeconds: 90, announcerPubKey: pubkey },
+      { ttlSeconds: 90, announcerPubKey: pubkey, overlaySecret: 'secret' },
     );
     expect(ok).toBe(true);
 

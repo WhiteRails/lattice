@@ -24,6 +24,7 @@ import {
 import { bindOverlayWebSocketServer, wsTlsClientOptions } from './ws-stack';
 import { validateDistributedPeer } from './peer-identity';
 import { postFederationAnnounce } from './federation-registry';
+import { deriveSelfAuthAddress } from './self-auth';
 
 export interface ServiceGatewayOptions {
   port?: number;
@@ -245,20 +246,28 @@ export class ServiceGateway {
     const fedUrls = resolveFederationUrls(cfg);
     if (!fedUrls.length) return;
     const fqdn = serviceAddress.replace(/^lp:\/\//, '').split('/')[0] ?? '';
-    if (!fqdn.endsWith('.lattice')) return;
+    if (!fqdn.endsWith('.lattice') && !fqdn.endsWith('.id')) return;
     const ttl = cfg?.gateway?.announceTtlSeconds ?? 300;
+    const overlaySecret = loadCA().overlaySecret;
+    // FQDNs to announce: the named .lattice address + the self-auth .id address
+    const selfAuthFqdn = deriveSelfAuthAddress(this.myPublicKey);
+    const fqdnsToAnnounce = fqdn.endsWith('.lattice')
+      ? [fqdn, selfAuthFqdn]
+      : [fqdn];
     for (const url of fedUrls) {
-      postFederationAnnounce(
-        url,
-        {
-          version: 2,
-          fqdn,
-          gatewayPubKeyB64: this.myPublicKey,
-          gatewayEndpoints,
-          gatewayNodeLabel: this.nodeLabel,
-        },
-        { ttlSeconds: ttl, announcerPubKey: this.myPublicKey },
-      ).catch(() => {});
+      for (const announceFqdn of fqdnsToAnnounce) {
+        postFederationAnnounce(
+          url,
+          {
+            version: 2,
+            fqdn: announceFqdn,
+            gatewayPubKeyB64: this.myPublicKey,
+            gatewayEndpoints,
+            gatewayNodeLabel: this.nodeLabel,
+          },
+          { ttlSeconds: ttl, announcerPubKey: this.myPublicKey, overlaySecret },
+        ).catch(() => {});
+      }
     }
     // Re-announce at half the TTL
     setTimeout(() => this.announceFederation(cfg, serviceAddress, gatewayEndpoints), (ttl / 2) * 1000).unref?.();

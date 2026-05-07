@@ -64,12 +64,15 @@ import {
   exportRoutingBundle,
   importRoutingBundle,
   upsertRoutingPayload,
+  lookupRoutingPayload,
+  routingCommitmentHex,
   ROUTING_PAYLOAD_VERSION,
   upsertLatticeNodeLocalRecord,
   type RoutingPayload,
   type RoutingBundle,
 } from '../node/routing-cache';
 import { LpGatewayResolver } from '../node/lp-resolver';
+import { selfAuthLpUrl, deriveSelfAuthAddress } from '../node/self-auth';
 import { credentialMaskFromNames } from '../core/namespace-access';
 import { LatticeCA }         from '../core/ca';
 import { generateKeyPair, hashRequestBody, requestSignaturePayload, signData } from '../core/identity';
@@ -323,6 +326,20 @@ svc.command('list').description('List registered services').action(() => {
     const s = loadService(n);
     console.log(`  ${chalk.cyan(s.address)}  →  ${chalk.dim(s.url)}`);
   }
+});
+
+// ── id ───────────────────────────────────────────────────────────────────────
+program.command('id').description('Show this node\'s self-authenticating lp:// address (.id)').action(() => {
+  requireInit();
+  const kp = getOrCreateOverlayKeyPair();
+  const fqdn = deriveSelfAuthAddress(kp.publicKey);
+  const url = selfAuthLpUrl(kp.publicKey);
+  console.log(chalk.bold('Self-authenticating address:'));
+  console.log(`  lp:// URL : ${chalk.cyan(url)}`);
+  console.log(`  fqdn      : ${chalk.cyan(fqdn)}`);
+  console.log(`  pubkey    : ${chalk.dim(kp.publicKey)}`);
+  console.log();
+  console.log(chalk.dim('Share this address to allow direct connections without a .lattice name or chain lookup.'));
 });
 
 // ── resolve ──────────────────────────────────────────────────────────────────
@@ -1038,6 +1055,7 @@ chainNs
   .requiredOption('--owner-issuer <label>', 'Issuer label (hashed to bytes32) as namespace owner')
   .option('--service-cert-hash <hex>', 'bytes32 service cert hash (default 0x0…0)')
   .option('--metadata-hash <hex>', 'bytes32 metadata hash (default 0x0…0)')
+  .option('--from-routing-cache', 'Auto-read metadataHash from local routing-cache for this FQDN (convenience flag)')
   .option('--namespace-admin <address>', 'Domain admin (default: caller); may update service binding + access policy')
   .option('--public', 'Accept any client at gateway (see docs/Namespace-firewall-gateway.md)')
   .option('--credentials <csv>', 'When not --public: OR mask from gov,enterprise,model (comma-separated)')
@@ -1054,6 +1072,18 @@ chainNs
         credentialMask = credentialMaskFromNames(credCsv.split(',').map(s => s.trim()).filter(Boolean));
       }
       const minAssuranceLevel = Math.max(0, Math.min(255, parseInt(String(opts.minAssurance), 10) || 0));
+
+      // --from-routing-cache: auto-read metadataHash from local routing-cache
+      let metadataHash: string | undefined = opts.metadataHash as string | undefined;
+      if (opts.fromRoutingCache) {
+        if (metadataHash) err('Use either --metadata-hash or --from-routing-cache, not both');
+        const normalFqdn = fqdn.trim().toLowerCase();
+        const cached = lookupRoutingPayload(loadNodeConfig(), normalFqdn, { requireLocalSig: false });
+        if (!cached) err(`No routing-cache entry for ${normalFqdn}. Run: lattice routing announce --fqdn ${normalFqdn} ...`);
+        metadataHash = routingCommitmentHex(cached!);
+        console.log(chalk.dim(`  Auto-detected metadataHash from routing-cache: ${metadataHash}`));
+      }
+
       const { txHash, nameHash, ownerIssuerId } = await chainRegisterNamespace(
         opts.rpc,
         pk,
@@ -1061,7 +1091,7 @@ chainNs
         fqdn,
         opts.ownerIssuer as string,
         opts.serviceCertHash as string | undefined,
-        opts.metadataHash as string | undefined,
+        metadataHash,
         opts.namespaceAdmin as string | undefined,
         publicAccess,
         credentialMask,
@@ -1218,6 +1248,159 @@ program.command('proof <action_id>').description('Generate and verify Merkle pro
     } catch (e: any) { err(e.message); }
   });
 
+// ── up — One-command full overlay stack ──────────────────────────────────────
+program
+  .command('up')
+  .description(
+    'Start the full Lattice overlay in one process (Relay + Gateway(s) + Entry).\n' +
+    'Services are read from node.yaml `services:` array, or passed with --service/--target.\n\n' +
+    'Examples:\n' +
+    '  lattice up --service lp://echo.lattice --target http://localhost:9001\n' +
+    '  lattice up --echo          # includes built-in echo backend on :9001\n' +
+    '  lattice up                 # reads services from ~/.lattice/node.yaml',
+  )
+  .option('--service <lp://name.lattice>', 'Service address (may repeat)', collect, [])
+  .option('--target <http://...>', 'Backend URL for the service (matches --service order)', collect, [])
+  .option('--entry-port <port>', 'Entry HTTP port (default 7777)')
+  .option('--relay-port <port>', 'Relay WS port (default 8888)')
+  .option('--gateway-port <port>', 'Base gateway WS port (default 8889, incremented per service)')
+  .option('--echo', 'Also start an in-process echo HTTP backend on :9001')
+  .option('--federation', 'Also start a local federation registry HTTP server on :9000')
+  .action(async (opts: {
+    service: string[];
+    target: string[];
+    entryPort?: string;
+    relayPort?: string;
+    gatewayPort?: string;
+    echo?: boolean;
+    federation?: boolean;
+  }) => {
+    requireInit();
+    const yaml = loadNodeConfig();
+
+    // ── Collect service definitions ──────────────────────────────────────
+    type ServiceDef = { address: string; target: string; port: number };
+    const services: ServiceDef[] = [];
+
+    // CLI flags take priority
+    if (opts.service.length) {
+      if (opts.service.length !== opts.target.length) {
+        err('--service and --target counts must match');
+      }
+      const basePort = parseInt(opts.gatewayPort ?? '8889', 10);
+      opts.service.forEach((addr, i) => {
+        services.push({ address: addr.trim(), target: opts.target[i]!.trim(), port: basePort + i });
+      });
+    } else if (yaml?.services?.length) {
+      // Read from node.yaml services array
+      const basePort = parseInt(opts.gatewayPort ?? '8889', 10);
+      yaml.services.forEach((s, i) => {
+        services.push({ address: s.address, target: s.target, port: s.port ?? basePort + i });
+      });
+    }
+
+    if (!services.length) {
+      err(
+        'No services defined.\n' +
+        '  Pass --service lp://name.lattice --target http://127.0.0.1:9001\n' +
+        '  or add a services: array to ~/.lattice/node.yaml\n' +
+        '  or use --echo to start with the built-in echo service.',
+      );
+    }
+
+    const closers: Array<() => void> = [];
+
+    // ── Optional built-in echo backend ───────────────────────────────────
+    if (opts.echo) {
+      const echoPort = 9001;
+      const echoSrv = http.createServer((req, res) => {
+        const chunks: Buffer[] = [];
+        req.on('data', (d: Buffer) => chunks.push(d));
+        req.on('end', () => {
+          const body = Buffer.concat(chunks).toString();
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ echo: true, method: req.method, path: req.url, body }));
+        });
+      });
+      echoSrv.listen(echoPort, '127.0.0.1', () =>
+        console.log(chalk.dim(`[echo]   http://127.0.0.1:${echoPort}`)),
+      );
+      closers.push(() => echoSrv.close());
+
+      // Add echo service if not already declared
+      if (!services.find(s => s.address.includes('echo'))) {
+        const basePort = parseInt(opts.gatewayPort ?? '8889', 10) + services.length;
+        services.push({
+          address: 'lp://echo.lattice',
+          target: `http://127.0.0.1:${echoPort}`,
+          port: basePort,
+        });
+      }
+    }
+
+    // ── Optional local federation registry ───────────────────────────────
+    if (opts.federation || yaml?.federation?.serve) {
+      const { parseBindHostPort: pbhp } = await import('../node/node-config');
+      const fedBind = yaml?.federation?.bindHostPort ?? '127.0.0.1:9000';
+      const { host: fh, port: fp } = pbhp(fedBind, '127.0.0.1', 9000);
+      const ca = loadCA();
+      const fedSrv = new FederationRegistryServer(fh, fp, ca.overlaySecret, yaml?.tls);
+      fedSrv.start();
+      closers.push(() => fedSrv.stop());
+    }
+
+    // ── Start Relay ───────────────────────────────────────────────────────
+    const relayPort = parseInt(opts.relayPort ?? String(DEFAULT_RELAY_PORT), 10);
+    const relay = new RelayNode({
+      port: relayPort,
+      nodeConfig: yaml,
+    });
+    closers.push(() => relay.close());
+
+    // ── Start Gateway(s) ─────────────────────────────────────────────────
+    for (const svc of services) {
+      const gw = new ServiceGateway(svc.address, svc.target, {
+        port: svc.port,
+        nodeConfig: yaml,
+      });
+      closers.push(() => gw.close());
+    }
+
+    // ── Start Entry ───────────────────────────────────────────────────────
+    const entryPort = parseInt(opts.entryPort ?? String(DEFAULT_ENTRY_PORT), 10);
+    new EntryNode({
+      port: entryPort,
+      relayUrls: [`ws://127.0.0.1:${relayPort}`],
+      nodeConfig: yaml,
+    });
+
+    // ── Status summary ────────────────────────────────────────────────────
+    setTimeout(() => {
+      console.log('');
+      console.log(chalk.bold('Lattice overlay ready'));
+      console.log(`  ${chalk.cyan('Entry')}   http://127.0.0.1:${entryPort}  ${chalk.dim('(agent-facing HTTP proxy)')}`);
+      console.log(`  ${chalk.magenta('Relay')}   ws://127.0.0.1:${relayPort}     ${chalk.dim('(overlay router)')}`);
+      for (const svc of services) {
+        console.log(`  ${chalk.green('Gateway')} ${svc.address} → ${svc.target}  ${chalk.dim(`ws/:${svc.port}`)}`);
+      }
+      console.log('');
+      console.log(chalk.dim('Press Ctrl+C to stop all nodes.'));
+    }, 300);
+
+    const shutdown = () => {
+      console.log('\n' + chalk.dim('Shutting down…'));
+      closers.forEach(c => { try { c(); } catch {} });
+      process.exit(0);
+    };
+    process.on('SIGINT', shutdown);
+    process.on('SIGTERM', shutdown);
+  });
+
+/** Commander `collect` option to allow --flag x --flag y → ['x','y'] */
+function collect(val: string, prev: string[]): string[] {
+  return [...prev, val];
+}
+
 // ── registry — Federation Registry ──────────────────────────────────────────
 const registryCli = program.command('registry').description('Federation Registry: share lp:// routing across nodes');
 
@@ -1272,6 +1455,7 @@ registryCli
     const success = await postFederationAnnounce(registryUrl, payload, {
       ttlSeconds: ttl,
       announcerPubKey: pubkey,
+      overlaySecret: loadCA().overlaySecret,
     });
     if (success) ok(`Announced (TTL ${ttl}s)`);
     else err('Announce failed — is the registry server running?');
