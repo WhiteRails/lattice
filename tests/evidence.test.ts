@@ -50,4 +50,29 @@ describe('EvidenceStore encryption key binding', () => {
     store.markPotentiallyExposed(re.ref);
     expect(store.get(re.ref)?.exposure_status).toBe('POTENTIALLY_EXPOSED');
   });
+
+  it('fails closed at evidence-shard capacity and returns bounded references', async () => {
+    const store = new EvidenceStore({ maxEntries: 1, maxRetainedBytes: 1_000_000, pageSize: 1 });
+    const recipient = rsaPair();
+    const makeBundle = (action_id: string) => ({
+      action_id, request: {}, response: {}, parameters: {}, agent_id: 'agent-1', tool_id: 'tool-1', timestamp: new Date().toISOString(),
+    });
+    await store.store_bundle(makeBundle('act-1'), [{ id: 'party-a', publicKey: recipient.publicKey }], { encryption_key_id: 'key-1' });
+    expect(store.listRefs()).toEqual(['wp-evidence://act-1']);
+    await expect(store.store_bundle(
+      makeBundle('act-2'), [{ id: 'party-a', publicKey: recipient.publicKey }], { encryption_key_id: 'key-1' },
+    )).rejects.toThrow(/capacity exhausted/i);
+    expect(store.snapshot().entries).toBe(1);
+  });
+
+  it('rejects duplicate recipients before key wrapping', async () => {
+    const store = new EvidenceStore();
+    const recipient = rsaPair();
+    await expect(store.store_bundle({
+      action_id: 'act-dup', request: {}, response: {}, parameters: {}, agent_id: 'agent-1', tool_id: 'tool-1', timestamp: new Date().toISOString(),
+    }, [
+      { id: 'party-a', publicKey: recipient.publicKey },
+      { id: 'party-a', publicKey: recipient.publicKey },
+    ], { encryption_key_id: 'key-1' })).rejects.toThrow(/unique/i);
+  });
 });

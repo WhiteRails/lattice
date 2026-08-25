@@ -89,4 +89,27 @@ describe('LatticeLog', () => {
     expect(log.getEntriesForAgent('alice')).toHaveLength(2);
     expect(log.getEntriesForAgent('bob')).toHaveLength(1);
   });
+
+  it('fails closed at retained and unsealed shard budgets', () => {
+    const log = new LatticeLog('log-test', privateKey, { maxEntries: 2, maxPendingEntries: 1, pageSize: 1 });
+    log.append(makeSAAE());
+    expect(() => log.append(makeSAAE())).toThrow(/batch backpressure/i);
+    log.computeBatch();
+    log.append(makeSAAE());
+    expect(() => log.append(makeSAAE())).toThrow(/capacity exhausted/i);
+    expect(log.getEntries()).toHaveLength(1);
+    expect(log.getEntries(2)).toHaveLength(2);
+    expect(log.snapshot()).toEqual({ entries: 2, pendingEntries: 1, batches: 1, maxEntries: 2, maxPendingEntries: 1 });
+  });
+
+  it('keeps committed proof lookup valid after a later unsealed tail', () => {
+    const log = new LatticeLog('log-test', privateKey);
+    const committed = makeSAAE();
+    log.append(committed);
+    log.computeBatch();
+    log.append(makeSAAE());
+    const proof = log.getProof(committed.action_id);
+    expect(proof).toBeDefined();
+    expect(log.verifyProof(proof!)).toBe(true);
+  });
 });

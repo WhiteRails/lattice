@@ -118,4 +118,28 @@ describe('Lattice Gateway', () => {
       cert: { ...signed.cert, owner_org: 'evil:org' },
     }, ca.publicKey)).toThrow('Invalid CA signature');
   });
+
+  it('fails closed at gateway agent-shard capacity while allowing a certificate rotation', () => {
+    const gatewayKeyPair = generateKeyPair();
+    const gateway = new LatticeGateway('gateway:test', gatewayKeyPair.privateKey, { maxRegisteredAgents: 1 });
+    const ca = new LatticeCA('ca:test');
+    const firstKey = generateKeyPair();
+    const first = ca.issueAgentCert({
+      agent_id: 'agent:one', owner_org: 'org:test', agent_type: 'test-agent', version: '1.0.0',
+      public_key: firstKey.publicKey, allowed_capability_classes: [], forbidden_capability_classes: [],
+    });
+    gateway.registerAgent(first, ca.publicKey);
+    const rotatedKey = generateKeyPair();
+    const rotated = ca.issueAgentCert({
+      agent_id: 'agent:one', owner_org: 'org:test', agent_type: 'test-agent', version: '1.0.1',
+      public_key: rotatedKey.publicKey, allowed_capability_classes: [], forbidden_capability_classes: [],
+    });
+    gateway.registerAgent(rotated, ca.publicKey);
+    const second = ca.issueAgentCert({
+      agent_id: 'agent:two', owner_org: 'org:test', agent_type: 'test-agent', version: '1.0.0',
+      public_key: generateKeyPair().publicKey, allowed_capability_classes: [], forbidden_capability_classes: [],
+    });
+    expect(() => gateway.registerAgent(second, ca.publicKey)).toThrow(/agent capacity exhausted/i);
+    expect(gateway.snapshot()).toEqual({ registeredAgents: 1, maxRegisteredAgents: 1 });
+  });
 });

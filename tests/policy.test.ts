@@ -113,4 +113,26 @@ describe('WhitePolicy', () => {
     expect(p.getRiskLevel('physical:operate')).toBe(5);
     expect(p.getRiskLevel('unknown:class')).toBe(3); // default
   });
+
+  it('uses an exact O(1) grant selector and rejects a different capability class', () => {
+    const p = new WhitePolicy();
+    p.grantCapability({
+      agent_id: 'agent-1', tool_id: 'tool.shared', capability_class: 'read:public', granted_by: 'human-1',
+    });
+    expect(p.evaluate({ agent_id: 'agent-1', tool_id: 'tool.shared', capability_class: 'money:execute', pas_score: 0 }).decision)
+      .toBe('deny');
+  });
+
+  it('fails closed at shard capacity and enumerates bounded pages', () => {
+    const p = new WhitePolicy({ maxGrants: 2, pageSize: 1 });
+    for (const capability_class of ['read:public', 'read:private']) {
+      p.grantCapability({ agent_id: 'agent-1', tool_id: `tool.${capability_class}`, capability_class, granted_by: 'human-1' });
+    }
+    expect(p.getGrants()).toHaveLength(1);
+    expect(p.getGrants(2)).toHaveLength(2);
+    expect(p.snapshot()).toEqual({ entries: 2, maxGrants: 2 });
+    expect(() => p.grantCapability({
+      agent_id: 'agent-1', tool_id: 'tool.extra', capability_class: 'write:private', granted_by: 'human-1',
+    })).toThrow(/capacity exhausted/i);
+  });
 });

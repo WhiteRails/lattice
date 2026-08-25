@@ -60,4 +60,11 @@ describe('LatticeCA', () => {
     const tampered = { ...signed, cert: { ...signed.cert, issuer: 'evil-ca' } };
     expect(ca.verifyCert(tampered)).toBe(false);
   });
+
+  it('fails closed when its local revocation lookup shard is full', () => {
+    const ca = new LatticeCA('ca.test', undefined, { maxIssuedCerts: 1 });
+    ca.issueOrgCert({ org_id: 'org-1' });
+    expect(() => ca.issueServiceCert({ service_id: 'svc-1' })).toThrow(/issuance capacity exhausted/i);
+    expect(ca.snapshot()).toEqual({ issuedCerts: 1, maxIssuedCerts: 1 });
+  });
 });

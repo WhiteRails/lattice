@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { signOverlayMessage, verifyOverlayMessage, OverlayMessage } from '../node/message';
+import { parseOverlayMessage, signOverlayMessage, verifyOverlayMessage, OverlayMessage } from '../node/message';
 
 function message(): OverlayMessage {
   return {
@@ -34,5 +34,16 @@ describe('Overlay message authentication', () => {
 
   it('rejects unsigned messages', () => {
     expect(verifyOverlayMessage(message(), 'secret')).toBe(false);
+  });
+
+  it('keeps authentication valid after wire serialization with optional fields absent', () => {
+    const signed = signOverlayMessage({
+      ...message(),
+      source_node_label: undefined,
+      source_node_role: undefined,
+    }, 'secret');
+    const received = parseOverlayMessage(JSON.stringify(signed));
+    expect(received).not.toBeNull();
+    expect(verifyOverlayMessage(received!, 'secret')).toBe(true);
   });
 });

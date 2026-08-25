@@ -128,6 +128,59 @@ describe('LpGatewayResolver + routing-cache (hybrid)', () => {
     expect(disk?.routes['echo.lattice']?.payload.gatewayEndpoints[0]).toBe('ws://127.0.0.1:9999');
   });
 
+  it('bounds local route-cache cardinality while allowing route renewal', async () => {
+    ({ home } = await freshLatticeHome());
+    homes.push(home);
+    const {
+      upsertRoutingPayload,
+      ROUTING_PAYLOAD_VERSION,
+      routingCacheMaxRoutesFromEnv,
+      routingCacheMaxFileBytesFromEnv,
+    } = await import('../node/routing-cache');
+    const first = {
+      version: ROUTING_PAYLOAD_VERSION,
+      fqdn: 'one.lattice',
+      gatewayPubKeyB64: 'Zm9v',
+      gatewayEndpoints: ['ws://127.0.0.1:9999'],
+    };
+    upsertRoutingPayload(null, first, { maxRoutes: 1 });
+    upsertRoutingPayload(null, { ...first, gatewayEndpoints: ['ws://127.0.0.1:9998'] }, { maxRoutes: 1 });
+    expect(() => upsertRoutingPayload(null, {
+      ...first,
+      fqdn: 'two.lattice',
+    }, { maxRoutes: 1 })).toThrow(/capacity/i);
+    expect(routingCacheMaxRoutesFromEnv({ LATTICE_ROUTING_CACHE_MAX_ROUTES: '1000' })).toBe(1000);
+    expect(() => routingCacheMaxRoutesFromEnv({ LATTICE_ROUTING_CACHE_MAX_ROUTES: 'invalid' })).toThrow(/integer/i);
+    expect(routingCacheMaxFileBytesFromEnv({ LATTICE_ROUTING_CACHE_MAX_FILE_BYTES: '1048576' })).toBe(1048576);
+    expect(() => routingCacheMaxFileBytesFromEnv({ LATTICE_ROUTING_CACHE_MAX_FILE_BYTES: 'invalid' })).toThrow(/integer/i);
+  });
+
+  it('bounds local lattice-node bootstrap records while allowing renewal', async () => {
+    ({ home } = await freshLatticeHome());
+    homes.push(home);
+    const { upsertLatticeNodeLocalRecord } = await import('../node/routing-cache');
+    const { generateNodeKeyPair } = await import('../node/session');
+    const first = generateNodeKeyPair().publicKey;
+    upsertLatticeNodeLocalRecord(null, 'entry-a', { overlayPubKeyB64: first }, { maxLatticeNodes: 1 });
+    upsertLatticeNodeLocalRecord(null, 'entry-a', { overlayPubKeyB64: generateNodeKeyPair().publicKey }, { maxLatticeNodes: 1 });
+    expect(() => upsertLatticeNodeLocalRecord(null, 'entry-b', {
+      overlayPubKeyB64: generateNodeKeyPair().publicKey,
+    }, { maxLatticeNodes: 1 })).toThrow(/lattice-node capacity/i);
+  });
+
+  it('bounds parsed routing files retained by one process', async () => {
+    ({ home } = await freshLatticeHome());
+    homes.push(home);
+    const { upsertRoutingPayload, routingFileCacheSnapshot, ROUTING_PAYLOAD_VERSION } = await import('../node/routing-cache');
+    for (let index = 0; index < 5; index++) {
+      upsertRoutingPayload({ registry: { cacheFile: path.join(home, `routing-${index}.json`) } } as any, {
+        version: ROUTING_PAYLOAD_VERSION,
+        fqdn: `echo-${index}.lattice`, gatewayPubKeyB64: 'Zm9v', gatewayEndpoints: ['ws://127.0.0.1:9999'],
+      });
+    }
+    expect(routingFileCacheSnapshot()).toEqual({ entries: 4, maxEntries: 4 });
+  });
+
   it('distributedMesh on + no chain + no cache → not found', async () => {
     ({ home } = await freshLatticeHome());
     homes.push(home);

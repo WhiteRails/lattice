@@ -102,11 +102,10 @@ describe('FederationRegistryServer', () => {
     expect(body.ok).toBe(true);
   });
 
-  it('returns empty routes on start', async () => {
+  it('does not expose a global route listing', async () => {
     const resp = await httpGet(`http://127.0.0.1:${port}/v1/routes`);
-    const body = JSON.parse(resp) as { version: number; routes: Record<string, unknown> };
-    expect(body.version).toBe(1);
-    expect(Object.keys(body.routes)).toHaveLength(0);
+    const body = JSON.parse(resp) as { error: string };
+    expect(body.error).toMatch(/global route listing/i);
   });
 
   it('accepts announce via POST and returns route on GET', async () => {
@@ -126,27 +125,59 @@ describe('FederationRegistryServer', () => {
     );
     expect(JSON.parse(announceResp).ok).toBe(true);
 
-    const routes = JSON.parse(await httpGet(`http://127.0.0.1:${port}/v1/routes`));
-    expect(routes.routes['echo.lattice']).toBeDefined();
-    expect(routes.routes['echo.lattice'].payload.gatewayEndpoints).toContain('wss://3.3.3.3:8889');
+    const route = JSON.parse(await httpGet(`http://127.0.0.1:${port}/v1/routes/echo.lattice`));
+    expect(route.route).toBeDefined();
+    expect(route.route.payload.gatewayEndpoints).toContain('wss://3.3.3.3:8889');
   });
 
-  it('signs response with serverSig HMAC', async () => {
-    // Announce something first
-    const announcePayload = {
+  it('rejects oversized and over-nested announces without taking down the registry', async () => {
+    try {
+      await httpPost(`http://127.0.0.1:${port}/v1/announce`, 'x'.repeat(65_537));
+    } catch {
+      // The server may reset an oversized request after rejecting its body.
+    }
+    let deeplyNested: unknown = {};
+    for (let i = 0; i < 40; i++) deeplyNested = [deeplyNested];
+    const invalid = await httpPost(
+      `http://127.0.0.1:${port}/v1/announce`,
+      JSON.stringify({ payload: deeplyNested }),
+    );
+    expect(JSON.parse(invalid).error).toBe('Invalid announce body');
+    expect(JSON.parse(await httpGet(`http://127.0.0.1:${port}/v1/health`)).ok).toBe(true);
+  });
+
+  it('serves a signed single-route response without serializing the global table', async () => {
+    server.localAnnounce({
+      version: 2,
+      fqdn: 'one.lattice',
+      gatewayPubKeyB64: overlayPubkey(),
+      gatewayEndpoints: ['wss://one.example:8889'],
+    });
+    server.localAnnounce({
+      version: 2,
+      fqdn: 'two.lattice',
+      gatewayPubKeyB64: overlayPubkey(),
+      gatewayEndpoints: ['wss://two.example:8889'],
+    });
+    const route = JSON.parse(await httpGet(`http://127.0.0.1:${port}/v1/routes/one.lattice`));
+    expect(route.fqdn).toBe('one.lattice');
+    expect(route.route.payload.fqdn).toBe('one.lattice');
+    expect(route.routes).toBeUndefined();
+    const { serverSig, ...body } = route;
+    const expected = crypto.createHmac('sha256', Buffer.from(overlaySecret, 'utf8'))
+      .update(stableStringify(body), 'utf8').digest('hex');
+    expect(serverSig).toBe(expected);
+  });
+
+  it('signs a named response with serverSig HMAC', async () => {
+    const payload = {
       version: 2,
       fqdn: 'test.lattice',
-      gatewayPubKeyB64: 'abc=',
+      gatewayPubKeyB64: overlayPubkey(),
       gatewayEndpoints: ['wss://1.2.3.4:9000'],
     };
-    await httpPost(
-      `http://127.0.0.1:${port}/v1/announce`,
-      JSON.stringify({
-        payload: announcePayload,
-        announceHmac: computeAnnounceHmac(overlaySecret, announcePayload),
-      }),
-    );
-    const raw = await httpGet(`http://127.0.0.1:${port}/v1/routes`);
+    server.localAnnounce(payload);
+    const raw = await httpGet(`http://127.0.0.1:${port}/v1/routes/test.lattice`);
     const body = JSON.parse(raw) as { serverSig: string; [k: string]: unknown };
     expect(body.serverSig).toBeTruthy();
 
@@ -169,8 +200,42 @@ describe('FederationRegistryServer', () => {
       },
       60,
     );
-    const routes = JSON.parse(await httpGet(`http://127.0.0.1:${port}/v1/routes`));
-    expect(routes.routes['local.lattice']).toBeDefined();
+    const route = JSON.parse(await httpGet(`http://127.0.0.1:${port}/v1/routes/local.lattice`));
+    expect(route.route).toBeDefined();
+  });
+
+  it('bounds a registry shard while allowing existing names to renew', async () => {
+    const { FederationRegistryServer } = await import('../node/federation-registry');
+    const bounded = new FederationRegistryServer('127.0.0.1', 0, overlaySecret, undefined, { maxRoutes: 1 });
+    const first = {
+      version: 2 as const,
+      fqdn: 'one.lattice',
+      gatewayPubKeyB64: overlayPubkey(),
+      gatewayEndpoints: ['wss://one.example:8889'],
+    };
+    bounded.localAnnounce(first, 60);
+    bounded.localAnnounce({ ...first, gatewayEndpoints: ['wss://renewed.example:8889'] }, 60);
+    expect(() => bounded.localAnnounce({
+      ...first,
+      fqdn: 'two.lattice',
+      gatewayPubKeyB64: overlayPubkey(),
+    }, 60)).toThrow(/capacity/i);
+    expect(bounded.getRoutes().size).toBe(1);
+    expect(bounded.snapshot()).toEqual({ routes: 1, expiryEntries: 1, maxRoutes: 1 });
+  });
+
+  it('removes an expired route and its indexed expiry row', async () => {
+    server.localAnnounce({
+      version: 2,
+      fqdn: 'expired.lattice',
+      gatewayPubKeyB64: overlayPubkey(),
+      gatewayEndpoints: ['wss://expired.example:8889'],
+    }, 1);
+    expect(server.snapshot()).toMatchObject({ routes: 1, expiryEntries: 1 });
+    await sleep(1_050);
+    const response = JSON.parse(await httpGet(`http://127.0.0.1:${port}/v1/routes/expired.lattice`));
+    expect(response.error).toBe('Route not found');
+    expect(server.snapshot()).toMatchObject({ routes: 0, expiryEntries: 0 });
   });
 
   it('rejects malformed announce', async () => {
@@ -182,9 +247,9 @@ describe('FederationRegistryServer', () => {
   });
 });
 
-// ─── Suite 2: fetchFederationRoutes client ───────────────────────────────────
+// ─── Suite 2: fetchFederationRoute client ───────────────────────────────────
 
-describe('fetchFederationRoutes', () => {
+describe('fetchFederationRoute', () => {
   let server: import('../node/federation-registry').FederationRegistryServer;
   let port: number;
   const overlaySecret = crypto.randomBytes(32).toString('base64');
@@ -202,22 +267,22 @@ describe('fetchFederationRoutes', () => {
   afterEach(() => server.stop());
 
   it('returns null for unreachable server', async () => {
-    const { fetchFederationRoutes } = await import('../node/federation-registry');
-    const result = await fetchFederationRoutes('http://127.0.0.1:1', { timeoutMs: 500 });
+    const { fetchFederationRoute } = await import('../node/federation-registry');
+    const result = await fetchFederationRoute('http://127.0.0.1:1', 'echo.lattice', { timeoutMs: 500 });
     expect(result).toBeNull();
   });
 
-  it('fetches and returns routes', async () => {
+  it('fetches only the requested route', async () => {
     server.localAnnounce({
       version: 2,
       fqdn: 'echo.lattice',
       gatewayPubKeyB64: 'key=',
       gatewayEndpoints: ['wss://relay.example.com:8889'],
     });
-    const { fetchFederationRoutes } = await import('../node/federation-registry');
-    const result = await fetchFederationRoutes(`http://127.0.0.1:${port}`);
+    const { fetchFederationRoute } = await import('../node/federation-registry');
+    const result = await fetchFederationRoute(`http://127.0.0.1:${port}`, 'echo.lattice');
     expect(result).not.toBeNull();
-    expect(result!.routes['echo.lattice']).toBeDefined();
+    expect(result!.payload.fqdn).toBe('echo.lattice');
   });
 
   it('verifies HMAC when overlaySecret provided', async () => {
@@ -227,17 +292,52 @@ describe('fetchFederationRoutes', () => {
       gatewayPubKeyB64: 'key=',
       gatewayEndpoints: ['wss://relay.example.com:8889'],
     });
-    const { fetchFederationRoutes } = await import('../node/federation-registry');
+    const { fetchFederationRoute } = await import('../node/federation-registry');
 
     // Correct secret — should pass
-    const ok = await fetchFederationRoutes(`http://127.0.0.1:${port}`, { overlaySecret });
+    const ok = await fetchFederationRoute(`http://127.0.0.1:${port}`, 'echo.lattice', { overlaySecret });
     expect(ok).not.toBeNull();
 
     // Wrong secret — should return null
-    const bad = await fetchFederationRoutes(`http://127.0.0.1:${port}`, {
+    const bad = await fetchFederationRoute(`http://127.0.0.1:${port}`, 'echo.lattice', {
       overlaySecret: crypto.randomBytes(32).toString('base64'),
     });
     expect(bad).toBeNull();
+  });
+
+  it('does not return other routes while fetching one signed route', async () => {
+    server.localAnnounce({
+      version: 2,
+      fqdn: 'echo.lattice',
+      gatewayPubKeyB64: overlayPubkey(),
+      gatewayEndpoints: ['wss://relay.example.com:8889'],
+    });
+    server.localAnnounce({
+      version: 2,
+      fqdn: 'other.lattice',
+      gatewayPubKeyB64: overlayPubkey(),
+      gatewayEndpoints: ['wss://other.example.com:8889'],
+    });
+    const { fetchFederationRoute } = await import('../node/federation-registry');
+    const route = await fetchFederationRoute(`http://127.0.0.1:${port}`, 'echo.lattice', { overlaySecret });
+    expect(route?.payload.fqdn).toBe('echo.lattice');
+    const rejected = await fetchFederationRoute(`http://127.0.0.1:${port}`, 'echo.lattice', {
+      overlaySecret: crypto.randomBytes(32).toString('base64'),
+    });
+    expect(rejected).toBeNull();
+  });
+
+  it('drops oversized named-route replies rather than retaining an unbounded response', async () => {
+    const oversized = http.createServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json', 'content-length': 65_537 });
+      res.end('x'.repeat(65_537));
+    });
+    await new Promise<void>((resolve, reject) => oversized.listen(0, '127.0.0.1', resolve).once('error', reject));
+    const address = oversized.address();
+    if (!address || typeof address === 'string') throw new Error('Expected TCP address');
+    const { fetchFederationRoute } = await import('../node/federation-registry');
+    await expect(fetchFederationRoute(`http://127.0.0.1:${address.port}`, 'echo.lattice')).resolves.toBeNull();
+    await new Promise<void>(resolve => oversized.close(() => resolve()));
   });
 });
 
@@ -300,6 +400,25 @@ describe('LpGatewayResolver — federation resolution', () => {
       LpRoutingNotFoundError,
     );
   });
+
+  it('negative-caches a federation miss instead of repeating registry discovery', async () => {
+    vi.resetModules();
+    const federation = await import('../node/federation-registry');
+    const fetchRoute = vi.spyOn(federation, 'fetchFederationRoute').mockResolvedValue(null);
+    const { LpGatewayResolver, LpRoutingNotFoundError } = await import('../node/lp-resolver');
+    const resolver = new LpGatewayResolver({
+      registry: { federationUrls: [`http://127.0.0.1:${fedPort}`] },
+      distributedMesh: false,
+    } as any, null);
+
+    await expect(resolver.resolveDestination('lp://negative-cache.lattice')).rejects.toBeInstanceOf(
+      LpRoutingNotFoundError,
+    );
+    await expect(resolver.resolveDestination('lp://negative-cache.lattice')).rejects.toBeInstanceOf(
+      LpRoutingNotFoundError,
+    );
+    expect(fetchRoute).toHaveBeenCalledTimes(1);
+  });
 });
 
 // ─── Suite 4: postFederationAnnounce ─────────────────────────────────────────
@@ -320,7 +439,7 @@ describe('postFederationAnnounce', () => {
 
   afterEach(() => server.stop());
 
-  it('posts an announcement and it appears in GET /v1/routes', async () => {
+  it('posts an announcement and it appears in GET /v1/routes/<fqdn>', async () => {
     const { postFederationAnnounce } = await import('../node/federation-registry');
     const pubkey = overlayPubkey();
     const ok = await postFederationAnnounce(
@@ -335,8 +454,8 @@ describe('postFederationAnnounce', () => {
     );
     expect(ok).toBe(true);
 
-    const routes = JSON.parse(await httpGet(`http://127.0.0.1:${port}/v1/routes`));
-    expect(routes.routes['clipma.lattice'].payload.gatewayEndpoints).toContain('wss://5.5.5.5:8889');
+    const route = JSON.parse(await httpGet(`http://127.0.0.1:${port}/v1/routes/clipma.lattice`));
+    expect(route.route.payload.gatewayEndpoints).toContain('wss://5.5.5.5:8889');
   });
 
   it('returns false for unreachable server', async () => {
@@ -373,6 +492,18 @@ describe('node-config schema — new fields', () => {
     const { loadNodeConfig: lnc } = await import('../node/node-config');
     const cfg = lnc();
     expect(cfg?.registry?.federationUrls).toEqual(['http://registry.example.com:9000']);
+  });
+
+  it('rejects global-sized relay or registry membership in a single cell config', async () => {
+    const { home } = await freshLatticeHome();
+    const yaml = await import('js-yaml');
+    fs.writeFileSync(path.join(home, 'node.yaml'), yaml.dump({
+      upstreamRelays: Array.from({ length: 17 }, (_, i) => `wss://relay-${i}.example.com:8888`),
+      registry: { federationUrls: Array.from({ length: 65 }, (_, i) => `https://registry-${i}.example.com:9000`) },
+    }));
+    vi.resetModules();
+    const { loadNodeConfig: lnc } = await import('../node/node-config');
+    expect(() => lnc()).toThrow(/at most/i);
   });
 
   it('rejects hidden mode without hiddenServiceAddress', async () => {
