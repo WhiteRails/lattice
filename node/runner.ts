@@ -1,6 +1,7 @@
 import { spawn } from 'child_process';
 import * as crypto from 'crypto';
 import * as path from 'path';
+import * as fs from 'fs';
 import { agentExists, isRevoked, LATTICE_DIR, loadAgent } from './state';
 import { SigningSocket, signingSocketPath, SIGNING_SOCKETS_DIR } from './signing-socket';
 import { controlBus } from './agent-control';
@@ -58,8 +59,21 @@ async function runInDocker(opts: RunOptions): Promise<void> {
   const agent = loadAgent(opts.agentName);
   const sessionToken = crypto.randomBytes(32).toString('hex');
 
-  const signingSocket = new SigningSocket(opts.agentName, agent.privateKey, sessionToken);
+  // A container receives only its own short-lived socket directory. Mounting the
+  // shared socket directory let one untrusted agent replace or proxy another
+  // agent's socket and obtain its signatures.
+  const runId = crypto.randomBytes(16).toString('hex');
+  const socketDir = path.join(SIGNING_SOCKETS_DIR, `run-${runId}`);
+  const socketPath = path.join(socketDir, 'sign.sock');
+  fs.mkdirSync(socketDir, { recursive: true, mode: 0o700 });
+  fs.chmodSync(socketDir, 0o700);
+  const signingSocket = new SigningSocket(opts.agentName, agent.privateKey, sessionToken, socketPath);
   signingSocket.start();
+
+  const containerSocketDir = '/run/lattice-signing';
+  const containerSocket = `${containerSocketDir}/sign.sock`;
+  const currentUid = typeof process.getuid === 'function' ? process.getuid() : undefined;
+  const currentGid = typeof process.getgid === 'function' ? process.getgid() : undefined;
 
   const args = [
     'run', '--rm',
@@ -69,9 +83,10 @@ async function runInDocker(opts: RunOptions): Promise<void> {
     '-e', `http_proxy=${proxy}`,
     '-e', `https_proxy=${proxy}`,
     '-e', `LATTICE_AGENT=${opts.agentName}`,
-    '-e', `LATTICE_SIGNING_SOCKET=/tmp/lattice-sockets/${opts.agentName}.sock`,
+    '-e', `LATTICE_SIGNING_SOCKET=${containerSocket}`,
     '-e', `LATTICE_SESSION_TOKEN=${sessionToken}`,
-    '-v', `${SIGNING_SOCKETS_DIR}:/tmp/lattice-sockets`,
+    ...(currentUid !== undefined && currentGid !== undefined ? ['--user', `${currentUid}:${currentGid}`] : []),
+    '-v', `${socketDir}:${containerSocketDir}:ro`,
     '-v', `${process.cwd()}:/workspace`,
     '-w', '/workspace',
     detectImage(opts.command[0]),
@@ -83,6 +98,7 @@ async function runInDocker(opts: RunOptions): Promise<void> {
     await spawnChild('docker', args, process.env as NodeJS.ProcessEnv, opts.agentName);
   } finally {
     signingSocket.stop();
+    fs.rmSync(socketDir, { recursive: true, force: true });
   }
 }
 

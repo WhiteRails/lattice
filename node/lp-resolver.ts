@@ -16,7 +16,7 @@ import {
   lookupRoutingPayload,
   routingCommitmentHex,
   readRoutingCacheFile,
-  upsertRoutingPayload,
+  normalizeRoutingPayload,
   lpFromFqdn,
   ROUTING_PAYLOAD_VERSION,
   type RoutingPayload,
@@ -57,7 +57,8 @@ export class LpGatewayResolver {
 
   /**
    * Poll configured federation registries for a route.
-   * Caches valid results into local routing-cache so subsequent calls are fast.
+   * Federation is online discovery only; it is never re-sealed into the local
+   * operator-authorised routing cache.
    */
   private async resolveFederation(fqdn: string): Promise<RoutingPayload | null> {
     const urls = resolveFederationUrls(this.cfg);
@@ -71,13 +72,9 @@ export class LpGatewayResolver {
       // Skip expired entries
       if (new Date(entry.expiresAt).getTime() < now) continue;
       if (!entry.payload.gatewayEndpoints.length) continue;
-      // Cache locally so future resolves skip the HTTP round-trip
-      try {
-        upsertRoutingPayload(this.cfg, entry.payload);
-      } catch {
-        // cache write failure is non-fatal
-      }
-      return entry.payload;
+      const payload = normalizeRoutingPayload(entry.payload);
+      if (payload.fqdn !== fqdn) continue;
+      return payload;
     }
     return null;
   }
@@ -106,13 +103,9 @@ export class LpGatewayResolver {
     const pubkeyB64 = pubkeyFromSelfAuthFqdn(fqdn);
     if (!pubkeyB64) throw new LpRoutingNotFoundError(`Invalid self-auth address: ${fqdn}`);
 
-    // Step 1: Local routing-cache (no HMAC required — pubkey is the trust anchor)
-    let payload = lookupRoutingPayload(this.cfg, fqdn, { requireLocalSig: false });
-
-    // Step 2: Federation (allowed for .id — pubkey in address verifies identity)
-    if (!payload || !payload.gatewayEndpoints.length) {
-      payload = (await this.resolveFederation(fqdn)) ?? undefined;
-    }
+    // The .id key establishes identity, not authority for arbitrary endpoints.
+    // Only an operator-authenticated local route may name where to dial.
+    const payload = lookupRoutingPayload(this.cfg, fqdn, { requireLocalSig: true });
 
     if (!payload || !payload.gatewayEndpoints.length) {
       throw new LpRoutingNotFoundError(

@@ -148,6 +148,18 @@ npm run lattice -- mesh smoke --agent bot1 --entry http://127.0.0.1:7777 --host 
 
 Expected: HTTP 200 with the backend response body, Relay/Gateway logs showing the request, and trace progression through `entry`, `relay`, `gateway`.
 
+### Required agent-key pinning
+
+Gateways now verify the agent signature end-to-end rather than trusting the relay's `source` claim. Before granting a remote agent access, pin its Ed25519 public key on every Gateway that serves the resource:
+
+```bash
+# Obtain this PEM through your approved identity/provisioning channel.
+npm run lattice -- policy pin-agent-key bot1 --public-key-file /secure/provisioning/bot1-public.pem
+npm run lattice -- grant bot1 lp://echo.lattice ping
+```
+
+`lattice agent create bot1` performs the pin automatically when the Entry and Gateway share state. A Gateway with no pinned key fails closed, even if a relay is registered and the agent name has an allow rule.
+
 Negative checks:
 
 - Change a node's on-chain pubkey or use an unregistered `nodeId`: peers must reject it with an unauthenticated/unregistered node error.

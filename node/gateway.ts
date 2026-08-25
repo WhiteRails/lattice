@@ -1,15 +1,15 @@
 import { WebSocketServer, WebSocket } from 'ws';
 import * as http from 'http';
 import * as crypto from 'crypto';
-import { OverlayMessage, signOverlayMessage } from './message';
+import { OverlayMessage, parseOverlayMessage, signOverlayMessage } from './message';
 import { PolicyLoader } from './policy-loader';
-import { appendLog, isRevoked, loadCA, getOrCreateOverlayKeyPair } from './state';
+import { appendLog, isRevoked, loadCA, getOrCreateOverlayKeyPair, normalizeAgentName } from './state';
 import { SessionManager } from './session';
 import chalk from 'chalk';
 import { controlBus } from './agent-control';
 import { PowerAccumulationTracker } from '../core/pas';
 import { verifyIncomingOverlayFromPeer, peerWireId } from './overlay-sign-key';
-import type { LatticeNodeYaml, NodeChainConfig } from './node-config';
+import type { LatticeNodeYaml, NodeChainConfig, UpstreamRelay } from './node-config';
 import {
   distributedMeshEffective,
   loadNodeConfig,
@@ -25,6 +25,16 @@ import { bindOverlayWebSocketServer, wsTlsClientOptions } from './ws-stack';
 import { validateDistributedPeer } from './peer-identity';
 import { postFederationAnnounce } from './federation-registry';
 import { deriveSelfAuthAddress } from './self-auth';
+import { LpGatewayResolver } from './lp-resolver';
+import { hashRequestBody, requestSignaturePayload, verifySignature } from '../core/identity';
+import { NonceStore, getReplayWindowMs } from './nonce-store';
+
+const agentProofNonces = new NonceStore();
+const ALLOWED_BACKEND_METHODS = new Set(['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS']);
+const HOP_BY_HOP_HEADERS = new Set([
+  'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization',
+  'te', 'trailer', 'transfer-encoding', 'upgrade', 'host', 'content-length',
+]);
 
 export interface ServiceGatewayOptions {
   port?: number;
@@ -43,6 +53,7 @@ export class ServiceGateway {
   private cfg: LatticeNodeYaml | null;
   private distributedMesh: boolean;
   private chain: NodeChainConfig | null;
+  private resolver: LpGatewayResolver;
   private nodeLabel: string | undefined;
   /** Active outbound connections to relay rendezvous points (hidden mode). */
   private rendezvousConnections: WebSocket[] = [];
@@ -85,6 +96,7 @@ export class ServiceGateway {
     this.distributedMesh = distributedMeshEffective(cfgFromDisk);
     this.nodeLabel = requireDistributedNodeId(cfgFromDisk, this.distributedMesh);
     this.chain = resolveNodeChainConfig(cfgFromDisk);
+    this.resolver = new LpGatewayResolver(cfgFromDisk ?? null, this.chain);
 
     const gwKeyPair = getOrCreateOverlayKeyPair();
     this.myPublicKey = gwKeyPair.publicKey;
@@ -154,31 +166,74 @@ export class ServiceGateway {
   // ─── Hidden-mode internals ────────────────────────────────────────────────
 
   private startHiddenMode(
-    relayUrls: string[],
+    relayTargets: UpstreamRelay[],
     serviceAddress: string,
     cfg: LatticeNodeYaml | null,
   ): void {
-    for (const url of relayUrls) {
-      this.connectToRendezvousRelay(url, serviceAddress, cfg, 0);
+    for (const target of relayTargets) {
+      if (this.distributedMesh && !target.label) {
+        throw new Error('distributedMesh hidden gateways require labeled rendezvous relays');
+      }
+      this.connectToRendezvousRelay(target, serviceAddress, cfg, 0);
     }
   }
 
   private connectToRendezvousRelay(
-    relayUrl: string,
+    relayTarget: UpstreamRelay,
     serviceAddress: string,
     cfg: LatticeNodeYaml | null,
     attempt: number,
   ): void {
     const tlsOpts = wsTlsClientOptions(cfg);
+    const relayUrl = relayTarget.url;
     const ws = new WebSocket(relayUrl, undefined, { rejectUnauthorized: true, ...tlsOpts });
     this.rendezvousConnections.push(ws);
 
     ws.on('open', () => {
-      attempt = 0; // reset backoff on successful connection
-      console.log(chalk.green('[Gateway]') + ` Connected to rendezvous relay: ${relayUrl}`);
+      void this.registerRendezvousConnection(ws, relayTarget, serviceAddress).catch((e: unknown) => {
+        console.warn(chalk.yellow('[Gateway]') + ` Rendezvous identity failed (${relayUrl}): ${String(e)}`);
+        ws.close();
+      });
+    });
 
-      // Register with relay
-      const regMsg = signOverlayMessage(
+    ws.on('message', (data) => {
+      const raw = data.toString();
+      const msg = parseOverlayMessage(raw);
+      if (!msg) return;
+      // register_ack is informational; all request frames are authenticated in
+      // handleMessage before they can affect policy or a backend.
+      if (msg.type === 'register_ack') return;
+      this.handleMessage(ws, raw);
+    });
+
+    ws.on('close', () => {
+      this.rendezvousConnections = this.rendezvousConnections.filter(c => c !== ws);
+      const delay = Math.min(30_000, 1_000 * Math.pow(2, Math.min(attempt, 5)));
+      console.log(chalk.yellow('[Gateway]') + ` Rendezvous disconnected (${relayUrl}), retry in ${delay}ms`);
+      setTimeout(
+        () => this.connectToRendezvousRelay(relayTarget, serviceAddress, cfg, attempt + 1),
+        delay,
+      );
+    });
+
+    ws.on('error', (e) => {
+      console.warn(chalk.yellow('[Gateway]') + ` Rendezvous error (${relayUrl}): ${e.message}`);
+    });
+  }
+
+  private async registerRendezvousConnection(
+    ws: WebSocket,
+    relayTarget: UpstreamRelay,
+    serviceAddress: string,
+  ): Promise<void> {
+    const relayPub = this.distributedMesh
+      ? await this.resolver.resolveRelayPubkey(relayTarget.label)
+      : undefined;
+    if (this.distributedMesh && !relayPub) throw new Error(`Could not resolve relay key for ${relayTarget.label}`);
+    const signKey = this.relaySignMaterial(relayPub);
+    console.log(chalk.green('[Gateway]') + ` Connected to rendezvous relay: ${relayTarget.url}`);
+
+    const regMsg = signOverlayMessage(
         {
           id: `reg_${crypto.randomBytes(6).toString('hex')}`,
           type: 'register',
@@ -190,14 +245,14 @@ export class ServiceGateway {
           source_node_label: this.nodeLabel,
           source_node_role: 'gateway',
         },
-        loadCA().overlaySecret,
-      );
-      ws.send(JSON.stringify(regMsg));
+      signKey,
+    );
+    ws.send(JSON.stringify(regMsg));
 
       // Keepalive heartbeat every 30 s
-      const hb = setInterval(() => {
-        if (ws.readyState !== WebSocket.OPEN) { clearInterval(hb); return; }
-        const heartbeat: OverlayMessage = {
+    const hb = setInterval(() => {
+      if (ws.readyState !== WebSocket.OPEN) { clearInterval(hb); return; }
+      const heartbeat: OverlayMessage = {
           id: `hb_${crypto.randomBytes(4).toString('hex')}`,
           type: 'heartbeat',
           source: serviceAddress,
@@ -205,36 +260,12 @@ export class ServiceGateway {
           payload: {},
           trace: [],
           source_pubkey: this.myPublicKey,
+          source_node_label: this.nodeLabel,
           source_node_role: 'gateway',
-        };
-        ws.send(JSON.stringify(heartbeat));
-      }, 30_000);
-      this.heartbeatTimers.push(hb);
-    });
-
-    ws.on('message', (data) => {
-      const raw = data.toString();
-      let msg: OverlayMessage;
-      try { msg = JSON.parse(raw); } catch { return; }
-      // register_ack — nothing to do
-      if (msg.type === 'register_ack') return;
-      // Normal request routed from relay → handle as if inbound WS
-      this.handleMessage(ws, raw);
-    });
-
-    ws.on('close', () => {
-      this.rendezvousConnections = this.rendezvousConnections.filter(c => c !== ws);
-      const delay = Math.min(30_000, 1_000 * Math.pow(2, Math.min(attempt, 5)));
-      console.log(chalk.yellow('[Gateway]') + ` Rendezvous disconnected (${relayUrl}), retry in ${delay}ms`);
-      setTimeout(
-        () => this.connectToRendezvousRelay(relayUrl, serviceAddress, cfg, attempt + 1),
-        delay,
-      );
-    });
-
-    ws.on('error', (e) => {
-      console.warn(chalk.yellow('[Gateway]') + ` Rendezvous error (${relayUrl}): ${e.message}`);
-    });
+      };
+      ws.send(JSON.stringify(signOverlayMessage(heartbeat, signKey)));
+    }, 30_000);
+    this.heartbeatTimers.push(hb);
   }
 
   /** Announce this gateway's lp:// address + endpoints to all configured federation registries. */
@@ -274,35 +305,20 @@ export class ServiceGateway {
   }
 
   private relaySignMaterial(relayPub?: string): Buffer | string {
-    if (!relayPub && this.distributedMesh) throw new Error('Missing relay pubkey in distributed mesh');
-    if (!relayPub) return loadCA().overlaySecret;
+    if (!this.distributedMesh) return loadCA().overlaySecret;
+    if (!relayPub) throw new Error('Missing relay pubkey in distributed mesh');
     return this.sessionMgr.getSessionKey(peerWireId(relayPub), relayPub);
   }
 
   private handleMessage(ws: WebSocket, data: string) {
-    void this.handleMessageAsync(ws, data);
+    void this.handleMessageAsync(ws, data).catch((e: unknown) => {
+      console.warn(chalk.yellow('[Gateway]') + ` Dropped invalid overlay frame: ${String(e)}`);
+    });
   }
 
   private async handleMessageAsync(ws: WebSocket, data: string) {
-    let msg: OverlayMessage;
-    try {
-      msg = JSON.parse(data);
-    } catch {
-      return;
-    }
-
-    const ok = verifyIncomingOverlayFromPeer({
-      distributedMesh: this.distributedMesh,
-      mgr: this.sessionMgr,
-      overlaySecret: loadCA().overlaySecret,
-      peerPubFromMessage: msg.source_pubkey,
-      msg,
-    });
-
-    if (!ok) {
-      this.sendResponse(ws, msg, 401, { error: 'Unauthenticated overlay request' });
-      return;
-    }
+    const msg = parseOverlayMessage(data);
+    if (!msg || msg.type !== 'request') return;
 
     const relayIdentity = await validateDistributedPeer({
       distributedMesh: this.distributedMesh,
@@ -312,16 +328,35 @@ export class ServiceGateway {
       expectedRole: 'relay',
     });
     if (!relayIdentity.ok) {
-      this.sendResponse(ws, msg, 401, { error: relayIdentity.error });
+      // Do not derive a reply key from an unauthenticated peer's claimed key.
+      // In mesh mode a negative identity result is silent by design.
+      if (!this.distributedMesh) this.sendResponse(ws, msg, 401, { error: relayIdentity.error });
+      return;
+    }
+
+    const ok = verifyIncomingOverlayFromPeer({
+      distributedMesh: this.distributedMesh,
+      mgr: this.sessionMgr,
+      overlaySecret: loadCA().overlaySecret,
+      expectedPeerPubKeyB64: relayIdentity.pubkey,
+      msg,
+    });
+    if (!ok) {
+      this.sendResponse(ws, msg, 401, { error: 'Unauthenticated overlay request' }, relayIdentity.pubkey);
       return;
     }
 
     msg.trace.push('gateway');
-    const agent = msg.source;
+    const proofResult = this.verifyAgentProof(msg);
+    if (!proofResult.ok) {
+      this.sendResponse(ws, msg, 401, { error: proofResult.error }, relayIdentity.pubkey);
+      return;
+    }
+    const agent = proofResult.agent;
 
     if (isRevoked(agent)) {
       this.log(agent, 'request', 'deny', 'AGENT_REVOKED');
-      this.sendResponse(ws, msg, 403, { error: 'AGENT_REVOKED' });
+      this.sendResponse(ws, msg, 403, { error: 'AGENT_REVOKED' }, relayIdentity.pubkey);
       return;
     }
 
@@ -331,34 +366,35 @@ export class ServiceGateway {
 
     if (!check.allowed) {
       this.log(agent, action, 'deny', check.reason);
-      this.sendResponse(ws, msg, 403, { error: 'Forbidden by Gateway Policy', reason: check.reason });
+      this.sendResponse(ws, msg, 403, { error: 'Forbidden by Gateway Policy', reason: check.reason }, relayIdentity.pubkey);
       return;
     }
 
     if (check.requires_approval) {
       this.log(agent, action, 'require_human_approval', check.reason);
-      this.sendResponse(ws, msg, 202, { status: 'pending_approval' });
+      this.sendResponse(ws, msg, 202, { status: 'pending_approval' }, relayIdentity.pubkey);
       return;
     }
 
     this.checkPASAndMaybePause(agent);
 
-    this.forwardHttp(msg, ws, action, check.reason);
+    this.forwardHttp(msg, ws, action, check.reason, relayIdentity.pubkey);
   }
 
-  private forwardHttp(msg: OverlayMessage, ws: WebSocket, action: string, reason: string) {
-    const reqUrl = new URL(msg.payload.url?.startsWith('http') ? msg.payload.url : `http://localhost${msg.payload.url}`);
-    const base = new URL(this.targetHttpBase);
+  private forwardHttp(
+    msg: OverlayMessage,
+    ws: WebSocket,
+    action: string,
+    reason: string,
+    relayPub?: string,
+  ) {
+    const backend = this.buildBackendRequest(msg);
+    if (!backend) {
+      this.sendResponse(ws, msg, 400, { error: 'Invalid backend request' }, relayPub);
+      return;
+    }
 
-    const options = {
-      hostname: base.hostname,
-      port: base.port || 80,
-      path: reqUrl.pathname + reqUrl.search,
-      method: msg.payload.method,
-      headers: msg.payload.headers,
-    };
-
-    const req = http.request(options, (res) => {
+    const req = http.request(backend.options, (res) => {
       const chunks: Buffer[] = [];
       res.on('data', d => chunks.push(d));
       res.on('end', () => {
@@ -367,14 +403,13 @@ export class ServiceGateway {
         const action_id = `act_${crypto.randomBytes(6).toString('hex')}`;
         this.log(msg.source, action, 'allow', reason, { action_id });
 
-        const relayPub = msg.source_pubkey;
         const outMsg = signOverlayMessage(
           {
             id: msg.id,
             type: 'response',
             source: this.serviceAddress,
             destination: msg.source,
-            payload: { status: res.statusCode, headers: res.headers as any, body: bodyStr },
+            payload: { status: res.statusCode, headers: responseHeaders(res.headers), body: bodyStr },
             trace: msg.trace,
             source_pubkey: this.myPublicKey,
             source_node_label: this.nodeLabel,
@@ -387,11 +422,98 @@ export class ServiceGateway {
     });
 
     req.on('error', (err) => {
-      this.sendResponse(ws, msg, 502, { error: 'Backend error', detail: err.message });
+      this.sendResponse(ws, msg, 502, { error: 'Backend error', detail: err.message }, relayPub);
     });
 
-    if (msg.payload.body) req.write(Buffer.from(msg.payload.body, 'base64'));
+    if (backend.body.length) req.write(backend.body);
     req.end();
+  }
+
+  private verifyAgentProof(msg: OverlayMessage): { ok: true; agent: string } | { ok: false; error: string } {
+    const proof = msg.payload.agent_proof;
+    if (!proof) return { ok: false, error: 'Missing end-to-end agent proof' };
+    let agent: string;
+    try {
+      agent = normalizeAgentName(proof.agent);
+    } catch {
+      return { ok: false, error: 'Invalid agent identity' };
+    }
+    if (msg.source !== agent) return { ok: false, error: 'Agent proof does not match overlay source' };
+    if (isRevoked(agent)) return { ok: false, error: 'AGENT_REVOKED' };
+
+    const timestampMs = new Date(proof.timestamp).getTime();
+    if (!Number.isFinite(timestampMs) || Math.abs(Date.now() - timestampMs) > 5 * 60_000) {
+      return { ok: false, error: 'Stale agent proof' };
+    }
+    const body = decodeBase64(msg.payload.body ?? '');
+    if (!body || hashRequestBody(body) !== proof.body_hash) {
+      return { ok: false, error: 'Invalid agent proof body hash' };
+    }
+
+    let policy: ReturnType<PolicyLoader['load']>;
+    try {
+      policy = this.policy.load(agent);
+    } catch {
+      return { ok: false, error: 'Unknown agent policy' };
+    }
+    if (!policy.trusted_public_key || policy.trusted_public_key !== proof.public_key) {
+      return { ok: false, error: 'Untrusted agent signing key' };
+    }
+
+    const signed = requestSignaturePayload({
+      agent,
+      method: msg.payload.method,
+      host: proof.host,
+      url: msg.payload.url,
+      timestamp: proof.timestamp,
+      bodyHash: proof.body_hash,
+    });
+    if (!verifySignature(signed, proof.signature, proof.public_key)) {
+      return { ok: false, error: 'Invalid end-to-end agent signature' };
+    }
+    if (!agentProofNonces.add(`${agent}:${proof.timestamp}:${proof.nonce}`, getReplayWindowMs())) {
+      return { ok: false, error: 'REPLAY_DETECTED' };
+    }
+    return { ok: true, agent };
+  }
+
+  private buildBackendRequest(msg: OverlayMessage): { options: http.RequestOptions; body: Buffer } | null {
+    const method = (msg.payload.method ?? 'GET').toUpperCase();
+    if (!ALLOWED_BACKEND_METHODS.has(method)) return null;
+    const rawUrl = msg.payload.url ?? '/';
+    if (!rawUrl.startsWith('/') || rawUrl.startsWith('//') || /[\r\n]/.test(rawUrl)) return null;
+    let reqUrl: URL;
+    let base: URL;
+    try {
+      reqUrl = new URL(rawUrl, 'http://lattice.invalid');
+      base = new URL(this.targetHttpBase);
+      if (!['http:', 'https:'].includes(base.protocol)) return null;
+    } catch {
+      return null;
+    }
+    const body = decodeBase64(msg.payload.body ?? '');
+    if (!body) return null;
+    const headers: Record<string, string | string[]> = {};
+    for (const [rawName, rawValue] of Object.entries(msg.payload.headers ?? {})) {
+      const name = rawName.toLowerCase();
+      if (!/^[a-z0-9-]{1,128}$/.test(name) || HOP_BY_HOP_HEADERS.has(name) || name.startsWith('x-lattice-')) continue;
+      const values = Array.isArray(rawValue) ? rawValue : [String(rawValue)];
+      const clean = values.filter(v => v.length <= 8_192 && !/[\r\n]/.test(v));
+      if (clean.length) headers[name] = clean.length === 1 ? clean[0]! : clean;
+    }
+    headers.host = base.host;
+    headers['content-length'] = String(body.length);
+    return {
+      options: {
+        protocol: base.protocol,
+        hostname: base.hostname,
+        port: base.port || (base.protocol === 'https:' ? 443 : 80),
+        path: reqUrl.pathname + reqUrl.search,
+        method,
+        headers,
+      },
+      body,
+    };
   }
 
   private inferAction(method: string, reqUrl: string): string {
@@ -407,8 +529,14 @@ export class ServiceGateway {
     appendLog({ timestamp: new Date().toISOString(), agent, resource: this.serviceAddress, action, decision, reason, ...extra });
   }
 
-  private sendResponse(ws: WebSocket, req: OverlayMessage, status: number, bodyObj: object) {
-    const relayPub = req.source_pubkey;
+  private sendResponse(
+    ws: WebSocket,
+    req: OverlayMessage,
+    status: number,
+    bodyObj: object,
+    trustedRelayPub?: string,
+  ) {
+    const relayPub = trustedRelayPub ?? req.source_pubkey;
     const unsigned: OverlayMessage = {
       id: req.id,
       type: 'response',
@@ -427,10 +555,35 @@ export class ServiceGateway {
     let res: OverlayMessage;
     try {
       res = signOverlayMessage(unsigned, this.relaySignMaterial(relayPub));
-    } catch (e) {
-      if (this.distributedMesh) res = unsigned;
-      else throw e;
+    } catch {
+      return;
     }
     ws.send(JSON.stringify(res));
   }
+}
+
+function decodeBase64(value: string): Buffer | null {
+  if (value === '') return Buffer.alloc(0);
+  if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value)) return null;
+  try {
+    return Buffer.from(value, 'base64');
+  } catch {
+    return null;
+  }
+}
+
+function responseHeaders(headers: http.IncomingHttpHeaders): Record<string, string | string[] | number> {
+  const out: Record<string, string | string[] | number> = {};
+  for (const [rawName, value] of Object.entries(headers)) {
+    if (value === undefined) continue;
+    const name = rawName.toLowerCase();
+    if (!/^[a-z0-9-]{1,128}$/.test(name) || HOP_BY_HOP_HEADERS.has(name) || /[\r\n]/.test(name)) continue;
+    if (Array.isArray(value)) {
+      const clean = value.filter(v => !/[\r\n]/.test(v)).slice(0, 16);
+      if (clean.length) out[name] = clean;
+    } else if (typeof value === 'number' || !/[\r\n]/.test(value)) {
+      out[name] = value;
+    }
+  }
+  return out;
 }

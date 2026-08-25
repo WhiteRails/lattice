@@ -65,6 +65,14 @@ function sleep(ms: number) {
   return new Promise<void>(r => setTimeout(r, ms));
 }
 
+function overlayPubkey(): string {
+  const { publicKey } = crypto.generateKeyPairSync('x25519', {
+    publicKeyEncoding: { type: 'spki', format: 'der' },
+    privateKeyEncoding: { type: 'pkcs8', format: 'der' },
+  });
+  return (publicKey as Buffer).toString('base64');
+}
+
 // ─── Suite 1: FederationRegistryServer unit tests ────────────────────────────
 
 describe('FederationRegistryServer', () => {
@@ -105,7 +113,7 @@ describe('FederationRegistryServer', () => {
     const payload = {
       version: 2 as const,
       fqdn: 'echo.lattice',
-      gatewayPubKeyB64: crypto.randomBytes(32).toString('base64'),
+      gatewayPubKeyB64: overlayPubkey(),
       gatewayEndpoints: ['wss://3.3.3.3:8889'],
     };
     const announceResp = await httpPost(
@@ -255,7 +263,7 @@ describe('LpGatewayResolver — federation resolution', () => {
   afterEach(() => fedServer.stop());
 
   it('resolves lp:// address from federation when no chain/routing-cache', async () => {
-    const pubkey = crypto.randomBytes(32).toString('base64');
+    const pubkey = overlayPubkey();
     fedServer.localAnnounce({
       version: 2,
       fqdn: 'billing.lattice',
@@ -314,7 +322,7 @@ describe('postFederationAnnounce', () => {
 
   it('posts an announcement and it appears in GET /v1/routes', async () => {
     const { postFederationAnnounce } = await import('../node/federation-registry');
-    const pubkey = crypto.randomBytes(32).toString('base64');
+    const pubkey = overlayPubkey();
     const ok = await postFederationAnnounce(
       `http://127.0.0.1:${port}`,
       {

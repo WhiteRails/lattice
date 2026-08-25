@@ -9,6 +9,8 @@ export const NODE_ROLE_BITS: Record<LatticeNodeRole, number> = {
   relay: 2,
   gateway: 4,
 };
+const NODE_LABEL_RE = /^[a-z0-9._-]{1,64}$/;
+const OVERLAY_PUBKEY_RE = /^[A-Za-z0-9+/]{59}=$/;
 
 export function roleBitmaskFromRoles(roles: LatticeNodeRole[]): number {
   return roles.reduce((acc, role) => acc | NODE_ROLE_BITS[role], 0);
@@ -17,9 +19,10 @@ export function roleBitmaskFromRoles(roles: LatticeNodeRole[]): number {
 export function overlayPubkeysEqual(a?: string, b?: string): boolean {
   if (!a || !b) return false;
   try {
+    if (!OVERLAY_PUBKEY_RE.test(a) || !OVERLAY_PUBKEY_RE.test(b)) return false;
     const ba = Buffer.from(a.trim(), 'base64');
     const bb = Buffer.from(b.trim(), 'base64');
-    if (ba.length !== bb.length) return false;
+    if (ba.length !== 44 || bb.length !== 44) return false;
     return crypto.timingSafeEqual(ba, bb);
   } catch {
     return false;
@@ -57,10 +60,10 @@ export async function validateDistributedPeer(opts: {
   const role = opts.msg.source_node_role;
   const pubkey = opts.msg.source_pubkey?.trim();
 
-  if (!label) return { ok: false, error: `Missing source_node_label for ${opts.expectedRole} peer` };
+  if (!label || !NODE_LABEL_RE.test(label)) return { ok: false, error: `Invalid source_node_label for ${opts.expectedRole} peer` };
   if (!role) return { ok: false, error: `Missing source_node_role for ${label}` };
   if (role !== opts.expectedRole) return { ok: false, error: `Unexpected node role for ${label}: ${role}` };
-  if (!pubkey) return { ok: false, error: `Missing source_pubkey for ${label}` };
+  if (!pubkey || !OVERLAY_PUBKEY_RE.test(pubkey)) return { ok: false, error: `Invalid source_pubkey for ${label}` };
   if (opts.expectedLabel && label !== opts.expectedLabel) {
     return { ok: false, error: `Unexpected node label: ${label} (expected ${opts.expectedLabel})` };
   }
@@ -68,7 +71,12 @@ export async function validateDistributedPeer(opts: {
     return { ok: false, error: `Peer pubkey mismatch for ${label}` };
   }
 
-  const rec = await resolveNodeRecord(opts.cfg, opts.chain, label);
+  let rec: ChainLatticeNodeRecord | null;
+  try {
+    rec = await resolveNodeRecord(opts.cfg, opts.chain, label);
+  } catch {
+    return { ok: false, error: `Unable to resolve lattice node: ${label}` };
+  }
   if (!rec) return { ok: false, error: `Unregistered lattice node: ${label}` };
   if (!rec.active) return { ok: false, error: `Inactive lattice node: ${label}` };
   if ((rec.roleBitmask & NODE_ROLE_BITS[opts.expectedRole]) === 0) {

@@ -44,6 +44,20 @@ export interface AgentState {
   createdAt: string;
 }
 
+const AGENT_NAME_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/;
+
+/**
+ * Agent names are security principals and filenames. Keep one canonical spelling
+ * so authorization, revocation, and filesystem access cannot diverge.
+ */
+export function normalizeAgentName(name: string): string {
+  const normalized = name.trim();
+  if (!AGENT_NAME_RE.test(normalized)) {
+    throw new Error('Invalid agent name: use 1-64 lowercase letters, digits, _ or -');
+  }
+  return normalized;
+}
+
 function writePrivateJson(file: string, data: object): void {
   fs.writeFileSync(file, JSON.stringify(data, null, 2), { mode: PRIVATE_FILE_MODE });
   fs.chmodSync(file, PRIVATE_FILE_MODE);
@@ -92,17 +106,22 @@ export function getOrCreateOverlayKeyPair(): NodeKeyPair {
 // ─── Agents ──────────────────────────────────────────────────────────────────
 
 export function saveAgent(name: string, data: AgentState): void {
-  writePrivateJson(agentPath(name), data);
+  writePrivateJson(agentPath(normalizeAgentName(name)), data);
 }
 
 export function loadAgent(name: string): AgentState {
-  const f = agentPath(name);
-  if (!fs.existsSync(f)) throw new Error(`Agent '${name}' not found`);
+  const canonicalName = normalizeAgentName(name);
+  const f = agentPath(canonicalName);
+  if (!fs.existsSync(f)) throw new Error(`Agent '${canonicalName}' not found`);
   return JSON.parse(fs.readFileSync(f, 'utf-8'));
 }
 
 export function agentExists(name: string): boolean {
-  return fs.existsSync(agentPath(name));
+  try {
+    return fs.existsSync(agentPath(normalizeAgentName(name)));
+  } catch {
+    return false;
+  }
 }
 
 export function listAgents(): string[] {
@@ -112,13 +131,16 @@ export function listAgents(): string[] {
 }
 
 function agentPath(name: string) {
-  return path.join(LATTICE_DIR, 'agents', `${name}.json`);
+  const base = path.resolve(LATTICE_DIR, 'agents');
+  const candidate = path.resolve(base, `${name}.json`);
+  if (!candidate.startsWith(base + path.sep)) throw new Error('Agent path escaped state directory');
+  return candidate;
 }
 
 // ─── Services ────────────────────────────────────────────────────────────────
 
 export function saveService(name: string, data: object): void {
-  fs.writeFileSync(servicePath(name), JSON.stringify(data, null, 2));
+  fs.writeFileSync(servicePath(name), JSON.stringify(data, null, 2), { mode: PRIVATE_FILE_MODE });
 }
 
 export function loadService(name: string): any {
@@ -138,25 +160,36 @@ export function listServices(): string[] {
 }
 
 function servicePath(name: string) {
-  return path.join(LATTICE_DIR, 'services', `${name}.json`);
+  const canonical = normalizeAgentName(name);
+  const base = path.resolve(LATTICE_DIR, 'services');
+  const candidate = path.resolve(base, `${canonical}.json`);
+  if (!candidate.startsWith(base + path.sep)) throw new Error('Service path escaped state directory');
+  return candidate;
 }
 
 // ─── Revocations ─────────────────────────────────────────────────────────────
 
 export function saveRevocation(name: string): void {
+  const canonicalName = normalizeAgentName(name);
   const f = path.join(LATTICE_DIR, 'revocations', 'list.json');
   const list: string[] = fs.existsSync(f) ? JSON.parse(fs.readFileSync(f, 'utf-8')) : [];
-  if (!list.includes(name)) {
-    list.push(name);
+  if (!list.includes(canonicalName)) {
+    list.push(canonicalName);
     fs.writeFileSync(f, JSON.stringify(list, null, 2));
   }
 }
 
 export function isRevoked(name: string): boolean {
+  let canonicalName: string;
+  try {
+    canonicalName = normalizeAgentName(name);
+  } catch {
+    return true;
+  }
   const f = path.join(LATTICE_DIR, 'revocations', 'list.json');
   if (!fs.existsSync(f)) return false;
   const list: string[] = JSON.parse(fs.readFileSync(f, 'utf-8'));
-  return list.includes(name);
+  return list.includes(canonicalName);
 }
 
 export function listRevocations(): string[] {

@@ -17,6 +17,7 @@
 import * as http from 'http';
 import * as https from 'https';
 import * as crypto from 'crypto';
+import { z } from 'zod';
 import chalk from 'chalk';
 import type { RoutingPayload } from './routing-cache';
 import { normalizeRoutingPayload } from './routing-cache';
@@ -56,6 +57,21 @@ export interface AnnounceRequest {
   announceHmac?: string;
 }
 
+const RoutingPayloadSchema = z.object({
+  version: z.literal(2),
+  fqdn: z.string().min(3).max(253).regex(/^(?:[a-z0-9-]+\.)+(?:lattice|id)$/),
+  gatewayNodeLabel: z.string().regex(/^[a-z0-9._-]{1,64}$/).optional(),
+  gatewayPubKeyB64: z.string().regex(/^[A-Za-z0-9+/]{59}=$/),
+  gatewayEndpoints: z.array(z.string().url().max(2_048)).min(1).max(16),
+}).strict();
+
+const AnnounceSchema = z.object({
+  payload: RoutingPayloadSchema,
+  ttlSeconds: z.number().int().min(1).max(86_400).optional(),
+  announcerPubKey: z.string().regex(/^[A-Za-z0-9+/]{59}=$/).optional(),
+  announceHmac: z.string().regex(/^[a-f0-9]{64}$/).optional(),
+}).strict();
+
 // ─── Server ─────────────────────────────────────────────────────────────────
 
 export class FederationRegistryServer {
@@ -69,8 +85,15 @@ export class FederationRegistryServer {
     private readonly overlaySecret: string,
     private readonly tls?: LatticeNodeYaml['tls'],
   ) {
-    const handler = (req: http.IncomingMessage, res: http.ServerResponse) =>
-      void this.handleRequest(req, res);
+    const handler = (req: http.IncomingMessage, res: http.ServerResponse) => {
+      void this.handleRequest(req, res).catch((e: unknown) => {
+        if (!res.headersSent) {
+          res.writeHead(400, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Invalid federation request' }));
+        }
+        console.warn(chalk.yellow('[Federation]') + ` Rejected request: ${String(e)}`);
+      });
+    };
     const creds = readHttpsTlsCredentials(tls);
     this.server = creds
       ? https.createServer(creds, handler)
@@ -176,16 +199,13 @@ export class FederationRegistryServer {
     }
 
     if (req.method === 'POST' && url === FEDERATION_ANNOUNCE_PATH) {
-      const body = await readBody(req);
       let announce: AnnounceRequest;
       try {
-        announce = JSON.parse(body) as AnnounceRequest;
-        if (!announce.payload?.fqdn || !Array.isArray(announce.payload.gatewayEndpoints)) {
-          throw new Error('Missing required payload fields');
-        }
-      } catch (e: any) {
+        const body = await readBody(req);
+        announce = AnnounceSchema.parse(JSON.parse(body));
+      } catch {
         res.writeHead(400, { 'content-type': 'application/json' });
-        res.end(JSON.stringify({ error: `Invalid announce body: ${e?.message}` }));
+        res.end(JSON.stringify({ error: 'Invalid announce body' }));
         return;
       }
 
@@ -193,10 +213,17 @@ export class FederationRegistryServer {
       const hmacBody: Record<string, unknown> = { payload: announce.payload };
       if (announce.ttlSeconds !== undefined) hmacBody.ttlSeconds = announce.ttlSeconds;
       if (announce.announcerPubKey !== undefined) hmacBody.announcerPubKey = announce.announcerPubKey;
-      const expectedHmac = crypto
-        .createHmac('sha256', Buffer.from(this.overlaySecret, 'utf8'))
-        .update(stableStringify(hmacBody), 'utf8')
-        .digest('hex');
+      let expectedHmac: string;
+      try {
+        expectedHmac = crypto
+          .createHmac('sha256', Buffer.from(this.overlaySecret, 'utf8'))
+          .update(stableStringify(hmacBody), 'utf8')
+          .digest('hex');
+      } catch {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Invalid announce payload' }));
+        return;
+      }
       const providedHmac = announce.announceHmac ?? '';
       let hmacOk = false;
       try {

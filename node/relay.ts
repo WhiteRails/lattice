@@ -1,6 +1,6 @@
 import { WebSocketServer, WebSocket } from 'ws';
 import * as crypto from 'crypto';
-import { OverlayMessage, signOverlayMessage } from './message';
+import { OverlayMessage, parseOverlayMessage, signOverlayMessage } from './message';
 import { loadCA, getOrCreateOverlayKeyPair } from './state';
 import { SessionManager } from './session';
 import chalk from 'chalk';
@@ -16,7 +16,7 @@ import {
 import { LpGatewayResolver, LpRoutingNotFoundError } from './lp-resolver';
 import { bindOverlayWebSocketServer, wsTlsClientOptions } from './ws-stack';
 import { overlayPubkeysEqual, validateDistributedPeer } from './peer-identity';
-import { fqdnFromLpAddress, lookupRoutingPayload } from './routing-cache';
+import { fqdnFromLpAddress } from './routing-cache';
 
 export const DEFAULT_RELAY_PORT = 8888;
 
@@ -42,7 +42,7 @@ export class RelayNode {
    * Key: fqdn (e.g. "echo.lattice")
    * Value: the outbound WebSocket the gateway dialled into us.
    */
-  private hiddenGateways: Map<string, WebSocket> = new Map();
+  private hiddenGateways: Map<string, { ws: WebSocket; pubkey: string; nodeLabel?: string }> = new Map();
 
   constructor(opts: RelayNodeOptions = {}) {
     const cfgFromDisk = opts.nodeConfig !== undefined ? opts.nodeConfig : loadNodeConfig();
@@ -74,7 +74,11 @@ export class RelayNode {
     this.closeStack = bound.close;
 
     this.wss.on('connection', (ws) => {
-      ws.on('message', (data) => void this.handleMessage(ws, data.toString()));
+      ws.on('message', (data) => {
+        void this.handleMessage(ws, data.toString()).catch((e: unknown) => {
+          console.warn(chalk.yellow('[RelayNode]') + ` Dropped invalid overlay frame: ${String(e)}`);
+        });
+      });
     });
 
     bound.wss.once('listening', () => {
@@ -92,18 +96,23 @@ export class RelayNode {
   }
 
   /** Called when a hidden gateway dials in and sends a 'register' message. */
-  private handleGatewayRegister(gatewayWs: WebSocket, msg: OverlayMessage): void {
+  private async handleGatewayRegister(gatewayWs: WebSocket, msg: OverlayMessage): Promise<void> {
+    const gatewayIdentity = await validateDistributedPeer({
+      distributedMesh: this.distributedMesh,
+      cfg: this.cfg,
+      chain: this.chain,
+      msg,
+      expectedRole: 'gateway',
+    });
+    if (!gatewayIdentity.ok) return;
     const ok = verifyIncomingOverlayFromPeer({
       distributedMesh: this.distributedMesh,
       mgr: this.downstreamMgr,
       overlaySecret: loadCA().overlaySecret,
-      peerPubFromMessage: msg.source_pubkey,
+      expectedPeerPubKeyB64: gatewayIdentity.pubkey,
       msg,
     });
-    if (!ok) {
-      console.warn(chalk.yellow('[RelayNode]') + ` Hidden gateway register rejected: bad auth (source=${msg.source})`);
-      return;
-    }
+    if (!ok) return;
 
     let fqdn: string;
     try {
@@ -113,27 +122,34 @@ export class RelayNode {
       return;
     }
 
-    // Verify the registering gateway owns the fqdn (pubkey must match cached entry if one exists)
-    const cachedRoute = lookupRoutingPayload(this.cfg, fqdn, { requireLocalSig: false });
-    if (cachedRoute?.gatewayPubKeyB64 && !overlayPubkeysEqual(cachedRoute.gatewayPubKeyB64, msg.source_pubkey ?? '')) {
+    // Hidden registration is never first-claim-wins: a route must already bind this
+    // name to this exact gateway key before its socket is admitted.
+    let route;
+    try {
+      route = await this.resolver.resolveDestination(`lp://${fqdn}`);
+    } catch {
+      return;
+    }
+    if (!overlayPubkeysEqual(route.gatewayPubKeyB64, msg.source_pubkey) ||
+        (this.distributedMesh && (!route.gatewayNodeLabel || route.gatewayNodeLabel !== gatewayIdentity.label))) {
       console.warn(
         chalk.yellow('[RelayNode]') +
-          ` Hidden gateway register rejected: pubkey mismatch for ${fqdn} (got ${msg.source_pubkey?.slice(0, 12)}…)`,
+          ` Hidden gateway register rejected: authoritative route mismatch for ${fqdn}`,
       );
       return;
     }
 
     // Replace any stale connection for this service
     const existing = this.hiddenGateways.get(fqdn);
-    if (existing && existing !== gatewayWs && existing.readyState === WebSocket.OPEN) {
-      existing.close();
+    if (existing && existing.ws !== gatewayWs && existing.ws.readyState === WebSocket.OPEN) {
+      existing.ws.close();
     }
-    this.hiddenGateways.set(fqdn, gatewayWs);
+    this.hiddenGateways.set(fqdn, { ws: gatewayWs, pubkey: route.gatewayPubKeyB64, nodeLabel: route.gatewayNodeLabel });
     console.log(chalk.magenta('[RelayNode]') + ` Hidden gateway registered: ${fqdn} (pubkey ${msg.source_pubkey?.slice(0, 12)}…)`);
 
     // Clean up on disconnect
     gatewayWs.once('close', () => {
-      if (this.hiddenGateways.get(fqdn) === gatewayWs) {
+      if (this.hiddenGateways.get(fqdn)?.ws === gatewayWs) {
         this.hiddenGateways.delete(fqdn);
         console.log(chalk.magenta('[RelayNode]') + ` Hidden gateway disconnected: ${fqdn}`);
       }
@@ -151,46 +167,29 @@ export class RelayNode {
       source_node_label: this.nodeLabel,
       source_node_role: 'relay',
     };
-    const signKey = chooseOverlaySignKey(
-      this.downstreamMgr,
-      this.distributedMesh,
-      loadCA().overlaySecret,
-      msg.source_pubkey,
-    );
-    if (gatewayWs.readyState === WebSocket.OPEN) {
-      gatewayWs.send(JSON.stringify(signOverlayMessage(ack, signKey)));
-    }
+    try {
+      const signKey = chooseOverlaySignKey(
+        this.downstreamMgr,
+        this.distributedMesh,
+        loadCA().overlaySecret,
+        gatewayIdentity.pubkey,
+      );
+      if (gatewayWs.readyState === WebSocket.OPEN) gatewayWs.send(JSON.stringify(signOverlayMessage(ack, signKey)));
+    } catch {}
   }
 
   private async handleMessage(clientWs: WebSocket, data: string) {
-    let msg: OverlayMessage;
-    try {
-      msg = JSON.parse(data);
-    } catch {
-      return;
-    }
+    const msg = parseOverlayMessage(data);
+    if (!msg) return;
 
     // Hidden gateway rendezvous: gateway dials relay and registers itself
     if (msg.type === 'register') {
-      this.handleGatewayRegister(clientWs, msg);
+      await this.handleGatewayRegister(clientWs, msg);
       return;
     }
 
     // Keepalive heartbeats from hidden gateways — no response needed
-    if (msg.type === 'heartbeat') return;
-
-    const entryPubOk = verifyIncomingOverlayFromPeer({
-      distributedMesh: this.distributedMesh,
-      mgr: this.upstreamMgr,
-      overlaySecret: loadCA().overlaySecret,
-      peerPubFromMessage: msg.source_pubkey,
-      msg,
-    });
-
-    if (!entryPubOk) {
-      this.sendError(clientWs, msg, 'Unauthenticated overlay request');
-      return;
-    }
+    if (msg.type !== 'request') return;
 
     const entryIdentity = await validateDistributedPeer({
       distributedMesh: this.distributedMesh,
@@ -200,11 +199,19 @@ export class RelayNode {
       expectedRole: 'entry',
     });
     if (!entryIdentity.ok) {
-      this.sendError(clientWs, msg, entryIdentity.error);
       return;
     }
 
-    const entryPub = msg.source_pubkey;
+    const entryPubOk = verifyIncomingOverlayFromPeer({
+      distributedMesh: this.distributedMesh,
+      mgr: this.upstreamMgr,
+      overlaySecret: loadCA().overlaySecret,
+      expectedPeerPubKeyB64: entryIdentity.pubkey,
+      msg,
+    });
+    if (!entryPubOk) return;
+
+    const entryPub = entryIdentity.pubkey;
 
     msg.trace.push('relay');
 
@@ -227,8 +234,8 @@ export class RelayNode {
     const tlsOpts = wsTlsClientOptions(this.cfg);
 
     // Check if a hidden gateway has registered for this fqdn
-    const hiddenWs = this.hiddenGateways.get(route.fqdn);
-    if (hiddenWs && hiddenWs.readyState === WebSocket.OPEN) {
+    const hiddenGateway = this.hiddenGateways.get(route.fqdn);
+    if (hiddenGateway && hiddenGateway.ws.readyState === WebSocket.OPEN) {
       console.log(chalk.magenta('[RelayNode]') + ` Routing ${msg.id} to hidden gateway: ${route.fqdn}`);
       try {
         const relaySignKeyDown = chooseOverlaySignKey(
@@ -248,28 +255,29 @@ export class RelayNode {
           relaySignKeyDown,
         );
 
-        hiddenWs.send(JSON.stringify(downstreamMsg));
+        hiddenGateway.ws.send(JSON.stringify(downstreamMsg));
 
         // Wait for the response matching our request id on the persistent connection
         const responsePromise = new Promise<OverlayMessage>((resolve, reject) => {
           const timeout = setTimeout(() => {
-            hiddenWs.off('message', onMsg);
+            hiddenGateway.ws.off('message', onMsg);
             reject(new Error('hidden gateway timeout'));
           }, 30_000);
           const onMsg = (gwData: import('ws').RawData) => {
             let parsed: OverlayMessage;
             try {
-              parsed = JSON.parse(gwData.toString()) as OverlayMessage;
+              parsed = parseOverlayMessage(gwData.toString())!;
             } catch {
               return; // ignore non-JSON frames, keep waiting
             }
+            if (!parsed) return;
             // Only resolve for the response to our specific request
             if (parsed.id !== msg.id) return;
             clearTimeout(timeout);
-            hiddenWs.off('message', onMsg);
+            hiddenGateway.ws.off('message', onMsg);
             resolve(parsed);
           };
-          hiddenWs.on('message', onMsg);
+          hiddenGateway.ws.on('message', onMsg);
         });
 
         let response: OverlayMessage;
@@ -280,11 +288,24 @@ export class RelayNode {
           return;
         }
 
+        const hiddenIdentity = await validateDistributedPeer({
+          distributedMesh: this.distributedMesh,
+          cfg: this.cfg,
+          chain: this.chain,
+          msg: response,
+          expectedRole: 'gateway',
+          expectedLabel: hiddenGateway.nodeLabel,
+          expectedPubKeyB64: hiddenGateway.pubkey,
+        });
+        if (!hiddenIdentity.ok) {
+          this.sendError(clientWs, msg, 'Hidden gateway response identity failed');
+          return;
+        }
         const okGwPub = verifyIncomingOverlayFromPeer({
           distributedMesh: this.distributedMesh,
           mgr: this.downstreamMgr,
           overlaySecret: loadCA().overlaySecret,
-          peerPubFromMessage: response.source_pubkey,
+          expectedPeerPubKeyB64: hiddenIdentity.pubkey,
           msg: response,
         });
 
@@ -353,27 +374,12 @@ export class RelayNode {
         }
       });
 
-      gatewayWs.on('message', async (gwData) => {
-        let response: OverlayMessage;
-        try {
-          response = JSON.parse(gwData.toString());
-        } catch {
+      gatewayWs.on('message', (gwData) => {
+        void (async () => {
+        const response = parseOverlayMessage(gwData.toString());
+        if (!response || response.type !== 'response') {
           gatewayWs.close();
-          void tryEndpoint(idx + 1);
-          return;
-        }
-
-        const okGwPub = verifyIncomingOverlayFromPeer({
-          distributedMesh: this.distributedMesh,
-          mgr: this.downstreamMgr,
-          overlaySecret: loadCA().overlaySecret,
-          peerPubFromMessage: response.source_pubkey,
-          msg: response,
-        });
-
-        if (!okGwPub) {
-          gatewayWs.close();
-          void tryEndpoint(idx + 1);
+          await tryEndpoint(idx + 1);
           return;
         }
 
@@ -388,13 +394,26 @@ export class RelayNode {
         });
         if (!gwIdentity.ok) {
           gatewayWs.close();
-          void tryEndpoint(idx + 1);
+          await tryEndpoint(idx + 1);
+          return;
+        }
+
+        const okGwPub = verifyIncomingOverlayFromPeer({
+          distributedMesh: this.distributedMesh,
+          mgr: this.downstreamMgr,
+          overlaySecret: loadCA().overlaySecret,
+          expectedPeerPubKeyB64: gwIdentity.pubkey,
+          msg: response,
+        });
+        if (!okGwPub) {
+          gatewayWs.close();
+          await tryEndpoint(idx + 1);
           return;
         }
 
         if (this.distributedMesh && !overlayPubkeysEqual(response.source_pubkey, route.gatewayPubKeyB64)) {
           gatewayWs.close();
-          void tryEndpoint(idx + 1);
+          await tryEndpoint(idx + 1);
           return;
         }
 
@@ -424,11 +443,15 @@ export class RelayNode {
           this.sendError(clientWs, msg, 'relay signing failed');
         }
         gatewayWs.close();
+        })().catch(() => {
+          gatewayWs.close();
+          void tryEndpoint(idx + 1).catch(() => {});
+        });
       });
 
       gatewayWs.on('error', () => {
         gatewayWs.close();
-        void tryEndpoint(idx + 1);
+        void tryEndpoint(idx + 1).catch(() => {});
       });
     };
 
@@ -437,6 +460,7 @@ export class RelayNode {
 
   private sendError(ws: WebSocket, req: OverlayMessage, error: string) {
     const entryPub = req.source_pubkey;
+    if (this.distributedMesh && !entryPub) return;
     let signKey: Buffer | string;
     try {
       signKey = chooseOverlaySignKey(
@@ -446,27 +470,7 @@ export class RelayNode {
         entryPub,
       );
     } catch {
-      if (this.distributedMesh) {
-        if (ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({
-            id: req.id,
-            type: 'response',
-            source: 'relay',
-            destination: req.source,
-            payload: {
-              status: 502,
-              headers: { 'content-type': 'application/json' },
-              body: Buffer.from(JSON.stringify({ error })).toString('base64'),
-            },
-            trace: [...req.trace],
-            source_pubkey: this.myPublicKey,
-            source_node_label: this.nodeLabel,
-            source_node_role: 'relay',
-          } satisfies OverlayMessage));
-        }
-        return;
-      }
-      signKey = loadCA().overlaySecret;
+      return;
     }
 
     const res = signOverlayMessage(

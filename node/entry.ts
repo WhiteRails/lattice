@@ -1,8 +1,8 @@
 import * as http from 'http';
 import * as crypto from 'crypto';
 import { WebSocket } from 'ws';
-import { OverlayMessage, signOverlayMessage } from './message';
-import { isRevoked, loadAgent, loadCA, getOrCreateOverlayKeyPair } from './state';
+import { OverlayMessage, parseOverlayMessage, signOverlayMessage } from './message';
+import { isRevoked, loadAgent, loadCA, getOrCreateOverlayKeyPair, normalizeAgentName } from './state';
 import { hashRequestBody, requestSignaturePayload, verifySignature } from '../core/identity';
 import { SessionManager } from './session';
 import chalk from 'chalk';
@@ -24,6 +24,7 @@ import { validateDistributedPeer } from './peer-identity';
 const nonceStore = new NonceStore();
 
 export const DEFAULT_ENTRY_PORT = 7777;
+const MAX_AGENT_REQUEST_BYTES = 1_048_576;
 
 export interface EntryNodeOptions {
   port?: number;
@@ -104,7 +105,14 @@ export class EntryNode {
   }
 
   private handleHttp(req: http.IncomingMessage, res: http.ServerResponse) {
-    const agent = this.agentName(req);
+    let agent: string;
+    try {
+      agent = this.agentName(req);
+    } catch {
+      res.writeHead(400, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Invalid Lattice agent identity' }));
+      return;
+    }
     if (isRevoked(agent)) {
       res.writeHead(403);
       res.end(JSON.stringify({ error: 'Agent revoked' }));
@@ -115,8 +123,29 @@ export class EntryNode {
     const resource = `lp://${host}`;
 
     const chunks: Buffer[] = [];
-    req.on('data', d => chunks.push(d));
+    let bodyBytes = 0;
+    let rejected = false;
+    req.on('data', d => {
+      bodyBytes += d.length;
+      if (bodyBytes > MAX_AGENT_REQUEST_BYTES) {
+        rejected = true;
+        req.destroy();
+        if (!res.headersSent) {
+          res.writeHead(413, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Request body too large' }));
+        }
+        return;
+      }
+      chunks.push(d);
+    });
+    req.on('error', () => {
+      if (!res.headersSent) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Invalid request body' }));
+      }
+    });
     req.on('end', () => {
+      if (rejected) return;
       const rawBody = Buffer.concat(chunks);
       const identity = this.verifyAgentRequest(req, agent, rawBody);
       if (!identity.ok) {
@@ -135,8 +164,9 @@ export class EntryNode {
           payload: {
             method: req.method,
             url: req.url,
-            headers: req.headers as Record<string, string>,
+            headers: overlayHeaders(req.headers),
             body,
+            agent_proof: identity.proof,
           },
           trace: ['entry'],
           source_pubkey: this.myPublicKey,
@@ -145,7 +175,12 @@ export class EntryNode {
         };
 
       console.log(chalk.cyan('[EntryNode]') + ` Routing ${req.method} ${req.url} -> ${resource} via Relay`);
-      void this.forwardToRelayWithFailover(msg, res, 0);
+      void this.forwardToRelayWithFailover(msg, res, 0).catch(() => {
+        if (!res.headersSent) {
+          res.writeHead(502, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Overlay forwarding failed' }));
+        }
+      });
     });
   }
 
@@ -188,11 +223,10 @@ export class EntryNode {
       ws.send(JSON.stringify(signedMsg));
     });
 
-    ws.on('message', (data) => void (async () => {
-      let response: OverlayMessage;
-      try {
-        response = JSON.parse(data.toString());
-      } catch {
+    ws.on('message', (data) => {
+      void (async () => {
+      const response = parseOverlayMessage(data.toString());
+      if (!response) {
         res.writeHead(502, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ error: 'Invalid overlay response' }));
         ws.close();
@@ -218,7 +252,7 @@ export class EntryNode {
         distributedMesh: this.distributedMesh,
         mgr: this.sessionMgr,
         overlaySecret: loadCA().overlaySecret,
-        peerPubFromMessage: response.source_pubkey,
+        expectedPeerPubKeyB64: peer.pubkey,
         msg: response,
       });
       if (!ok) {
@@ -237,7 +271,14 @@ export class EntryNode {
         }
         ws.close();
       }
-    })());
+      })().catch(() => {
+        if (!res.headersSent) {
+          res.writeHead(502, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Invalid overlay response' }));
+        }
+        ws.close();
+      });
+    });
 
     ws.on('error', (err) => {
       console.error(chalk.red('[EntryNode]') + ` Relay ${url} failed: ${err.message}`);
@@ -247,14 +288,15 @@ export class EntryNode {
   }
 
   private agentName(req: http.IncomingMessage): string {
-    return (req.headers['x-lattice-agent'] as string) ?? process.env.LATTICE_AGENT ?? 'unknown';
+    const value = singleHeader(req.headers['x-lattice-agent']) ?? process.env.LATTICE_AGENT ?? 'unknown';
+    return normalizeAgentName(value);
   }
 
   private verifyAgentRequest(
     req: http.IncomingMessage,
     agent: string,
     body: Buffer,
-  ): { ok: true } | { ok: false; status: number; error: string } {
+  ): { ok: true; proof: NonNullable<OverlayMessage['payload']['agent_proof']> } | { ok: false; status: number; error: string } {
     let agentState;
     try {
       agentState = loadAgent(agent);
@@ -277,13 +319,9 @@ export class EntryNode {
     if (!nonce) {
       return { ok: false, status: 401, error: 'Missing x-lattice-nonce header' };
     }
-    const compositeKey = `${timestamp}:${nonce}`;
-    const replayWindow = getReplayWindowMs();
-    if (!nonceStore.add(compositeKey, replayWindow)) {
-      return { ok: false, status: 401, error: 'REPLAY_DETECTED' };
-    }
 
     const payload = requestSignaturePayload({
+      agent,
       method: req.method,
       host: singleHeader(req.headers.host),
       url: req.url,
@@ -295,11 +333,41 @@ export class EntryNode {
     if (!publicKey || !verifySignature(payload, signature, publicKey)) {
       return { ok: false, status: 401, error: 'Invalid Lattice agent signature' };
     }
+    const compositeKey = `${agent}:${timestamp}:${nonce}`;
+    if (!nonceStore.add(compositeKey, getReplayWindowMs())) {
+      return { ok: false, status: 401, error: 'REPLAY_DETECTED' };
+    }
 
-    return { ok: true };
+    return {
+      ok: true,
+      proof: {
+        agent,
+        public_key: publicKey,
+        signature,
+        timestamp,
+        nonce,
+        body_hash: hashRequestBody(body),
+        host: singleHeader(req.headers.host) ?? '',
+      },
+    };
   }
 }
 
 function singleHeader(value: string | string[] | undefined): string | undefined {
   return Array.isArray(value) ? value[0] : value;
+}
+
+function overlayHeaders(headers: http.IncomingHttpHeaders): Record<string, string | string[] | number> {
+  const result: Record<string, string | string[] | number> = {};
+  for (const [name, value] of Object.entries(headers)) {
+    if (value === undefined) continue;
+    if (!/^[a-z0-9-]{1,128}$/i.test(name)) continue;
+    if (Array.isArray(value)) {
+      const filtered = value.filter(v => typeof v === 'string' && !/[\r\n]/.test(v)).slice(0, 16);
+      if (filtered.length) result[name] = filtered;
+    } else if (!/[\r\n]/.test(value)) {
+      result[name] = value;
+    }
+  }
+  return result;
 }

@@ -268,7 +268,9 @@ agent.command('create <name>').description('Create an agent with a certificate')
       privateKey: keys.privateKey,
       createdAt: new Date().toISOString(),
     });
-    new PolicyLoader().deny(name, 'internet:*');
+    const policy = new PolicyLoader();
+    policy.deny(name, 'internet:*');
+    policy.pinAgentPublicKey(name, keys.publicKey);
     ok(`Agent '${chalk.cyan(name)}' created`);
     console.log(chalk.dim(`  cert: ${signed.cert.id}`));
     console.log(chalk.dim('  default policy: deny internet:*'));
@@ -385,7 +387,6 @@ program.command('resolve <address>').description('Resolve a lp:// address (YAML 
 program.command('grant <agent> <resource> <actions...>').description('Grant capability to agent')
   .action((agentName, resource, actions) => {
     requireInit();
-    if (!agentExists(agentName)) err(`Agent '${agentName}' not found`);
     new PolicyLoader().grant(agentName, resource, actions);
     ok(`${chalk.cyan(agentName)} can now ${chalk.green(actions.join(', '))} on ${chalk.cyan(resource)}`);
   });
@@ -406,6 +407,21 @@ pol.command('inspect <agent>').description('Show agent policy').action((agentNam
   if (!agentExists(agentName)) err(`Agent '${agentName}' not found`);
   console.log(new PolicyLoader().inspect(agentName));
 });
+
+pol.command('pin-agent-key <agent>')
+  .description('Pin a remote agent Ed25519 public key before granting gateway access')
+  .requiredOption('--public-key-file <path>', 'PEM public-key file from the agent operator')
+  .action((agentName, opts) => {
+    requireInit();
+    let publicKey: string;
+    try {
+      publicKey = fs.readFileSync(opts.publicKeyFile, 'utf8').trim();
+    } catch {
+      err(`Could not read public-key file: ${opts.publicKeyFile}`);
+    }
+    new PolicyLoader().pinAgentPublicKey(agentName, publicKey);
+    ok(`Pinned end-to-end signing key for ${chalk.cyan(agentName)}`);
+  });
 
 // ── gateway ──────────────────────────────────────────────────────────────────
 const nodeCmd = program.command('node').description('Manage Lattice Overlay Nodes');
@@ -710,6 +726,7 @@ meshCli
     const timestamp = new Date().toISOString();
     const nonce = crypto.randomBytes(12).toString('hex');
     const payload = requestSignaturePayload({
+      agent: opts.agent,
       method,
       host: opts.host,
       url: reqPath,

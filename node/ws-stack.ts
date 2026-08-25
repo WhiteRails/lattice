@@ -7,6 +7,7 @@ import * as http from 'http';
 import type { Server as HttpLikeServer } from 'http';
 import { WebSocketServer } from 'ws';
 import type { LatticeNodeYaml } from './node-config';
+import { MAX_OVERLAY_FRAME_BYTES } from './message';
 
 export type WsCloseFn = () => void;
 
@@ -38,7 +39,7 @@ export function bindOverlayWebSocketServer(host: string, port: number, tls: Latt
   const creds = readHttpsTlsCredentials(tls);
   if (creds) {
     const srv = https.createServer({ ...creds });
-    const wss = new WebSocketServer({ server: srv });
+    const wss = new WebSocketServer({ server: srv, maxPayload: MAX_OVERLAY_FRAME_BYTES });
     srv.listen(port, host);
     return {
       wss,
@@ -50,7 +51,7 @@ export function bindOverlayWebSocketServer(host: string, port: number, tls: Latt
     };
   }
 
-  const wss = new WebSocketServer({ port, host });
+  const wss = new WebSocketServer({ port, host, maxPayload: MAX_OVERLAY_FRAME_BYTES });
   return {
     wss,
     close: () => wss.close(),

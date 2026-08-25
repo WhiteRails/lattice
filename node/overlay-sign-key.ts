@@ -26,17 +26,18 @@ export function verifyIncomingOverlayFromPeer(opts: {
   distributedMesh: boolean;
   mgr: SessionManager;
   overlaySecret: string;
-  peerPubFromMessage?: string;
+  /** Trusted peer key resolved from config, route, or the node registry. */
+  expectedPeerPubKeyB64?: string;
   msg: OverlayMessage;
 }): boolean {
-  const { distributedMesh, mgr, overlaySecret, peerPubFromMessage, msg } = opts;
-  if (!distributedMesh) {
-    const k = peerPubFromMessage
-      ? mgr.getSessionKey(peerWireId(peerPubFromMessage), peerPubFromMessage)
-      : overlaySecret;
+  const { distributedMesh, mgr, overlaySecret, expectedPeerPubKeyB64, msg } = opts;
+  try {
+    // Local/shared-secret mode must never derive a key from frame-controlled data.
+    if (!distributedMesh) return defaultVerifyOverlayMessage(msg, overlaySecret);
+    if (!expectedPeerPubKeyB64) return false;
+    const k = mgr.getSessionKey(peerWireId(expectedPeerPubKeyB64), expectedPeerPubKeyB64);
     return defaultVerifyOverlayMessage(msg, k);
+  } catch {
+    return false;
   }
-  if (!peerPubFromMessage) return false;
-  const k = mgr.getSessionKey(peerWireId(peerPubFromMessage), peerPubFromMessage);
-  return defaultVerifyOverlayMessage(msg, k);
 }

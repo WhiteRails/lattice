@@ -23,7 +23,10 @@
     "@types/node": "^20.0.0",
     "ts-node": "^10.9.1",
     "typescript": "^5.0.0",
-    "vitest": "^1.0.0"
+    "vitest": "^4.1.11"
+  },
+  "overrides": {
+    "tmp": "0.2.7"
   },
   "dependencies": {
     "@types/chalk": "^0.4.31",

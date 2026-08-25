@@ -2,11 +2,13 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as yaml from 'js-yaml';
 import { z } from 'zod';
-import { LATTICE_DIR } from './state';
+import { LATTICE_DIR, normalizeAgentName } from './state';
 
 export interface PolicyRule { resource: string; actions?: string[]; }
 export interface AgentPolicy {
   agent: string;
+  /** Ed25519 key allowed to assert this principal across overlay hops. */
+  trusted_public_key?: string;
   network: { default: 'deny' | 'allow' };
   allow: PolicyRule[];
   deny: PolicyRule[];
@@ -21,6 +23,7 @@ const PolicyRuleSchema = z.object({
 
 const AgentPolicySchema = z.object({
   agent: z.string(),
+  trusted_public_key: z.string().min(32).max(8_192).optional(),
   network: z.object({ default: z.enum(['deny', 'allow']) }).strict(),
   allow: z.array(PolicyRuleSchema),
   deny: z.array(PolicyRuleSchema),
@@ -31,23 +34,35 @@ export class PolicyLoader {
   private dir = path.join(LATTICE_DIR, 'policies');
 
   load(name: string): AgentPolicy {
-    const f = this.policyPath(name);
+    const canonicalName = normalizeAgentName(name);
+    const f = this.policyPath(canonicalName);
     if (!fs.existsSync(f)) {
-      console.warn(JSON.stringify({ level: "WARN", event: "default_policy_activated", agent: name, reason: "policy_file_missing", policy: "default-deny+internet-blocked" }));
-      return this.defaultPolicy(name);
+      console.warn(JSON.stringify({ level: "WARN", event: "default_policy_activated", agent: canonicalName, reason: "policy_file_missing", policy: "default-deny+internet-blocked" }));
+      return this.defaultPolicy(canonicalName);
     }
     const raw = yaml.load(fs.readFileSync(f, 'utf-8'));
     const result = AgentPolicySchema.safeParse(raw);
     if (!result.success) {
       const issue = result.error.issues[0];
-      throw new Error(`Policy file for '${name}' is invalid: ${issue.path.join('.')} - ${issue.message}`);
+      throw new Error(`Policy file for '${canonicalName}' is invalid: ${issue.path.join('.')} - ${issue.message}`);
+    }
+    if (result.data.agent !== canonicalName) {
+      throw new Error(`Policy file principal mismatch for '${canonicalName}'`);
     }
     return result.data;
   }
 
   save(name: string, policy: AgentPolicy): void {
+    const canonicalName = normalizeAgentName(name);
+    if (policy.agent !== canonicalName) throw new Error('Policy agent must match its canonical filename');
     if (!fs.existsSync(this.dir)) fs.mkdirSync(this.dir, { recursive: true });
-    fs.writeFileSync(this.policyPath(name), yaml.dump(policy));
+    fs.writeFileSync(this.policyPath(canonicalName), yaml.dump(policy), { mode: 0o600 });
+  }
+
+  pinAgentPublicKey(name: string, publicKey: string): void {
+    const p = this.load(name);
+    p.trusted_public_key = publicKey;
+    this.save(name, p);
   }
 
   grant(name: string, resource: string, actions: string[]): void {
@@ -117,5 +132,11 @@ export class PolicyLoader {
     return { agent: name, network: { default: 'deny' }, allow: [], deny: [{ resource: 'internet:*' }], approval_required: [] };
   }
 
-  private policyPath(name: string) { return path.join(this.dir, `${name}.yaml`); }
+  private policyPath(name: string) {
+    const canonical = normalizeAgentName(name);
+    const base = path.resolve(this.dir);
+    const candidate = path.resolve(base, `${canonical}.yaml`);
+    if (!candidate.startsWith(base + path.sep)) throw new Error('Policy path escaped policy directory');
+    return candidate;
+  }
 }

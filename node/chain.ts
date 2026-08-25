@@ -407,7 +407,11 @@ export const LATTICE_CHAIN_ROLE_RELAY = 2;
 export const LATTICE_CHAIN_ROLE_GATEWAY = 4;
 
 export function latticeNodeIdBytes32(nodeLabel: string): string {
-  return ethers.keccak256(ethers.toUtf8Bytes(nodeLabel.trim()));
+  const normalized = nodeLabel.trim();
+  if (!/^[a-z0-9._-]{1,64}$/.test(normalized)) {
+    throw new Error('Invalid lattice node label');
+  }
+  return ethers.keccak256(ethers.toUtf8Bytes(normalized));
 }
 
 export async function chainRegisterLatticeNode(

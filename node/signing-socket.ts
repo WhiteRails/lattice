@@ -23,14 +23,20 @@ export class SigningSocket {
   private lastResetTime = Date.now();
   private readonly RATE_LIMIT = 100; // per second
 
-  constructor(private agentName: string, private privateKey: string, private sessionToken: string) {
-    this.socketPath = signingSocketPath(agentName);
+  constructor(
+    private agentName: string,
+    private privateKey: string,
+    private sessionToken: string,
+    socketPath?: string,
+  ) {
+    this.socketPath = socketPath ?? signingSocketPath(agentName);
     this.server = net.createServer((socket) => this.handleConnection(socket));
   }
 
   start(): void {
-    if (process.platform !== 'win32' && !fs.existsSync(SIGNING_SOCKETS_DIR)) {
-      fs.mkdirSync(SIGNING_SOCKETS_DIR, { recursive: true, mode: 0o700 });
+    const socketDir = path.dirname(this.socketPath);
+    if (process.platform !== 'win32' && !fs.existsSync(socketDir)) {
+      fs.mkdirSync(socketDir, { recursive: true, mode: 0o700 });
     }
     // Remove stale socket file
     if (process.platform !== 'win32' && fs.existsSync(this.socketPath)) {
@@ -39,7 +45,10 @@ export class SigningSocket {
     // Set restrictive umask before bind to eliminate TOCTOU window
     const oldUmask = process.platform !== 'win32' ? process.umask(0o177) : 0;
     this.server.listen(this.socketPath, () => {
-      if (process.platform !== 'win32') process.umask(oldUmask);
+      if (process.platform !== 'win32') {
+        process.umask(oldUmask);
+        fs.chmodSync(this.socketPath, 0o600);
+      }
     });
   }
 

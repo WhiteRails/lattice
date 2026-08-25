@@ -25,17 +25,26 @@ export function generateNodeKeyPair(): NodeKeyPair {
   };
 }
 
+/** Accept only canonical X25519 SubjectPublicKeyInfo DER values. */
+export function parseOverlayPublicKey(peerPublicKeyB64: string): crypto.KeyObject {
+  if (!/^[A-Za-z0-9+/]{59}=$/.test(peerPublicKeyB64)) {
+    throw new Error('Invalid X25519 overlay public key encoding');
+  }
+  const raw = Buffer.from(peerPublicKeyB64, 'base64');
+  if (raw.length !== 44) throw new Error('Invalid X25519 overlay public key length');
+  const key = crypto.createPublicKey({ key: raw, format: 'der', type: 'spki' });
+  if (key.asymmetricKeyType !== 'x25519') throw new Error('Overlay public key must be X25519');
+  return key;
+}
+
 export function deriveSessionKey(myPrivateKeyB64: string, peerPublicKeyB64: string): Buffer {
   const myPrivKey = crypto.createPrivateKey({
     key: Buffer.from(myPrivateKeyB64, 'base64'),
     format: 'der',
     type: 'pkcs8',
   });
-  const peerPubKey = crypto.createPublicKey({
-    key: Buffer.from(peerPublicKeyB64, 'base64'),
-    format: 'der',
-    type: 'spki',
-  });
+  if (myPrivKey.asymmetricKeyType !== 'x25519') throw new Error('Overlay private key must be X25519');
+  const peerPubKey = parseOverlayPublicKey(peerPublicKeyB64);
   const sharedSecret = crypto.diffieHellman({ privateKey: myPrivKey, publicKey: peerPubKey });
   // HKDF-SHA256: derive a 32-byte session key with a fixed info string
   const PROTOCOL_SALT = Buffer.from('lattice-ecdh-session-v1');

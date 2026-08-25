@@ -93,8 +93,8 @@ const latticeNodeConfigSchema = z.object({
       mode: z.enum(['public', 'hidden']).optional(),
       /** lp:// address this gateway serves (required for hidden mode). */
       hiddenServiceAddress: z.string().optional(),
-      /** Relay URLs to dial when mode=hidden (rendezvous relays). */
-      rendezvousRelays: z.array(z.string().url()).optional(),
+      /** Relay endpoints to dial when mode=hidden (labels are mandatory in mesh mode). */
+      rendezvousRelays: z.array(upstreamRelaySchema).optional(),
       /** TTL in seconds for federation announcements (default 300). */
       announceTtlSeconds: z.number().int().positive().optional(),
     })
@@ -253,8 +253,10 @@ export function resolveGatewayMode(cfg: LatticeNodeYaml | null): 'public' | 'hid
   return cfg?.gateway?.mode ?? 'public';
 }
 
-export function resolveRendezvousRelays(cfg: LatticeNodeYaml | null): string[] {
-  return cfg?.gateway?.rendezvousRelays ?? [];
+export function resolveRendezvousRelays(cfg: LatticeNodeYaml | null): UpstreamRelay[] {
+  return (cfg?.gateway?.rendezvousRelays ?? []).map(r =>
+    typeof r === 'string' ? { url: r.trim() } : { label: r.label.trim(), url: r.url.trim() },
+  );
 }
 
 export function resolveHiddenServiceAddress(cfg: LatticeNodeYaml | null): string | undefined {

@@ -166,9 +166,11 @@ describe('LpGatewayResolver + routing-cache (hybrid)', () => {
     homes.push(home);
     const { upsertLatticeNodeLocalRecord } = await import('../node/routing-cache');
     const { validateDistributedPeer } = await import('../node/peer-identity');
+    const { generateNodeKeyPair } = await import('../node/session');
+    const peerPub = generateNodeKeyPair().publicKey;
 
     upsertLatticeNodeLocalRecord(null, 'entry-a', {
-      overlayPubKeyB64: 'Zm9v',
+      overlayPubKeyB64: peerPub,
       roleBitmask: 1,
     });
 
@@ -179,7 +181,7 @@ describe('LpGatewayResolver + routing-cache (hybrid)', () => {
       destination: 'lp://echo.lattice',
       payload: {},
       trace: [],
-      source_pubkey: 'Zm9v',
+      source_pubkey: peerPub,
       source_node_label: 'entry-a',
       source_node_role: 'entry',
     };
@@ -212,7 +214,7 @@ describe('LpGatewayResolver + routing-cache (hybrid)', () => {
       distributedMesh: true,
       cfg: null,
       chain: null,
-      msg: { ...baseMsg, source_pubkey: 'YmFy' },
+      msg: { ...baseMsg, source_pubkey: generateNodeKeyPair().publicKey },
       expectedRole: 'entry',
     })).resolves.toMatchObject({ ok: false });
   });
@@ -240,6 +242,7 @@ describe('LpGatewayResolver + routing-cache (hybrid)', () => {
     const entryPk = await overlayPubkey(entryHome);
     const relayPk = await overlayPubkey(relayHome);
     const gatewayPk = await overlayPubkey(gatewayHome);
+    let agentPublicKey = '';
 
     await configureHome(entryHome, async () => {
       const { saveNodeConfig } = await import('../node/node-config');
@@ -258,6 +261,7 @@ describe('LpGatewayResolver + routing-cache (hybrid)', () => {
       const caState = loadCA();
       const ca = LatticeCA.fromKeyPair(caState.caId, { publicKey: caState.publicKey, privateKey: caState.privateKey });
       const keys = generateKeyPair();
+      agentPublicKey = keys.publicKey;
       const signed = ca.issueAgentCert({
         agent_id: 'agent:local:bot1',
         owner_org: 'local',
@@ -308,7 +312,9 @@ describe('LpGatewayResolver + routing-cache (hybrid)', () => {
         bind: { gateway: `127.0.0.1:${gatewayPort}` },
       });
       upsertLatticeNodeLocalRecord(null, 'relay-a', { overlayPubKeyB64: relayPk, roleBitmask: 2 });
-      new PolicyLoader().grant('bot1', 'lp://echo.lattice', ['ping']);
+      const policy = new PolicyLoader();
+      policy.grant('bot1', 'lp://echo.lattice', ['ping']);
+      policy.pinAgentPublicKey('bot1', agentPublicKey);
     });
 
     const backend = http.createServer((_req, res) => {

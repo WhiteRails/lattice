@@ -86,6 +86,7 @@ export function hashRequestBody(body: Buffer | string): string {
 }
 
 export function requestSignaturePayload(params: {
+  agent?: string;
   method?: string;
   host?: string;
   url?: string;
@@ -93,6 +94,7 @@ export function requestSignaturePayload(params: {
   bodyHash: string;
 }): string {
   return [
+    params.agent ?? '',
     (params.method ?? 'GET').toUpperCase(),
     params.host ?? '',
     params.url ?? '/',
