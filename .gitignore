@@ -8,3 +8,5 @@ dist/
 secrets/
 operator.key
 *.pkcs8
+.DS_Store
+.omc/
