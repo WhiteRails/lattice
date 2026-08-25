@@ -42,8 +42,9 @@ cmake -S "$llama_root" -B "$release_root/build/llama.cpp-release" \
   -DLLAMA_BUILD_EXAMPLES=OFF \
   -DLLAMA_BUILD_SERVER=OFF \
   -DLLAMA_BUILD_TESTS=OFF \
-  -DLLAMA_BUILD_UI=OFF
-cmake --build "$release_root/build/llama.cpp-release" --config Release --target llama
+  -DLLAMA_BUILD_UI=OFF \
+  -DLLAMA_USE_PREBUILT_UI=OFF
+cmake --build "$release_root/build/llama.cpp-release" --config Release --target llama-completion
 
 if [ ! -f "$model_cache" ]; then
   curl --fail --location --retry 3 --output "$model_cache" \
@@ -55,15 +56,17 @@ if [ "$model_actual_sha256" != "$model_sha256" ]; then
   exit 1
 fi
 
-mkdir -p "$release_dir/bin" "$release_dir/models" "$release_dir/etc/lattice" "$release_dir/lib/systemd/system"
+mkdir -p "$release_dir/bin" "$release_dir/models" "$release_dir/etc/lattice" "$release_dir/lib/systemd/system" "$release_dir/THIRD_PARTY_LICENSES"
 install -m 0755 "$release_root/build/release-daemon/latticed" "$release_dir/bin/latticed"
 install -m 0755 "$release_root/clients/rust/target/release/lattice" "$release_dir/bin/lattice"
 install -m 0755 "$release_root/clients/rust/target/release/lt" "$release_dir/bin/lt"
-install -m 0755 "$release_root/build/llama.cpp-release/bin/llama" "$release_dir/bin/lt-llm"
+install -m 0755 "$release_root/build/llama.cpp-release/bin/llama-completion" "$release_dir/bin/lt-llm"
 install -m 0644 "$model_cache" "$release_dir/models/$model_name"
 install -m 0644 "$release_root/daemon/latticed.conf.example" "$release_dir/etc/lattice/latticed.conf.example"
 install -m 0644 "$release_root/daemon/systemd/latticed.service" "$release_dir/lib/systemd/system/latticed.service"
 install -m 0644 "$release_root/README.md" "$release_dir/README.md"
+install -m 0644 "$llama_root/LICENSE" "$release_dir/THIRD_PARTY_LICENSES/llama.cpp-MIT.txt"
+install -m 0644 "$release_root/docs/third-party-notices.md" "$release_dir/THIRD_PARTY_NOTICES.md"
 
 tar -C "$release_root/artifacts" -czf "$release_archive" "$release_name"
 shasum -a 256 "$release_archive" > "$release_archive.sha256"

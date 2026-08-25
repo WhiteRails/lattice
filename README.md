@@ -75,7 +75,7 @@ Agents operate under YAML capability policies. If an agent tries to reach a reso
 
 - Node.js 20+
 - CMake, a C compiler, and OpenSSL 3 development headers (for `latticed`)
-- Rust stable toolchain and Cargo (for `lattice-client`)
+- Rust stable toolchain and Cargo (for `lattice` and `lt`)
 - Docker (recommended for network namespace isolation)
 - For distributed deployment: VPS(s) + TLS (Let's Encrypt) + an EVM-compatible chain
 
@@ -99,8 +99,9 @@ that use it:
 | `lt` | Local-model Lattice agent; it can only inspect connectivity through `status` and `ping`. |
 | `latticectl` | Node-based operator control plane for identities, policies, Entry, Relay, and Gateway. |
 
-Build a same-platform release bundle. It contains `latticed`, `lattice`, a
-sample configuration, a systemd unit, and a SHA-256 checksum:
+Build a same-platform release bundle. It contains `latticed`, `lattice`, `lt`,
+its embedded inference runtime and model, a sample configuration, a systemd
+unit, and a SHA-256 checksum:
 
 ```bash
 npm run package:bundle

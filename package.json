@@ -12,7 +12,7 @@
     "README.md"
   ],
   "scripts": {
-    "test": "vitest run",
+    "test": "vitest run --dir tests",
     "build": "tsc",
     "build:native": "cmake -S daemon -B build/daemon && cmake --build build/daemon",
     "test:rust": "cargo test --manifest-path clients/rust/Cargo.toml",

@@ -9,21 +9,20 @@ use lattice_client::Client;
 use serde_json::{json, Value};
 use std::env;
 use std::io::{self, BufRead, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 const MODEL_FILE: &str = "lt-smollm2-135m-instruct-q4_k_m.gguf";
 const MAX_PROMPT_BYTES: usize = 8 * 1024;
 const MAX_MODEL_REPLY_BYTES: usize = 16 * 1024;
 const MAX_PING_BYTES: usize = 1024;
-const MAX_AGENT_STEPS: usize = 4;
+const RESPONSE_SCHEMA: &str = r#"{"oneOf":[{"type":"object","properties":{"type":{"const":"final"},"message":{"type":"string"}},"required":["type","message"],"additionalProperties":false},{"type":"object","properties":{"type":{"const":"tool"},"tool":{"const":"lattice_status"},"arguments":{"type":"object","properties":{},"additionalProperties":false}},"required":["type","tool","arguments"],"additionalProperties":false},{"type":"object","properties":{"type":{"const":"tool"},"tool":{"const":"lattice_ping"},"arguments":{"type":"object","properties":{"payload":{"type":"string"}},"required":["payload"],"additionalProperties":false}},"required":["type","tool","arguments"],"additionalProperties":false}]}"#;
 
 #[derive(Clone)]
 struct Settings {
     socket: Option<String>,
     model_path: PathBuf,
     inference_bin: PathBuf,
-    max_steps: usize,
 }
 
 enum AgentReply {
@@ -34,7 +33,7 @@ enum AgentReply {
 
 fn usage() {
     eprintln!(
-        "Usage: lt [--socket <path>] [--max-steps <1-4>] [ask <prompt>]\n\n\
+        "Usage: lt [--socket <path>] [ask <prompt>]\n\n\
 lt is a local Lattice agent. With no command it reads prompts interactively.\n\
 It embeds llama.cpp and the bundled SmolLM2-135M Q4 model; no model server is used.\n\
 The agent can only call lattice_status and lattice_ping. It cannot run shell commands,\n\
@@ -42,9 +41,7 @@ read or write files, use MCP, browse the web, manage keys, or sign payloads."
     );
 }
 
-fn embedded_runtime_paths() -> Result<(PathBuf, PathBuf), String> {
-    let executable =
-        env::current_exe().map_err(|error| format!("cannot locate lt executable: {error}"))?;
+fn runtime_paths_for(executable: &Path) -> Result<(PathBuf, PathBuf), String> {
     let bin_dir = executable
         .parent()
         .ok_or_else(|| "lt executable has no parent directory".to_owned())?;
@@ -53,6 +50,13 @@ fn embedded_runtime_paths() -> Result<(PathBuf, PathBuf), String> {
         .ok_or_else(|| "lt must run from its release bundle".to_owned())?;
     let inference_bin = bin_dir.join("lt-llm");
     let model_path = bundle_root.join("models").join(MODEL_FILE);
+    Ok((inference_bin, model_path))
+}
+
+fn embedded_runtime_paths() -> Result<(PathBuf, PathBuf), String> {
+    let executable =
+        env::current_exe().map_err(|error| format!("cannot locate lt executable: {error}"))?;
+    let (inference_bin, model_path) = runtime_paths_for(&executable)?;
     if !inference_bin.is_file() || !model_path.is_file() {
         return Err(
             "embedded inference runtime or model is missing; install a complete lt release bundle"
@@ -64,7 +68,6 @@ fn embedded_runtime_paths() -> Result<(PathBuf, PathBuf), String> {
 
 fn parse_settings() -> Result<(Settings, Option<String>), String> {
     let mut socket = None;
-    let mut max_steps = 3_usize;
     let mut remainder = Vec::new();
     let mut args = env::args().skip(1);
     while let Some(argument) = args.next() {
@@ -75,16 +78,6 @@ fn parse_settings() -> Result<(Settings, Option<String>), String> {
                 std::process::exit(0);
             }
             "--socket" => socket = args.next(),
-            "--max-steps" => {
-                max_steps = args
-                    .next()
-                    .ok_or_else(|| "--max-steps requires a value".to_owned())?
-                    .parse::<usize>()
-                    .map_err(|_| "--max-steps must be an integer from 1 to 4".to_owned())?;
-                if !(1..=MAX_AGENT_STEPS).contains(&max_steps) {
-                    return Err("--max-steps must be an integer from 1 to 4".to_owned());
-                }
-            }
             "ask" => {
                 remainder.extend(args);
                 break;
@@ -105,7 +98,6 @@ fn parse_settings() -> Result<(Settings, Option<String>), String> {
             socket,
             model_path,
             inference_bin,
-            max_steps,
         },
         prompt,
     ))
@@ -149,11 +141,17 @@ fn request_model(settings: &Settings, messages: &[Value]) -> Result<String, Stri
             "-p",
             &prompt,
             "-n",
-            "384",
+            "96",
+            "-ngl",
+            "99",
             "--temp",
             "0",
+            "--json-schema",
+            RESPONSE_SCHEMA,
             "--no-display-prompt",
             "--simple-io",
+            "--single-turn",
+            "-no-cnv",
         ])
         .output()
         .map_err(|error| format!("cannot start embedded inference: {error}"))?;
@@ -168,7 +166,12 @@ fn request_model(settings: &Settings, messages: &[Value]) -> Result<String, Stri
     }
     let content = String::from_utf8(output.stdout)
         .map_err(|_| "embedded model returned non-UTF-8 output".to_owned())?;
-    Ok(content.trim().to_owned())
+    let content = content.trim();
+    Ok(content
+        .strip_suffix("[end of text]")
+        .unwrap_or(content)
+        .trim()
+        .to_owned())
 }
 
 fn parse_reply(content: &str) -> Result<AgentReply, String> {
@@ -243,26 +246,27 @@ fn execute_tool(settings: &Settings, reply: &AgentReply) -> Result<String, Strin
     }
 }
 
+fn tool_answer(action: &AgentReply, result: String) -> String {
+    match action {
+        AgentReply::Status => format!("Lattice status:\n{result}"),
+        AgentReply::Ping(_) => format!("Lattice ping:\n{result}"),
+        AgentReply::Final(_) => unreachable!("final messages do not execute tools"),
+    }
+}
+
 fn ask(settings: &Settings, prompt: &str) -> Result<String, String> {
     if prompt.is_empty() || prompt.len() > MAX_PROMPT_BYTES {
         return Err("prompt must be between 1 and 8192 bytes".to_owned());
     }
-    let mut messages = vec![
+    let messages = vec![
         json!({ "role": "system", "content": system_prompt() }),
         json!({ "role": "user", "content": prompt }),
     ];
-    for _ in 0..settings.max_steps {
-        let content = request_model(settings, &messages)?;
-        match parse_reply(&content)? {
-            AgentReply::Final(message) => return Ok(message),
-            action => {
-                let result = execute_tool(settings, &action)?;
-                messages.push(json!({ "role": "assistant", "content": content }));
-                messages.push(json!({ "role": "user", "content": format!("Lattice tool result: {result}. Return a final JSON response now, or one further allowed tool call.") }));
-            }
-        }
+    let content = request_model(settings, &messages)?;
+    match parse_reply(&content)? {
+        AgentReply::Final(message) => Ok(message),
+        action => Ok(tool_answer(&action, execute_tool(settings, &action)?)),
     }
-    Err("lt reached its four-step Lattice action ceiling".to_owned())
 }
 
 fn interactive(settings: &Settings) -> Result<(), String> {
@@ -350,5 +354,15 @@ mod tests {
             r#"{{"type":"tool","tool":"lattice_ping","arguments":{{"payload":"{payload}"}}}}"#
         ))
         .is_err());
+    }
+
+    #[test]
+    fn inference_is_resolved_only_from_the_release_bundle() {
+        let (runtime, model) = runtime_paths_for(Path::new("/opt/lattice/bin/lt")).unwrap();
+        assert_eq!(runtime, PathBuf::from("/opt/lattice/bin/lt-llm"));
+        assert_eq!(
+            model,
+            PathBuf::from("/opt/lattice/models/lt-smollm2-135m-instruct-q4_k_m.gguf")
+        );
     }
 }

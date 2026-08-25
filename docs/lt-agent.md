@@ -11,7 +11,7 @@ El modelo recibe un contrato JSON y sólo puede proponer:
 - `lattice_status`: lee los contadores LTP/1 del socket de daemon configurado.
 - `lattice_ping`: verifica conectividad LTP/1 con un payload máximo de 1 KiB.
 
-El proceso host valida cada respuesta del modelo antes de tocar Lattice. Rechaza herramientas desconocidas, argumentos extra, payloads grandes, respuestas malformadas, más de cuatro pasos y cualquier acción sin `--socket`, `LATTICE_SOCKET` o `LATTICE_DAEMON_SOCKET`.
+El proceso host restringe la generación con un esquema JSON y valida cada respuesta antes de tocar Lattice. Rechaza herramientas desconocidas, argumentos extra, payloads grandes, respuestas malformadas y cualquier acción sin `--socket`, `LATTICE_SOCKET` o `LATTICE_DAEMON_SOCKET`. Después de una única acción permitida, el host devuelve el resultado directamente: no deja al modelo encadenar llamadas.
 
 No hay herramienta para ejecutar comandos, acceder a archivos, abrir red externa, cargar servidores MCP, iniciar daemon, cambiar la configuración, crear agentes, modificar políticas, leer claves ni firmar. El daemon C conserva la custodia de claves; `lt` no expone `SIGN` aunque el socket tenga firma habilitada.
 
