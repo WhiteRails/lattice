@@ -3,14 +3,12 @@
 **A certified overlay network for autonomous AI agents.**
 
 <p align="center">
-  <em>Don't give the agent the open internet. Give it Lattice.</em>
+  <em>Don't expose agents to the open internet. Give them Lattice.</em>
 </p>
 
-The internet was designed for humans: open connectivity, implicit trust, applications that assume a person is in control. It was not designed for autonomous AI agents capable of planning, invoking APIs, accumulating resources, and operating at machine speed.
+Lattice is a hardened overlay network infrastructure architected for the secure governance of autonomous AI agents. Unlike traditional networking stacks, Lattice air-gaps agents from the public web using a Tor-inspired architecture that mandates accountability and privacy by design. 
 
-**Lattice** is an overlay network and cryptographic runtime that structurally isolates agents from the open web. It replaces implicit trust (API keys, loose firewalls) with explicit cryptographic identity, default-deny network routing, and undeniable cryptographic action provenance.
-
-Structurally inspired by Tor-like networks — separate addressing (`lp://`), overlay routing, cryptographic service identity — but serving the opposite purpose: **where Tor protects anonymity, Lattice enforces accountable agency.**
+The framework leverages cryptographic identities and zero-trust access policies to ensure that every agent interaction is both verifiable and revocable. By utilizing blockchain technology as a decentralized root of trust, Lattice maintains an immutable record of system integrity without compromising sensitive data. This enables developers to deploy autonomous services within a strictly controlled environment, where AI autonomy is bounded by granular permissions, predefined capabilities, and tamper-evident logging.
 
 ---
 
