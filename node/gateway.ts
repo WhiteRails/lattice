@@ -1,10 +1,11 @@
 import { WebSocketServer, WebSocket } from 'ws';
 import * as http from 'http';
+import * as https from 'https';
 import * as crypto from 'crypto';
-import { OverlayMessage, parseOverlayMessage, signOverlayMessage } from './message';
+import { OverlayMessage, parseOverlayMessage, signOverlayMessage, type AgentProof } from './message';
 import { PolicyLoader } from './policy-loader';
-import { appendLog, isRevoked, loadCA, getOrCreateOverlayKeyPair, normalizeAgentName } from './state';
-import { SessionManager } from './session';
+import { isRevoked, loadCA, getOrCreateOverlayKeyPair, logPath, normalizeAgentName } from './state';
+import { SessionManager, sessionMaxEntriesFromEnv } from './session';
 import chalk from 'chalk';
 import { controlBus } from './agent-control';
 import { PowerAccumulationTracker } from '../core/pas';
@@ -17,6 +18,7 @@ import {
   requireDistributedNodeId,
   resolveNodeChainConfig,
   resolveGatewayMode,
+  resolveGatewayIssuerGrants,
   resolveRendezvousRelays,
   resolveHiddenServiceAddress,
   resolveFederationUrls,
@@ -25,21 +27,35 @@ import { bindOverlayWebSocketServer, wsTlsClientOptions } from './ws-stack';
 import { validateDistributedPeer } from './peer-identity';
 import { postFederationAnnounce } from './federation-registry';
 import { deriveSelfAuthAddress } from './self-auth';
+import { ActionJournal, actionJournalOptionsFromEnv } from './action-journal';
+import type { GatewayIssuerGrant } from './node-config';
+import { IssuerCertificateCache } from './issuer-certificate-cache';
 import { LpGatewayResolver } from './lp-resolver';
 import { hashRequestBody, requestSignaturePayload, verifySignature } from '../core/identity';
-import { NonceStore, getReplayWindowMs } from './nonce-store';
+import { getReplayWindowMs } from './nonce-store';
+import { OverlayIngressLimiter, overlayIngressLimitsFromEnv } from './overlay-ingress';
+import { replayStoreFromEnv, type ReplayStore } from './replay-store';
+import { gatewayReplayKey } from './replay-keys';
+import { federationReplicaUrls } from './rendezvous';
+import { serveCellStatus } from './node-metrics';
 
-const agentProofNonces = new NonceStore();
 const ALLOWED_BACKEND_METHODS = new Set(['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS']);
 const HOP_BY_HOP_HEADERS = new Set([
   'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization',
   'te', 'trailer', 'transfer-encoding', 'upgrade', 'host', 'content-length',
 ]);
+// A response is re-encoded into the 1 MiB overlay frame. Keep enough room for
+// base64 expansion, signed metadata and a bounded header set.
+const MAX_BACKEND_RESPONSE_BYTES = 512 * 1024;
+const MAX_BACKEND_RESPONSE_HEADER_BYTES = 32 * 1024;
+const DEFAULT_BACKEND_RESPONSE_TIMEOUT_MS = 30_000;
+const DEFAULT_BACKEND_MAX_SOCKETS = 4_096;
 
 export interface ServiceGatewayOptions {
   port?: number;
   bindHostPort?: string;
   nodeConfig?: LatticeNodeYaml | null;
+  replayStore?: ReplayStore;
 }
 
 export class ServiceGateway {
@@ -55,12 +71,26 @@ export class ServiceGateway {
   private chain: NodeChainConfig | null;
   private resolver: LpGatewayResolver;
   private nodeLabel: string | undefined;
+  private readonly journal: ActionJournal;
+  private readonly ingress = new OverlayIngressLimiter(overlayIngressLimitsFromEnv());
+  private readonly issuerGrants: ReadonlyMap<string, GatewayIssuerGrant>;
+  private readonly issuerCertificateCache = new IssuerCertificateCache();
+  private failures = 0;
+  private readonly replayStore: ReplayStore;
+  private readonly ownsReplayStore: boolean;
+  private readonly backendResponseTimeoutMs: number;
+  private readonly backendHttpAgent: http.Agent;
+  private readonly backendHttpsAgent: https.Agent;
   /** Active outbound connections to relay rendezvous points (hidden mode). */
   private rendezvousConnections: WebSocket[] = [];
   /** Whether we're in hidden (outbound-only) mode. */
   private hiddenMode: boolean = false;
   /** Heartbeat timers for rendezvous connections. */
   private heartbeatTimers: ReturnType<typeof setInterval>[] = [];
+  /** Deferred retries must be cancelled when a replica is drained. */
+  private reconnectTimers: ReturnType<typeof setTimeout>[] = [];
+  private announceTimer: ReturnType<typeof setTimeout> | undefined;
+  private closed = false;
 
   setPASTracker(tracker: PowerAccumulationTracker, threshold = 100): void {
     this.pasTracker = tracker;
@@ -88,11 +118,19 @@ export class ServiceGateway {
       opts = maybeOpts ?? {};
     } else {
       opts = portOrOpts;
-      portInput = undefined;
+      portInput = opts.port;
     }
+    this.ownsReplayStore = !opts.replayStore;
+    this.replayStore = opts.replayStore ?? replayStoreFromEnv();
+    this.backendResponseTimeoutMs = backendResponseTimeoutFromEnv();
+    const backendMaxSockets = backendMaxSocketsFromEnv();
+    this.backendHttpAgent = new http.Agent({ keepAlive: true, maxSockets: backendMaxSockets, maxFreeSockets: Math.min(256, backendMaxSockets) });
+    this.backendHttpsAgent = new https.Agent({ keepAlive: true, maxSockets: backendMaxSockets, maxFreeSockets: Math.min(256, backendMaxSockets) });
+    this.journal = new ActionJournal(logPath(), actionJournalOptionsFromEnv());
 
     const cfgFromDisk = opts.nodeConfig !== undefined ? opts.nodeConfig : loadNodeConfig();
     this.cfg = cfgFromDisk;
+    this.issuerGrants = new Map(resolveGatewayIssuerGrants(cfgFromDisk).map(grant => [grant.issuer_id, grant]));
     this.distributedMesh = distributedMeshEffective(cfgFromDisk);
     this.nodeLabel = requireDistributedNodeId(cfgFromDisk, this.distributedMesh);
     this.chain = resolveNodeChainConfig(cfgFromDisk);
@@ -100,7 +138,7 @@ export class ServiceGateway {
 
     const gwKeyPair = getOrCreateOverlayKeyPair();
     this.myPublicKey = gwKeyPair.publicKey;
-    this.sessionMgr = new SessionManager('gateway', gwKeyPair.privateKey);
+    this.sessionMgr = new SessionManager('gateway', gwKeyPair.privateKey, undefined, sessionMaxEntriesFromEnv());
 
     const gatewayMode = resolveGatewayMode(cfgFromDisk);
     this.hiddenMode = gatewayMode === 'hidden';
@@ -128,7 +166,24 @@ export class ServiceGateway {
         defaultPort,
       );
 
-      const bound = bindOverlayWebSocketServer(bindHost, bindPort, cfgFromDisk?.tls);
+      const bound = bindOverlayWebSocketServer(
+        bindHost,
+        bindPort,
+        cfgFromDisk?.tls,
+        undefined,
+        (req, res) => {
+          if (serveCellStatus(req, res, 'gateway', () => ({
+            ...this.ingress.snapshot(),
+            residentPeers: this.rendezvousConnections.length,
+            failures: this.failures,
+            issuerCertificateCacheEntries: this.issuerCertificateCache.snapshot().entries,
+            issuerCertificateCacheHits: this.issuerCertificateCache.snapshot().hits,
+            issuerCertificateCacheMisses: this.issuerCertificateCache.snapshot().misses,
+          }))) return;
+          res.writeHead(404, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Not found' }));
+        },
+      );
       this.wss = bound.wss;
       this.closeStack = bound.close;
 
@@ -155,12 +210,24 @@ export class ServiceGateway {
   }
 
   close(): void {
+    if (this.closed) return;
+    this.closed = true;
+    this.policy.dispose();
+    void this.journal.close().catch(e => console.error(chalk.red('[Gateway] journal close'), String(e)));
     this.closeStack();
     for (const t of this.heartbeatTimers) clearInterval(t);
+    this.heartbeatTimers = [];
+    for (const t of this.reconnectTimers) clearTimeout(t);
+    this.reconnectTimers = [];
+    if (this.announceTimer) clearTimeout(this.announceTimer);
+    this.announceTimer = undefined;
     for (const ws of this.rendezvousConnections) {
       if (ws.readyState === WebSocket.OPEN) ws.close();
     }
     this.rendezvousConnections = [];
+    this.backendHttpAgent.destroy();
+    this.backendHttpsAgent.destroy();
+    if (this.ownsReplayStore) (this.replayStore as { close?: () => void }).close?.();
   }
 
   // ─── Hidden-mode internals ────────────────────────────────────────────────
@@ -170,6 +237,7 @@ export class ServiceGateway {
     serviceAddress: string,
     cfg: LatticeNodeYaml | null,
   ): void {
+    if (this.closed) return;
     for (const target of relayTargets) {
       if (this.distributedMesh && !target.label) {
         throw new Error('distributedMesh hidden gateways require labeled rendezvous relays');
@@ -184,6 +252,7 @@ export class ServiceGateway {
     cfg: LatticeNodeYaml | null,
     attempt: number,
   ): void {
+    if (this.closed) return;
     const tlsOpts = wsTlsClientOptions(cfg);
     const relayUrl = relayTarget.url;
     const ws = new WebSocket(relayUrl, undefined, { rejectUnauthorized: true, ...tlsOpts });
@@ -208,12 +277,15 @@ export class ServiceGateway {
 
     ws.on('close', () => {
       this.rendezvousConnections = this.rendezvousConnections.filter(c => c !== ws);
+      if (this.closed) return;
       const delay = Math.min(30_000, 1_000 * Math.pow(2, Math.min(attempt, 5)));
       console.log(chalk.yellow('[Gateway]') + ` Rendezvous disconnected (${relayUrl}), retry in ${delay}ms`);
-      setTimeout(
-        () => this.connectToRendezvousRelay(relayTarget, serviceAddress, cfg, attempt + 1),
-        delay,
-      );
+      let retry: ReturnType<typeof setTimeout>;
+      retry = setTimeout(() => {
+        this.reconnectTimers = this.reconnectTimers.filter(timer => timer !== retry);
+        if (!this.closed) this.connectToRendezvousRelay(relayTarget, serviceAddress, cfg, attempt + 1);
+      }, delay);
+      this.reconnectTimers.push(retry);
     });
 
     ws.on('error', (e) => {
@@ -250,8 +322,13 @@ export class ServiceGateway {
     ws.send(JSON.stringify(regMsg));
 
       // Keepalive heartbeat every 30 s
-    const hb = setInterval(() => {
-      if (ws.readyState !== WebSocket.OPEN) { clearInterval(hb); return; }
+    let hb: ReturnType<typeof setInterval>;
+    const stopHeartbeat = () => {
+      clearInterval(hb);
+      this.heartbeatTimers = this.heartbeatTimers.filter(timer => timer !== hb);
+    };
+    hb = setInterval(() => {
+      if (ws.readyState !== WebSocket.OPEN) { stopHeartbeat(); return; }
       const heartbeat: OverlayMessage = {
           id: `hb_${crypto.randomBytes(4).toString('hex')}`,
           type: 'heartbeat',
@@ -266,6 +343,9 @@ export class ServiceGateway {
       ws.send(JSON.stringify(signOverlayMessage(heartbeat, signKey)));
     }, 30_000);
     this.heartbeatTimers.push(hb);
+    // A reconnect must release its timer immediately; waiting for the next
+    // interval tick would retain one array entry per historical connection.
+    ws.once('close', stopHeartbeat);
   }
 
   /** Announce this gateway's lp:// address + endpoints to all configured federation registries. */
@@ -274,6 +354,7 @@ export class ServiceGateway {
     serviceAddress: string,
     gatewayEndpoints: string[],
   ): void {
+    if (this.closed) return;
     const fedUrls = resolveFederationUrls(cfg);
     if (!fedUrls.length) return;
     const fqdn = serviceAddress.replace(/^lp:\/\//, '').split('/')[0] ?? '';
@@ -285,10 +366,10 @@ export class ServiceGateway {
     const fqdnsToAnnounce = fqdn.endsWith('.lattice')
       ? [fqdn, selfAuthFqdn]
       : [fqdn];
-    for (const url of fedUrls) {
-      for (const announceFqdn of fqdnsToAnnounce) {
+    for (const announceFqdn of fqdnsToAnnounce) {
+      for (const replicaUrl of federationReplicaUrls(fedUrls, announceFqdn)) {
         postFederationAnnounce(
-          url,
+          replicaUrl,
           {
             version: 2,
             fqdn: announceFqdn,
@@ -301,7 +382,11 @@ export class ServiceGateway {
       }
     }
     // Re-announce at half the TTL
-    setTimeout(() => this.announceFederation(cfg, serviceAddress, gatewayEndpoints), (ttl / 2) * 1000).unref?.();
+    this.announceTimer = setTimeout(
+      () => this.announceFederation(cfg, serviceAddress, gatewayEndpoints),
+      (ttl / 2) * 1000,
+    );
+    this.announceTimer.unref?.();
   }
 
   private relaySignMaterial(relayPub?: string): Buffer | string {
@@ -311,9 +396,14 @@ export class ServiceGateway {
   }
 
   private handleMessage(ws: WebSocket, data: string) {
-    void this.handleMessageAsync(ws, data).catch((e: unknown) => {
-      console.warn(chalk.yellow('[Gateway]') + ` Dropped invalid overlay frame: ${String(e)}`);
-    });
+    const frameBytes = Math.max(1, Buffer.byteLength(data, 'utf8'));
+    if (!this.ingress.tryAcquire(ws, frameBytes)) {
+      ws.close(1013, 'overlay backpressure');
+      return;
+    }
+    void this.handleMessageAsync(ws, data).catch(() => {
+      this.failures++;
+    }).finally(() => this.ingress.release(ws, frameBytes));
   }
 
   private async handleMessageAsync(ws: WebSocket, data: string) {
@@ -347,89 +437,126 @@ export class ServiceGateway {
     }
 
     msg.trace.push('gateway');
-    const proofResult = this.verifyAgentProof(msg);
+    const proofResult = await this.verifyAgentProof(msg);
     if (!proofResult.ok) {
-      this.sendResponse(ws, msg, 401, { error: proofResult.error }, relayIdentity.pubkey);
+      this.sendResponse(ws, msg, proofResult.status ?? 401, { error: proofResult.error }, relayIdentity.pubkey);
       return;
     }
     const agent = proofResult.agent;
 
     if (isRevoked(agent)) {
-      this.log(agent, 'request', 'deny', 'AGENT_REVOKED');
+      if (!await this.audit(agent, 'request', 'deny', 'AGENT_REVOKED', ws, msg, relayIdentity.pubkey)) return;
       this.sendResponse(ws, msg, 403, { error: 'AGENT_REVOKED' }, relayIdentity.pubkey);
       return;
     }
 
     const reqUrlStr = msg.payload.url || '/';
     const action = this.inferAction(msg.payload.method ?? 'GET', reqUrlStr);
-    const check = this.policy.check(agent, this.serviceAddress, action);
+    const check = proofResult.issuerCheck ?? this.policy.check(agent, this.serviceAddress, action);
 
     if (!check.allowed) {
-      this.log(agent, action, 'deny', check.reason);
+      if (!await this.audit(agent, action, 'deny', check.reason, ws, msg, relayIdentity.pubkey)) return;
       this.sendResponse(ws, msg, 403, { error: 'Forbidden by Gateway Policy', reason: check.reason }, relayIdentity.pubkey);
       return;
     }
 
     if (check.requires_approval) {
-      this.log(agent, action, 'require_human_approval', check.reason);
+      if (!await this.audit(agent, action, 'require_human_approval', check.reason, ws, msg, relayIdentity.pubkey)) return;
       this.sendResponse(ws, msg, 202, { status: 'pending_approval' }, relayIdentity.pubkey);
       return;
     }
 
+    const action_id = actionIdForProof(msg.payload.agent_proof!);
+    if (!await this.audit(agent, action, 'allow', check.reason, ws, msg, relayIdentity.pubkey, { action_id })) return;
     this.checkPASAndMaybePause(agent);
 
-    this.forwardHttp(msg, ws, action, check.reason, relayIdentity.pubkey);
+    await this.forwardHttp(msg, ws, relayIdentity.pubkey, action_id);
   }
 
   private forwardHttp(
     msg: OverlayMessage,
     ws: WebSocket,
-    action: string,
-    reason: string,
     relayPub?: string,
-  ) {
-    const backend = this.buildBackendRequest(msg);
+    actionId?: string,
+  ): Promise<void> {
+    const backend = this.buildBackendRequest(msg, actionId);
     if (!backend) {
       this.sendResponse(ws, msg, 400, { error: 'Invalid backend request' }, relayPub);
-      return;
+      return Promise.resolve();
     }
+    return new Promise(resolve => {
+      let settled = false;
+      const finish = () => {
+        if (settled) return false;
+        settled = true;
+        resolve();
+        return true;
+      };
+      const failBackend = (error: Error) => {
+        if (!finish()) return;
+        this.failures++;
+        this.sendResponse(ws, msg, 502, { error: 'Backend error', detail: error.message }, relayPub);
+      };
+      try {
+        const client = backend.options.protocol === 'https:' ? https : http;
+        const agent = backend.options.protocol === 'https:' ? this.backendHttpsAgent : this.backendHttpAgent;
+        const req = client.request({ ...backend.options, agent }, (res) => {
+          const declaredLength = Number(res.headers['content-length'] ?? 0);
+          if (Number.isFinite(declaredLength) && declaredLength > MAX_BACKEND_RESPONSE_BYTES) {
+            failBackend(new Error('Backend response too large'));
+            res.destroy();
+            return;
+          }
+          const chunks: Buffer[] = [];
+          let responseBytes = 0;
+          res.on('data', d => {
+            responseBytes += d.length;
+            if (responseBytes > MAX_BACKEND_RESPONSE_BYTES) {
+              failBackend(new Error('Backend response too large'));
+              res.destroy();
+              return;
+            }
+            chunks.push(d);
+          });
+          res.on('end', () => {
+            if (settled) return;
+            try {
+              const bodyStr = Buffer.concat(chunks).toString('base64');
+              const outMsg = signOverlayMessage(
+                {
+                  id: msg.id,
+                  type: 'response',
+                  source: this.serviceAddress,
+                  destination: msg.source,
+                  payload: { status: res.statusCode, headers: responseHeaders(res.headers), body: bodyStr },
+                  trace: msg.trace,
+                  source_pubkey: this.myPublicKey,
+                  source_node_label: this.nodeLabel,
+                  source_node_role: 'gateway',
+                },
+                this.relaySignMaterial(relayPub),
+              );
+              if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(outMsg));
+              finish();
+            } catch (error) {
+              failBackend(error instanceof Error ? error : new Error(String(error)));
+            }
+          });
+          res.on('aborted', () => failBackend(new Error('Backend response aborted')));
+          res.on('error', error => failBackend(error instanceof Error ? error : new Error(String(error))));
+        });
 
-    const req = http.request(backend.options, (res) => {
-      const chunks: Buffer[] = [];
-      res.on('data', d => chunks.push(d));
-      res.on('end', () => {
-        const bodyStr = Buffer.concat(chunks).toString('base64');
-
-        const action_id = `act_${crypto.randomBytes(6).toString('hex')}`;
-        this.log(msg.source, action, 'allow', reason, { action_id });
-
-        const outMsg = signOverlayMessage(
-          {
-            id: msg.id,
-            type: 'response',
-            source: this.serviceAddress,
-            destination: msg.source,
-            payload: { status: res.statusCode, headers: responseHeaders(res.headers), body: bodyStr },
-            trace: msg.trace,
-            source_pubkey: this.myPublicKey,
-            source_node_label: this.nodeLabel,
-            source_node_role: 'gateway',
-          },
-          this.relaySignMaterial(relayPub),
-        );
-        ws.send(JSON.stringify(outMsg));
-      });
+        req.setTimeout(this.backendResponseTimeoutMs, () => req.destroy(new Error('Backend response timeout')));
+        req.on('error', err => failBackend(err));
+        if (backend.body.length) req.write(backend.body);
+        req.end();
+      } catch (error) {
+        failBackend(error instanceof Error ? error : new Error(String(error)));
+      }
     });
-
-    req.on('error', (err) => {
-      this.sendResponse(ws, msg, 502, { error: 'Backend error', detail: err.message }, relayPub);
-    });
-
-    if (backend.body.length) req.write(backend.body);
-    req.end();
   }
 
-  private verifyAgentProof(msg: OverlayMessage): { ok: true; agent: string } | { ok: false; error: string } {
+  private async verifyAgentProof(msg: OverlayMessage): Promise<{ ok: true; agent: string; issuerCheck?: { allowed: boolean; requires_approval: boolean; reason: string } } | { ok: false; error: string; status?: number }> {
     const proof = msg.payload.agent_proof;
     if (!proof) return { ok: false, error: 'Missing end-to-end agent proof' };
     let agent: string;
@@ -450,14 +577,23 @@ export class ServiceGateway {
       return { ok: false, error: 'Invalid agent proof body hash' };
     }
 
-    let policy: ReturnType<PolicyLoader['load']>;
-    try {
-      policy = this.policy.load(agent);
-    } catch {
-      return { ok: false, error: 'Unknown agent policy' };
-    }
-    if (!policy.trusted_public_key || policy.trusted_public_key !== proof.public_key) {
-      return { ok: false, error: 'Untrusted agent signing key' };
+    let issuerCheck: { allowed: boolean; requires_approval: boolean; reason: string } | undefined;
+    if (this.policy.hasExplicitPolicy(agent)) {
+      let policy: ReturnType<PolicyLoader['load']>;
+      try {
+        policy = this.policy.load(agent);
+      } catch {
+        return { ok: false, error: 'Unknown agent policy' };
+      }
+      const pinnedKey = policy.trusted_public_key === proof.public_key;
+      const trustedCert = policy.trusted_issuer
+        ? this.issuerCertificateCache.verify(proof.certificate, policy.trusted_issuer)
+        : null;
+      const issuerTrusted = Boolean(trustedCert && trustedCert.agent_id === policy.trusted_issuer?.subject && trustedCert.public_key === proof.public_key);
+      if (!pinnedKey && !issuerTrusted) return { ok: false, error: 'Untrusted agent signing key' };
+    } else {
+      issuerCheck = this.issuerCheckForProof(proof, this.inferAction(msg.payload.method ?? 'GET', msg.payload.url ?? '/'));
+      if (!issuerCheck) return { ok: false, error: 'Untrusted agent signing key' };
     }
 
     const signed = requestSignaturePayload({
@@ -471,13 +607,36 @@ export class ServiceGateway {
     if (!verifySignature(signed, proof.signature, proof.public_key)) {
       return { ok: false, error: 'Invalid end-to-end agent signature' };
     }
-    if (!agentProofNonces.add(`${agent}:${proof.timestamp}:${proof.nonce}`, getReplayWindowMs())) {
+    let nonceAccepted: boolean;
+    try {
+      // Gateway replicas share this namespace. Keep it distinct from Entry's
+      // admission claim because both layers deliberately verify one request.
+      nonceAccepted = await this.replayStore.claim(gatewayReplayKey(agent, proof.timestamp, proof.nonce), getReplayWindowMs());
+    } catch {
+      return { ok: false, error: 'REPLAY_STORE_UNAVAILABLE', status: 503 };
+    }
+    if (!nonceAccepted) {
       return { ok: false, error: 'REPLAY_DETECTED' };
     }
-    return { ok: true, agent };
+    return { ok: true, agent, issuerCheck };
   }
 
-  private buildBackendRequest(msg: OverlayMessage): { options: http.RequestOptions; body: Buffer } | null {
+  private issuerCheckForProof(proof: NonNullable<OverlayMessage['payload']['agent_proof']>, action: string) {
+    const issuerId = proof.certificate && typeof proof.certificate === 'object'
+      ? (proof.certificate as { ca_cert_id?: unknown }).ca_cert_id
+      : undefined;
+    const grant = typeof issuerId === 'string' ? this.issuerGrants.get(issuerId) : undefined;
+    if (!grant) return undefined;
+    const cert = this.issuerCertificateCache.verify(proof.certificate, grant);
+    const service = grant.services.find(candidate => candidate.address === this.serviceAddress && candidate.actions.includes(action));
+    const capability = `${this.serviceAddress}:${action}`;
+    if (!cert || !service || !cert.allowed_capability_classes.includes(capability) || cert.forbidden_capability_classes.includes(capability)) {
+      return undefined;
+    }
+    return { allowed: true, requires_approval: false, reason: `Issuer ${grant.issuer_id} capability grant` };
+  }
+
+  private buildBackendRequest(msg: OverlayMessage, actionId?: string): { options: http.RequestOptions; body: Buffer } | null {
     const method = (msg.payload.method ?? 'GET').toUpperCase();
     if (!ALLOWED_BACKEND_METHODS.has(method)) return null;
     const rawUrl = msg.payload.url ?? '/';
@@ -503,6 +662,9 @@ export class ServiceGateway {
     }
     headers.host = base.host;
     headers['content-length'] = String(body.length);
+    // Same signed agent proof always produces the same key across Gateway
+    // replicas. Backends must treat it as an idempotency key for unsafe calls.
+    if (actionId) headers['x-lattice-action-id'] = actionId;
     return {
       options: {
         protocol: base.protocol,
@@ -525,8 +687,24 @@ export class ServiceGateway {
     return { GET: 'read', POST: 'write', DELETE: 'delete', PUT: 'write', PATCH: 'write' }[method] ?? method.toLowerCase();
   }
 
-  private log(agent: string, action: string, decision: string, reason: string, extra?: object) {
-    appendLog({ timestamp: new Date().toISOString(), agent, resource: this.serviceAddress, action, decision, reason, ...extra });
+  private async audit(
+    agent: string,
+    action: string,
+    decision: string,
+    reason: string,
+    ws: WebSocket,
+    req: OverlayMessage,
+    trustedRelayPub?: string,
+    extra?: object,
+  ): Promise<boolean> {
+    try {
+      await this.journal.append({ timestamp: new Date().toISOString(), agent, resource: this.serviceAddress, action, decision, reason, ...extra });
+      return true;
+    } catch {
+      this.failures++;
+      this.sendResponse(ws, req, 503, { error: 'AUDIT_UNAVAILABLE' }, trustedRelayPub);
+      return false;
+    }
   }
 
   private sendResponse(
@@ -562,6 +740,18 @@ export class ServiceGateway {
   }
 }
 
+/** Stable cross-replica idempotency key, bound to the signed agent proof. */
+export function actionIdForProof(proof: AgentProof): string {
+  return `act_${crypto.createHash('sha256')
+    .update('lattice-action-v1\0', 'utf8')
+    .update(proof.agent, 'utf8')
+    .update('\0', 'utf8')
+    .update(proof.public_key, 'utf8')
+    .update('\0', 'utf8')
+    .update(proof.signature, 'utf8')
+    .digest('hex')}`;
+}
+
 function decodeBase64(value: string): Buffer | null {
   if (value === '') return Buffer.alloc(0);
   if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value)) return null;
@@ -574,16 +764,49 @@ function decodeBase64(value: string): Buffer | null {
 
 function responseHeaders(headers: http.IncomingHttpHeaders): Record<string, string | string[] | number> {
   const out: Record<string, string | string[] | number> = {};
+  let usedBytes = 0;
   for (const [rawName, value] of Object.entries(headers)) {
     if (value === undefined) continue;
     const name = rawName.toLowerCase();
     if (!/^[a-z0-9-]{1,128}$/.test(name) || HOP_BY_HOP_HEADERS.has(name) || /[\r\n]/.test(name)) continue;
     if (Array.isArray(value)) {
       const clean = value.filter(v => !/[\r\n]/.test(v)).slice(0, 16);
-      if (clean.length) out[name] = clean;
+      const bytes = clean.reduce((sum, item) => sum + Buffer.byteLength(name) + Buffer.byteLength(item) + 4, 0);
+      if (clean.length && usedBytes + bytes <= MAX_BACKEND_RESPONSE_HEADER_BYTES) {
+        out[name] = clean;
+        usedBytes += bytes;
+      }
     } else if (typeof value === 'number' || !/[\r\n]/.test(value)) {
-      out[name] = value;
+      const text = String(value);
+      const bytes = Buffer.byteLength(name) + Buffer.byteLength(text) + 4;
+      if (usedBytes + bytes <= MAX_BACKEND_RESPONSE_HEADER_BYTES) {
+        out[name] = value;
+        usedBytes += bytes;
+      }
     }
   }
   return out;
+}
+
+function backendResponseTimeoutFromEnv(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env.LATTICE_BACKEND_RESPONSE_TIMEOUT_MS;
+  if (raw === undefined || raw.trim() === '') return DEFAULT_BACKEND_RESPONSE_TIMEOUT_MS;
+  if (!/^[0-9]+$/.test(raw.trim())) throw new Error('LATTICE_BACKEND_RESPONSE_TIMEOUT_MS must be an integer');
+  const parsed = Number(raw);
+  if (!Number.isSafeInteger(parsed) || parsed < 1_000 || parsed > 120_000) {
+    throw new Error('LATTICE_BACKEND_RESPONSE_TIMEOUT_MS must be between 1000 and 120000');
+  }
+  return parsed;
+}
+
+/** Bound pooled backend sockets independently of public WebSocket connections. */
+export function backendMaxSocketsFromEnv(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env.LATTICE_BACKEND_MAX_SOCKETS;
+  if (raw === undefined || raw.trim() === '') return DEFAULT_BACKEND_MAX_SOCKETS;
+  if (!/^[0-9]+$/.test(raw.trim())) throw new Error('LATTICE_BACKEND_MAX_SOCKETS must be an integer');
+  const parsed = Number(raw);
+  if (!Number.isSafeInteger(parsed) || parsed < 32 || parsed > 65_536) {
+    throw new Error('LATTICE_BACKEND_MAX_SOCKETS must be between 32 and 65536');
+  }
+  return parsed;
 }

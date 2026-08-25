@@ -1,0 +1,24 @@
+#ifndef LATTICE_PROTOCOL_H
+#define LATTICE_PROTOCOL_H
+
+/* LTP/1 is deliberately small enough to implement in C, Rust and constrained
+ * runtimes. All integer fields are unsigned big-endian. */
+#define LATTICE_PROTOCOL_MAGIC "LTP1"
+#define LATTICE_PROTOCOL_VERSION 1U
+#define LATTICE_FRAME_HEADER_BYTES 20U
+#define LATTICE_MAX_FRAME_BYTES (1024U * 1024U)
+
+enum lattice_frame_kind {
+  LATTICE_FRAME_PING = 1,
+  LATTICE_FRAME_STATS = 2,
+  LATTICE_FRAME_AUTH = 3,
+  LATTICE_FRAME_SIGN = 4,
+  LATTICE_FRAME_PONG = 129,
+  LATTICE_FRAME_STATS_RESPONSE = 130,
+  LATTICE_FRAME_CHALLENGE = 131,
+  LATTICE_FRAME_AUTHENTICATED = 132,
+  LATTICE_FRAME_SIGNATURE = 133,
+  LATTICE_FRAME_ERROR = 255,
+};
+
+#endif

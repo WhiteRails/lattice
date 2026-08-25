@@ -1,5 +1,6 @@
 /**
- * Legacy single-host MVP: resolves lp:// *.lattice to local ws://127.0.0.1 ports when catalog + resolver have no row.
+ * Development-only single-host fallback: resolves lp:// *.lattice to local
+ * ws://127.0.0.1 ports when the catalog and resolver have no row.
  * Disabled when {@link LatticeNodeYaml} sets `distributedMesh: true`.
  */
 export const LOCAL_FALLBACK_WS_REGISTRY: Record<string, string> = {

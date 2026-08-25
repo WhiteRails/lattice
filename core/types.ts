@@ -349,8 +349,6 @@ export const RegistryTransparencyEventSchema = z.discriminatedUnion('event', [
 ]);
 export type RegistryTransparencyEvent = z.infer<typeof RegistryTransparencyEventSchema>;
 
-/** @deprecated Use RegistryTransparencyEvent; kept as alias for append-only logs. */
-export type RegistryEvent = RegistryTransparencyEvent;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Signed Agent Action Envelope / SAAE (§8 Step 7)

@@ -4,12 +4,32 @@
 # 2) Populate ~/.lattice/node.yaml + routing-cache (lattice node init-sample, lattice routing announce, lattice peer add).
 # 3) Run entry / relay / gateway with LATTICE_CHAIN_RPC_URL / LATTICE_CHAIN_ADDRESS or registry.chain in YAML.
 #
-# This file only ships a local Anvil; process-based nodes should be started on distinct hosts or compose services
-# you build (not included here to avoid pinning container images / keys in-repo).
-version: "3.8"
+# This file only ships local chain and replay dependencies. Process-based nodes
+# must run in distinct cells/hosts; do not put node keys or TLS material in this
+# compose file. Replicated Entry/Gateway deployments must point
+# LATTICE_REPLAY_REDIS_URL at a TLS-authenticated Redis/Valkey service.
 services:
   anvil:
-    image: ghcr.io/foundry-rs/foundry:stable
+    image: ghcr.io/foundry-rs/foundry@sha256:043752653d5be351c71709091b3db97c4421c907eb40ea294195e7f532aadf46
     command: ["anvil", "--host", "0.0.0.0", "--port", "8545"]
     ports:
-      - "8545:8545"
+      - "127.0.0.1:8545:8545"
+
+  replay:
+    image: redis@sha256:02419de7eddf55aa5bcf49efb74e88fa8d931b4d77c07eff8a6b2144472b6952
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    user: "999:1000"
+    ports:
+      - "127.0.0.1:6379:6379"
+    read_only: true
+    tmpfs:
+      - /data:uid=999,gid=1000,mode=0700
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping | grep -qx PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 10

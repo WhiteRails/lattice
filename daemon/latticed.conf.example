@@ -1,0 +1,13 @@
+# latticed configuration. One directive per line, like a minimal torrc.
+# Paths may be absolute or relative to the daemon's working directory.
+
+# Required: local LTP/1 Unix socket for Rust agents and SDKs.
+Socket /run/lattice/latticed.sock
+
+# Resource ceilings for one daemon process.
+MaxClients 256
+MaxBufferedBytes 134217728
+
+# Optional: enable Ed25519 signing. Both directives must be present together.
+# KeyFile /etc/lattice/agent-ed25519.pem
+# SessionTokenFile /run/lattice/session.token

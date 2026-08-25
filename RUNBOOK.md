@@ -14,8 +14,7 @@
 4. [AC-21-P4: PAS State Rollback](#ac-21-p4-pas-state-rollback)
 5. [KMS Plugin Development](#kms-plugin-development)
 6. [Proxy Mode Network Limitation](#proxy-mode-network-limitation)
-7. [Signing Socket Reference](#signing-socket-reference)
-8. [F1 Distributed Public Overlay Bring-Up](#f1-distributed-public-overlay-bring-up)
+7. [F1 Distributed Public Overlay Bring-Up](#f1-distributed-public-overlay-bring-up)
 
 ---
 
@@ -159,6 +158,58 @@ npm run lattice -- grant bot1 lp://echo.lattice ping
 ```
 
 `lattice agent create bot1` performs the pin automatically when the Entry and Gateway share state. A Gateway with no pinned key fails closed, even if a relay is registered and the agent name has an allow rule.
+
+### Issuer-backed agent trust
+
+For a fleet where individual agent-key pinning is impractical, a policy can instead trust one issuer and the expected certificate subject. The Gateway verifies the certificate signature, issuer identifier, subject, expiry, and the key that signed the request:
+
+```bash
+npm run lattice -- agent trust-issuer bot1 \
+  --issuer acme-agent-ca \
+  --public-key-file /secure/provisioning/acme-agent-ca-public.pem \
+  --subject agent:acme:bot1
+```
+
+This is an alternative to a matching `trusted_public_key` policy pin; if both are configured, either valid binding is accepted. The issuer key must still come from an approved trust-distribution channel.
+
+Para que un **Entry** acepte identidades remotas sin replicar un archivo por
+agente, configure la misma raíz de emisor que corresponda a esa célula. El CLI
+envía el certificado firmado del agente automáticamente en las operaciones
+`mesh smoke` y `mesh load`; esto no concede acceso al servicio, que sigue
+siendo decidido por la policy del Gateway.
+
+```yaml
+# ~/.lattice/node.yaml
+agentTrust:
+  issuers:
+    - issuer_id: acme-agent-ca
+      public_key: |-
+        -----BEGIN PUBLIC KEY-----
+        ...
+        -----END PUBLIC KEY-----
+```
+
+Mantenga esta lista como un conjunto pequeño de raíces aprobadas (máximo 64),
+nunca como un inventario de claves de agentes. Un certificado de un emisor no
+configurado se rechaza en Entry con `401`.
+
+Si una Gateway debe servir una población completa de ese emisor sin archivos
+de policy por agente, declare el grant local de servicio y acción. El
+certificado debe traer exactamente la capability `lp://echo.lattice:ping`; una
+policy individual existente para el agente tiene precedencia.
+
+```yaml
+gateway:
+  issuerGrants:
+    - issuer_id: acme-agent-ca
+      public_key: |-
+        -----BEGIN PUBLIC KEY-----
+        ...
+        -----END PUBLIC KEY-----
+      services:
+        - address: lp://echo.lattice
+          actions: [ping]
+```
 
 Negative checks:
 
@@ -324,13 +375,11 @@ A valid revocation produces this log pattern:
 
 If you see `decision: allow` after revocation, verify both EntryNode and ServiceGateway share or sync the same `~/.lattice/revocations/list.json`. In multi-host deployments, replication of this file is the operator's responsibility.
 
-### Remove the agent's signing socket (if running)
+### Native daemon cleanup
 
-```
-rm -f ~/.lattice/sockets/<agent-name>.sock
-```
-
-Stop any process holding the socket before removal to prevent stale file descriptor errors.
+`lattice run` creates a private per-run directory for the C daemon and removes
+it when the agent exits. Do not delete active daemon sockets manually; stop the
+agent process first and let the runner perform cleanup.
 
 ---
 
@@ -493,7 +542,7 @@ Do not rely on proxy mode as a security boundary for agents with access to sensi
 
 ---
 
-## Distributed overlay (cross-host MVP)
+## Distributed overlay (cross-host development baseline)
 
 Operational pieces added for **Fase 1** (“distributed but not hidden”):
 
@@ -525,37 +574,3 @@ lattice peer add …                     # bootstrap relay pubkey hints when cha
 - Example Anvil-only compose: `docker-compose.distributed.yml`
 
 ---
-
-## Signing Socket Reference
-
-### Overview
-
-The signing socket allows an agent process to request cryptographic signatures from the Lattice daemon without ever holding the agent's private key. This limits key material exposure to the daemon process.
-
-### Environment variables
-
-| Variable | Description |
-|---|---|
-| `LATTICE_SIGNING_SOCKET` | Path to the Unix domain socket for the agent, e.g. `~/.lattice/sockets/<agent-name>.sock`. On Windows, this is a named pipe: `\\.\pipe\lattice-<agent-name>`. |
-| `LATTICE_SESSION_TOKEN` | Per-session HMAC token. The agent uses this to authenticate to the socket by computing `HMAC-SHA256(LATTICE_SESSION_TOKEN, challenge)` in response to the daemon's challenge. |
-
-Both variables are injected by the Lattice runner into the agent's environment at startup. Agents must not log or expose these values.
-
-### Connection protocol
-
-1. Agent connects to the socket at `LATTICE_SIGNING_SOCKET`.
-2. Daemon sends a challenge: `{ "type": "challenge", "challenge": "<32-byte hex>" }`
-3. Agent responds: `{ "type": "challenge_response", "response": "<HMAC-SHA256(LATTICE_SESSION_TOKEN, challenge) hex>" }`
-4. Daemon confirms: `{ "type": "authenticated" }`
-5. Agent sends sign requests: `{ "type": "sign", "payload": "<data>" }`
-6. Daemon returns: `{ "type": "signature", "signature": "<signature>" }`
-
-The socket enforces a rate limit of 100 sign requests per second per connection. Requests exceeding this limit receive `{ "type": "error", "error": "RATE_LIMITED" }`.
-
-### Socket file permissions
-
-The socket file is created with mode `0600`, owned by the user running the daemon. Only the daemon and agent processes running as the same user can connect. The socket directory (`~/.lattice/sockets/`) is created with mode `0700`.
-
-### Using the socket instead of the private key
-
-Agents should read `LATTICE_SIGNING_SOCKET` at startup. If the variable is set, all signing operations must go through the socket. Direct access to private key files from agent code is a policy violation and defeats the purpose of the signing socket isolation.

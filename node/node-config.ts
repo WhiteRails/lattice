@@ -6,6 +6,7 @@ import * as path from 'path';
 import * as yaml from 'js-yaml';
 import { z } from 'zod';
 import { LATTICE_DIR } from './state';
+import type { AgentIssuerTrust } from '../core/issuer-trust';
 
 export const NODE_CONFIG_FILENAME = 'node.yaml';
 
@@ -14,6 +15,12 @@ export const DEFAULT_ROUTING_CACHE_PATH = path.join(LATTICE_DIR, 'routing-cache.
 
 export const LATTICE_NODE_ROLES = ['entry', 'relay', 'gateway'] as const;
 export type LatticeNodeRole = (typeof LATTICE_NODE_ROLES)[number];
+/** Local bootstrap/failover sets, never a representation of global membership. */
+export const MAX_UPSTREAM_RELAYS = 16;
+export const MAX_RENDEZVOUS_RELAYS = 16;
+export const MAX_FEDERATION_BOOTSTRAPS = 64;
+export const MAX_LOCAL_SERVICES = 256;
+export const MAX_ENTRY_AGENT_ISSUERS = 64;
 
 const bindHostPort = z.union([
   z.string().regex(/^(\d+\.\d+\.\d+\.\d+|::|\[.*]|[a-zA-Z._-]+):(\d+)$/, 'host:port'),
@@ -46,6 +53,20 @@ const upstreamRelaySchema = z.union([
   }).strict(),
 ]);
 
+const agentIssuerTrustSchema = z.object({
+  issuer_id: z.string().min(1).max(256),
+  public_key: z.string().min(32).max(8_192),
+}).strict();
+
+const gatewayIssuerGrantSchema = z.object({
+  issuer_id: z.string().min(1).max(256),
+  public_key: z.string().min(32).max(8_192),
+  services: z.array(z.object({
+    address: z.string().min(1).max(512),
+    actions: z.array(z.string().min(1).max(128)).min(1).max(64),
+  }).strict()).min(1).max(MAX_LOCAL_SERVICES),
+}).strict();
+
 const latticeNodeConfigSchema = z.object({
   nodeId: z.string().min(1).optional(),
   roles: z.array(z.enum(LATTICE_NODE_ROLES)).min(1).optional(),
@@ -71,7 +92,12 @@ const latticeNodeConfigSchema = z.object({
     .optional(),
 
   /** Prefer first URL; failover on transient connect failures (Entry outbound). */
-  upstreamRelays: z.array(upstreamRelaySchema).optional(),
+  upstreamRelays: z.array(upstreamRelaySchema).max(MAX_UPSTREAM_RELAYS).optional(),
+
+  /** Issuer roots accepted by Entry for portable agent certificates. */
+  agentTrust: z.object({
+    issuers: z.array(agentIssuerTrustSchema).max(MAX_ENTRY_AGENT_ISSUERS),
+  }).strict().optional(),
 
   /** Label of lattice node registry entry matching `upstreamRelays[0]` (for pubkey lookup). */
   primaryUpstreamRelayLabel: z.string().min(1).optional(),
@@ -81,7 +107,7 @@ const latticeNodeConfigSchema = z.object({
       chain: chainSchema,
       cacheFile: z.string().min(1).optional(),
       /** HTTP URLs of federation registry servers to poll for lp:// routing. */
-      federationUrls: z.array(z.string().url()).optional(),
+      federationUrls: z.array(z.string().url()).max(MAX_FEDERATION_BOOTSTRAPS).optional(),
     })
     .strict()
     .optional(),
@@ -94,9 +120,11 @@ const latticeNodeConfigSchema = z.object({
       /** lp:// address this gateway serves (required for hidden mode). */
       hiddenServiceAddress: z.string().optional(),
       /** Relay endpoints to dial when mode=hidden (labels are mandatory in mesh mode). */
-      rendezvousRelays: z.array(upstreamRelaySchema).optional(),
+      rendezvousRelays: z.array(upstreamRelaySchema).max(MAX_RENDEZVOUS_RELAYS).optional(),
       /** TTL in seconds for federation announcements (default 300). */
       announceTtlSeconds: z.number().int().positive().optional(),
+      /** Compact issuer-to-service authorisation for agents without local policy files. */
+      issuerGrants: z.array(gatewayIssuerGrantSchema).max(MAX_ENTRY_AGENT_ISSUERS).optional(),
     })
     .strict()
     .optional(),
@@ -121,7 +149,7 @@ const latticeNodeConfigSchema = z.object({
         target: z.string().url(),     // e.g. http://127.0.0.1:9001
         port: z.number().int().positive().optional(), // gateway WS port (auto-assigned if omitted)
       }).strict(),
-    )
+    ).max(MAX_LOCAL_SERVICES)
     .optional(),
 
   tls: tlsSchema,
@@ -153,6 +181,20 @@ const latticeNodeConfigSchema = z.object({
 
 export type LatticeNodeYaml = z.infer<typeof latticeNodeConfigSchema>;
 export type UpstreamRelay = { label?: string; url: string };
+export interface GatewayIssuerGrant {
+  issuer_id: string;
+  public_key: string;
+  services: Array<{ address: string; actions: string[] }>;
+}
+
+/** Small, operator-authorised issuer roots; never a list of every agent key. */
+export function resolveEntryTrustedAgentIssuers(cfg: LatticeNodeYaml | null): AgentIssuerTrust[] {
+  return cfg?.agentTrust?.issuers ?? [];
+}
+
+export function resolveGatewayIssuerGrants(cfg: LatticeNodeYaml | null): GatewayIssuerGrant[] {
+  return cfg?.gateway?.issuerGrants ?? [];
+}
 export type NodeChainConfig = { rpcUrl: string; contractAddress: string };
 
 export function nodeConfigPath(): string {

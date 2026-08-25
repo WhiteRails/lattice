@@ -24,6 +24,8 @@ const server = http.createServer((req, res) => {
   });
 });
 
-server.listen(PORT, '127.0.0.1', () => {
-  console.log(`lp://echo.lattice backend listening on http://127.0.0.1:${PORT}`);
+const BIND_HOST = process.env.LATTICE_SERVICE_BIND_HOST ?? '127.0.0.1';
+
+server.listen(PORT, BIND_HOST, () => {
+  console.log(`lp://echo.lattice backend listening on http://${BIND_HOST}:${PORT}`);
 });

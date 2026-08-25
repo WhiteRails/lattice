@@ -1,0 +1,21 @@
+[Unit]
+Description=Lattice native local daemon
+After=network.target
+
+[Service]
+Type=simple
+User=lattice
+Group=lattice
+RuntimeDirectory=lattice
+RuntimeDirectoryMode=0750
+ExecStart=/usr/local/bin/latticed --config /etc/lattice/latticed.conf
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/run/lattice
+
+[Install]
+WantedBy=multi-user.target

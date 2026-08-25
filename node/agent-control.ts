@@ -1,5 +1,25 @@
 import { EventEmitter } from 'events';
 import { ChildProcess } from 'child_process';
+import { BoundedTtlCache } from './bounded-ttl-cache';
+
+const DEFAULT_MAX_CONTROLLED_AGENTS = 8_192;
+const DEFAULT_PENDING_PAUSE_TTL_MS = 60_000;
+const DEFAULT_KILL_GRACE_MS = 5_000;
+
+export interface AgentControlBusOptions {
+  maxAgents?: number;
+  maxPendingPauses?: number;
+  pendingPauseTtlMs?: number;
+  killGraceMs?: number;
+}
+
+function boundedOption(value: number | undefined, fallback: number, min: number, max: number, name: string): number {
+  const resolved = value ?? fallback;
+  if (!Number.isSafeInteger(resolved) || resolved < min || resolved > max) {
+    throw new Error(`${name} must be between ${min} and ${max}`);
+  }
+  return resolved;
+}
 
 /**
  * AgentControlBus: module-level singleton EventEmitter that bridges
@@ -9,18 +29,51 @@ import { ChildProcess } from 'child_process';
  * For testnet (in-process topology). Production multi-process
  * deployments should extend this with a Unix domain socket transport.
  */
-class AgentControlBus extends EventEmitter {
+export class AgentControlBus extends EventEmitter {
   // Map of registered agent processes
-  private agents = new Map<string, ChildProcess>();
-  // Queue for pause events that arrive before agent registration
-  private pendingPause = new Map<string, true>();
+  private readonly agents = new Map<string, ChildProcess>();
+  // Queue for pause events that arrive before agent registration. This only
+  // bridges a short startup race: it is not durable policy state.
+  private readonly pendingPause: BoundedTtlCache<string, true>;
   // Kill timers tracked to prevent leaks
-  private killTimers = new Map<string, NodeJS.Timeout>();
+  private readonly killTimers = new Map<string, NodeJS.Timeout>();
+  private readonly maxAgents: number;
+  private readonly pendingPauseTtlMs: number;
+  private readonly killGraceMs: number;
+
+  constructor(options: AgentControlBusOptions = {}) {
+    super();
+    this.maxAgents = boundedOption(options.maxAgents, DEFAULT_MAX_CONTROLLED_AGENTS, 1, 65_536, 'maxAgents');
+    const maxPendingPauses = boundedOption(options.maxPendingPauses, this.maxAgents, 1, 65_536, 'maxPendingPauses');
+    this.pendingPauseTtlMs = boundedOption(options.pendingPauseTtlMs, DEFAULT_PENDING_PAUSE_TTL_MS, 1, 300_000, 'pendingPauseTtlMs');
+    this.killGraceMs = boundedOption(options.killGraceMs, DEFAULT_KILL_GRACE_MS, 1, 60_000, 'killGraceMs');
+    this.pendingPause = new BoundedTtlCache(maxPendingPauses);
+  }
+
+  snapshot(): { activeAgents: number; pendingPauses: number; pendingKills: number; maxAgents: number } {
+    return {
+      activeAgents: this.agents.size,
+      pendingPauses: this.pendingPause.size,
+      pendingKills: this.killTimers.size,
+      maxAgents: this.maxAgents,
+    };
+  }
 
   registerAgent(agentName: string, child: ChildProcess): void {
+    const existing = this.agents.get(agentName);
+    if (existing && existing !== child) {
+      try { child.kill('SIGTERM'); } catch {}
+      throw new Error(`Agent '${agentName}' is already registered`);
+    }
+    if (!existing && this.agents.size >= this.maxAgents) {
+      // The child was already spawned by the runner. Stop it rather than
+      // leaving an untracked process outside the bounded control plane.
+      try { child.kill('SIGTERM'); } catch {}
+      throw new Error(`Agent control capacity exhausted (${this.maxAgents})`);
+    }
     this.agents.set(agentName, child);
     // Drain pending pause queue
-    if (this.pendingPause.has(agentName)) {
+    if (this.pendingPause.get(agentName)) {
       this.pendingPause.delete(agentName);
       this.executeKill(agentName, child);
     }
@@ -39,7 +92,7 @@ class AgentControlBus extends EventEmitter {
       this.executeKill(agentName, child);
     } else {
       // Queue for when agent registers (handles startup race condition)
-      this.pendingPause.set(agentName, true);
+      this.pendingPause.set(agentName, true, this.pendingPauseTtlMs);
     }
   }
 
@@ -70,7 +123,7 @@ class AgentControlBus extends EventEmitter {
         }));
         try { child.kill('SIGKILL'); } catch {}
       }
-    }, 5000);
+    }, this.killGraceMs);
     killTimer.unref();
     this.killTimers.set(agentName, killTimer);
 

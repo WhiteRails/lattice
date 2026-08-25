@@ -23,8 +23,10 @@ import {
 } from './routing-cache';
 import { LOCAL_FALLBACK_WS_REGISTRY } from './local-relay-registry';
 import { getOrCreateOverlayKeyPair, loadCA } from './state';
-import { fetchFederationRoutes } from './federation-registry';
+import { fetchFederationRoute } from './federation-registry';
 import { isSelfAuthAddress, pubkeyFromSelfAuthFqdn, deriveSelfAuthAddress } from './self-auth';
+import { federationReplicaUrls } from './rendezvous';
+import { BoundedTtlCache } from './bounded-ttl-cache';
 
 export class LpRoutingNotFoundError extends Error {
   constructor(msg: string) {
@@ -43,6 +45,48 @@ export interface ResolvedGatewayRoute {
   serviceCertHash: string;
 }
 
+interface ChainNamespaceRecord {
+  ownerIssuerId: string;
+  serviceCertHash: string;
+  metadataHash: string;
+  active: boolean;
+  namespaceAdmin: string;
+  publicAccess: boolean;
+  credentialMask: number;
+  minAssuranceLevel: number;
+}
+
+export interface ResolverCacheOptions {
+  chainTtlMs?: number;
+  chainMaxEntries?: number;
+}
+
+const DEFAULT_CHAIN_CACHE_TTL_MS = 30_000;
+const DEFAULT_CHAIN_CACHE_MAX_ENTRIES = 10_000;
+const FEDERATION_CACHE_MAX_ENTRIES = 10_000;
+const FEDERATION_NEGATIVE_CACHE_TTL_MS = 5_000;
+const FEDERATION_MAX_CACHE_TTL_MS = 300_000;
+
+/** Bounds RPC load for on-chain namespace/node reads in a single cell. */
+export function resolverCacheOptionsFromEnv(env: NodeJS.ProcessEnv = process.env): Required<ResolverCacheOptions> {
+  return {
+    chainTtlMs: boundedResolverCacheValue(
+      env.LATTICE_CHAIN_CACHE_TTL_MS, DEFAULT_CHAIN_CACHE_TTL_MS, 1_000, 300_000, 'LATTICE_CHAIN_CACHE_TTL_MS',
+    ),
+    chainMaxEntries: boundedResolverCacheValue(
+      env.LATTICE_CHAIN_CACHE_MAX_ENTRIES, DEFAULT_CHAIN_CACHE_MAX_ENTRIES, 32, 100_000, 'LATTICE_CHAIN_CACHE_MAX_ENTRIES',
+    ),
+  };
+}
+
+function boundedResolverCacheValue(raw: string | undefined, fallback: number, min: number, max: number, name: string): number {
+  if (raw === undefined || raw.trim() === '') return fallback;
+  if (!/^[0-9]+$/.test(raw.trim())) throw new Error(`${name} must be an integer`);
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value < min || value > max) throw new Error(`${name} must be between ${min} and ${max}`);
+  return value;
+}
+
 function isNamespaceUnknown(ns: {
   ownerIssuerId: string;
 }): boolean {
@@ -50,10 +94,32 @@ function isNamespaceUnknown(ns: {
 }
 
 export class LpGatewayResolver {
+  // Cache misses too: an invalid name must not query its registry replicas on
+  // every request. Federation remains only an online routing hint, so both the
+  // positive and negative entries are bounded and expire quickly.
+  private readonly federationCache = new BoundedTtlCache<string, RoutingPayload | null>(FEDERATION_CACHE_MAX_ENTRIES);
+  private readonly chainTtlMs: number;
+  private readonly chainNamespaceCache: BoundedTtlCache<string, ChainNamespaceRecord>;
+  private readonly chainNodeCache: BoundedTtlCache<string, string | null>;
   constructor(
     private readonly cfg: LatticeNodeYaml | null,
     private readonly chain: { rpcUrl: string; contractAddress: string } | null,
-  ) {}
+    cacheOptions: ResolverCacheOptions = resolverCacheOptionsFromEnv(),
+  ) {
+    const options = {
+      chainTtlMs: cacheOptions.chainTtlMs ?? DEFAULT_CHAIN_CACHE_TTL_MS,
+      chainMaxEntries: cacheOptions.chainMaxEntries ?? DEFAULT_CHAIN_CACHE_MAX_ENTRIES,
+    };
+    if (!Number.isSafeInteger(options.chainTtlMs) || options.chainTtlMs < 1_000 || options.chainTtlMs > 300_000) {
+      throw new Error('chainTtlMs must be between 1000 and 300000');
+    }
+    if (!Number.isSafeInteger(options.chainMaxEntries) || options.chainMaxEntries < 1 || options.chainMaxEntries > 100_000) {
+      throw new Error('chainMaxEntries must be between 1 and 100000');
+    }
+    this.chainTtlMs = options.chainTtlMs;
+    this.chainNamespaceCache = new BoundedTtlCache(options.chainMaxEntries);
+    this.chainNodeCache = new BoundedTtlCache(options.chainMaxEntries);
+  }
 
   /**
    * Poll configured federation registries for a route.
@@ -64,18 +130,26 @@ export class LpGatewayResolver {
     const urls = resolveFederationUrls(this.cfg);
     if (!urls.length) return null;
     const now = Date.now();
-    for (const url of urls) {
-      const resp = await fetchFederationRoutes(url, { overlaySecret: loadCA().overlaySecret });
-      if (!resp?.routes) continue;
-      const entry = resp.routes[fqdn];
+    const cached = this.federationCache.get(fqdn);
+    if (cached !== undefined) return cached;
+    // A name is replicated to a fixed small set of registry shards. Never
+    // fan out a cache miss to every global registry.
+    for (const url of federationReplicaUrls(urls, fqdn)) {
+      const entry = await fetchFederationRoute(url, fqdn, { overlaySecret: loadCA().overlaySecret });
       if (!entry) continue;
       // Skip expired entries
       if (new Date(entry.expiresAt).getTime() < now) continue;
       if (!entry.payload.gatewayEndpoints.length) continue;
       const payload = normalizeRoutingPayload(entry.payload);
       if (payload.fqdn !== fqdn) continue;
+      const expiresAtMs = new Date(entry.expiresAt).getTime();
+      if (!Number.isFinite(expiresAtMs) || expiresAtMs <= now) continue;
+      // Do not retain a remotely supplied hint longer than five minutes even
+      // when its advertised expiration is much farther away.
+      this.federationCache.set(fqdn, payload, Math.min(expiresAtMs - now, FEDERATION_MAX_CACHE_TTL_MS), now);
       return payload;
     }
+    this.federationCache.set(fqdn, null, FEDERATION_NEGATIVE_CACHE_TTL_MS, now);
     return null;
   }
 
@@ -86,9 +160,15 @@ export class LpGatewayResolver {
         const file = readRoutingCacheFile(this.cfg);
         return file?.latticeNodes[remoteLabel.trim()]?.overlayPubKeyB64;
       }
-      const rec = await chainGetLatticeNode(this.chain.rpcUrl, this.chain.contractAddress, remoteLabel.trim());
-      if (!rec?.active) return undefined;
-      return rec.overlayPubKeyB64;
+      const label = remoteLabel.trim();
+      const cached = this.chainNodeCache.get(label);
+      if (cached !== undefined) return cached ?? undefined;
+      const rec = await chainGetLatticeNode(this.chain.rpcUrl, this.chain.contractAddress, label);
+      const pubkey = rec?.active ? rec.overlayPubKeyB64 : null;
+      // Negative caching prevents a stream of invalid labels from becoming a
+      // stream of chain RPCs. It remains bounded and expires quickly.
+      this.chainNodeCache.set(label, pubkey, this.chainTtlMs);
+      return pubkey ?? undefined;
     } catch {
       return undefined;
     }
@@ -203,7 +283,11 @@ export class LpGatewayResolver {
       };
     }
 
-    const ns = await chainGetNamespace(this.chain.rpcUrl, this.chain.contractAddress, fqdn);
+    let ns = this.chainNamespaceCache.get(fqdn);
+    if (!ns) {
+      ns = await chainGetNamespace(this.chain.rpcUrl, this.chain.contractAddress, fqdn);
+      this.chainNamespaceCache.set(fqdn, ns, this.chainTtlMs);
+    }
     if (!ns.active || isNamespaceUnknown(ns)) {
       throw new LpRoutingNotFoundError(`Unknown or inactive Lattice namespace on-chain: ${fqdn}`);
     }

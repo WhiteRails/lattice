@@ -13,6 +13,21 @@ export interface SignedCert<T extends WhiteCertificate> {
   ca_cert_id: string;
 }
 
+export interface LatticeCAOptions {
+  /** Maximum locally retained certificates for revocation lookup. */
+  maxIssuedCerts?: number;
+}
+
+const DEFAULT_MAX_ISSUED_CERTS = 100_000;
+
+function boundedMaxIssuedCerts(value: number | undefined): number {
+  const resolved = value ?? DEFAULT_MAX_ISSUED_CERTS;
+  if (!Number.isSafeInteger(resolved) || resolved < 1 || resolved > 1_000_000) {
+    throw new Error('maxIssuedCerts must be between 1 and 1000000');
+  }
+  return resolved;
+}
+
 /**
  * LatticeCA — issues, tracks and revokes certificates for all Lattice actor types.
  *
@@ -22,11 +37,13 @@ export interface SignedCert<T extends WhiteCertificate> {
 export class LatticeCA {
   private readonly caKeyPair: KeyPair;
   private readonly caId: string;
-  private issuedCerts: Map<string, SignedCert<WhiteCertificate>> = new Map();
+  private readonly issuedCerts = new Map<string, SignedCert<WhiteCertificate>>();
+  private readonly maxIssuedCerts: number;
 
-  constructor(caId: string, keyPair: KeyPair = generateKeyPair()) {
+  constructor(caId: string, keyPair: KeyPair = generateKeyPair(), options: LatticeCAOptions = {}) {
     this.caId = caId;
     this.caKeyPair = keyPair;
+    this.maxIssuedCerts = boundedMaxIssuedCerts(options.maxIssuedCerts);
   }
 
   get publicKey(): string {
@@ -45,13 +62,20 @@ export class LatticeCA {
     return { ...this.caKeyPair };
   }
 
-  static fromKeyPair(caId: string, keyPair: KeyPair): LatticeCA {
-    return new LatticeCA(caId, keyPair);
+  static fromKeyPair(caId: string, keyPair: KeyPair, options: LatticeCAOptions = {}): LatticeCA {
+    return new LatticeCA(caId, keyPair, options);
+  }
+
+  snapshot(): { issuedCerts: number; maxIssuedCerts: number } {
+    return { issuedCerts: this.issuedCerts.size, maxIssuedCerts: this.maxIssuedCerts };
   }
 
   // ─── Private helpers ──────────────────────────────────────────────────────
 
   private sign<T extends WhiteCertificate>(cert: T): SignedCert<T> {
+    if (!this.issuedCerts.has(cert.id) && this.issuedCerts.size >= this.maxIssuedCerts) {
+      throw new Error(`CA issuance capacity exhausted (${this.maxIssuedCerts})`);
+    }
     const ca_signature = signData(JSON.stringify(cert), this.caKeyPair.privateKey);
     const signed: SignedCert<T> = { cert, ca_signature, ca_cert_id: this.caId };
     this.issuedCerts.set(cert.id, signed as SignedCert<WhiteCertificate>);

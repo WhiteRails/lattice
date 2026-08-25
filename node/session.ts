@@ -8,10 +8,25 @@
  */
 
 import * as crypto from 'crypto';
+import { BoundedTtlCache } from './bounded-ttl-cache';
 
 export interface NodeKeyPair {
   publicKey: string;   // base64 X25519 public key (SPKI DER)
   privateKey: string;  // base64 X25519 private key (PKCS8 DER)
+}
+
+export const DEFAULT_SESSION_TTL_MS = 60 * 60 * 1000;
+export const DEFAULT_SESSION_MAX_ENTRIES = 8_192;
+
+export function sessionMaxEntriesFromEnv(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env.LATTICE_SESSION_MAX_ENTRIES;
+  if (raw === undefined || raw.trim() === '') return DEFAULT_SESSION_MAX_ENTRIES;
+  if (!/^[0-9]+$/.test(raw.trim())) throw new Error('LATTICE_SESSION_MAX_ENTRIES must be an integer');
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value < 32 || value > 65_536) {
+    throw new Error('LATTICE_SESSION_MAX_ENTRIES must be between 32 and 65536');
+  }
+  return value;
 }
 
 export function generateNodeKeyPair(): NodeKeyPair {
@@ -52,25 +67,33 @@ export function deriveSessionKey(myPrivateKeyB64: string, peerPublicKeyB64: stri
 }
 
 export class SessionManager {
-  private sessions = new Map<string, { key: Buffer; createdAt: number }>();
-  private ttlMs: number;
+  private readonly sessions: BoundedTtlCache<string, Buffer>;
+  private readonly ttlMs: number;
 
   constructor(
     private myNodeId: string,
     private myPrivateKey: string,
-    ttlMs = 60 * 60 * 1000, // 1 hour default
+    ttlMs = DEFAULT_SESSION_TTL_MS, // 1 hour default
+    private readonly maxSessions = DEFAULT_SESSION_MAX_ENTRIES,
   ) {
+    if (!Number.isSafeInteger(ttlMs) || ttlMs <= 0) throw new Error('Session TTL must be a positive integer');
+    if (!Number.isSafeInteger(maxSessions) || maxSessions < 1 || maxSessions > 65_536) {
+      throw new Error('Session cache capacity must be between 1 and 65536');
+    }
     this.ttlMs = ttlMs;
+    this.sessions = new BoundedTtlCache(maxSessions);
+  }
+
+  get cachedSessionCount(): number {
+    return this.sessions.size;
   }
 
   getSessionKey(peerId: string, peerPublicKey: string): Buffer {
-    const existing = this.sessions.get(peerId);
     const now = Date.now();
-    if (existing && now - existing.createdAt < this.ttlMs) {
-      return existing.key;
-    }
+    const existing = this.sessions.get(peerId, now);
+    if (existing) return existing;
     const key = deriveSessionKey(this.myPrivateKey, peerPublicKey);
-    this.sessions.set(peerId, { key, createdAt: now });
+    this.sessions.set(peerId, key, this.ttlMs, now);
     return key;
   }
 
@@ -79,8 +102,6 @@ export class SessionManager {
   }
 
   hasSession(peerId: string): boolean {
-    const existing = this.sessions.get(peerId);
-    if (!existing) return false;
-    return Date.now() - existing.createdAt < this.ttlMs;
+    return this.sessions.get(peerId) !== undefined;
   }
 }

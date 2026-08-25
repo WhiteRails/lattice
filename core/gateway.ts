@@ -33,15 +33,37 @@ export function toolCallSignaturePayload(params: {
   });
 }
 
+export interface LatticeGatewayOptions {
+  /** Maximum distinct agent certificates retained by this gateway shard. */
+  maxRegisteredAgents?: number;
+}
+
+const DEFAULT_MAX_REGISTERED_AGENTS = 100_000;
+
+function boundedMaxRegisteredAgents(value: number | undefined): number {
+  const resolved = value ?? DEFAULT_MAX_REGISTERED_AGENTS;
+  if (!Number.isSafeInteger(resolved) || resolved < 1 || resolved > 1_000_000) {
+    throw new Error('maxRegisteredAgents must be between 1 and 1000000');
+  }
+  return resolved;
+}
+
 export class LatticeGateway {
-  private registeredAgents: Map<string, AgentCert> = new Map();
+  private readonly registeredAgents = new Map<string, AgentCert>();
+  private readonly maxRegisteredAgents: number;
   private revocationNetwork?: RevocationNetwork;
   private pasTracker?: PowerAccumulationTracker;
   private policy?: WhitePolicy;
   private log?: LatticeLog;
   private registry?: LatticeRegistry;
 
-  constructor(public gatewayId: string, private gatewayPrivateKey: string) {}
+  constructor(public gatewayId: string, private gatewayPrivateKey: string, options: LatticeGatewayOptions = {}) {
+    this.maxRegisteredAgents = boundedMaxRegisteredAgents(options.maxRegisteredAgents);
+  }
+
+  snapshot(): { registeredAgents: number; maxRegisteredAgents: number } {
+    return { registeredAgents: this.registeredAgents.size, maxRegisteredAgents: this.maxRegisteredAgents };
+  }
 
   setRevocationNetwork(rn: RevocationNetwork) {
     this.revocationNetwork = rn;
@@ -73,6 +95,9 @@ export class LatticeGateway {
     const cert = signedCert.cert;
     if (!isCertValid(cert)) {
       throw new Error('Attempted to register an invalid or expired certificate');
+    }
+    if (!this.registeredAgents.has(cert.agent_id) && this.registeredAgents.size >= this.maxRegisteredAgents) {
+      throw new Error(`Gateway agent capacity exhausted (${this.maxRegisteredAgents})`);
     }
     this.registeredAgents.set(cert.agent_id, cert);
   }

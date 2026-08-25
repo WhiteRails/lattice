@@ -1,12 +1,13 @@
 import * as http from 'http';
 import * as crypto from 'crypto';
-import { WebSocket } from 'ws';
-import { OverlayMessage, parseOverlayMessage, signOverlayMessage } from './message';
-import { isRevoked, loadAgent, loadCA, getOrCreateOverlayKeyPair, normalizeAgentName } from './state';
+import { OverlayMessage, signOverlayMessage } from './message';
+import { isRevoked, loadAgentPublicIdentity, loadCA, getOrCreateOverlayKeyPair, normalizeAgentName } from './state';
 import { hashRequestBody, requestSignaturePayload, verifySignature } from '../core/identity';
-import { SessionManager } from './session';
+import { SessionManager, sessionMaxEntriesFromEnv } from './session';
 import chalk from 'chalk';
-import { NonceStore, getReplayWindowMs } from './nonce-store';
+import { getReplayWindowMs } from './nonce-store';
+import { replayStoreFromEnv, type ReplayStore } from './replay-store';
+import { entryReplayKey } from './replay-keys';
 import { chooseOverlaySignKey, verifyIncomingOverlayFromPeer } from './overlay-sign-key';
 import type { LatticeNodeYaml, NodeChainConfig, UpstreamRelay } from './node-config';
 import {
@@ -15,16 +16,23 @@ import {
   normalizeUpstreamRelays,
   parseBindHostPort,
   requireDistributedNodeId,
+  resolveEntryTrustedAgentIssuers,
   resolveNodeChainConfig,
 } from './node-config';
 import { LpGatewayResolver } from './lp-resolver';
 import { bindHttpListen, wsTlsClientOptions } from './ws-stack';
 import { validateDistributedPeer } from './peer-identity';
-
-const nonceStore = new NonceStore();
+import { OverlayRpcPool, overlayRpcPoolOptionsFromEnv } from './overlay-rpc';
+import { OverlayIngressLimiter, overlayIngressLimitsFromEnv } from './overlay-ingress';
+import { serveCellStatus } from './node-metrics';
+import type { AgentIssuerTrust } from '../core/issuer-trust';
+import { IssuerCertificateCache } from './issuer-certificate-cache';
 
 export const DEFAULT_ENTRY_PORT = 7777;
-const MAX_AGENT_REQUEST_BYTES = 1_048_576;
+const MAX_AGENT_REQUEST_BYTES = 512 * 1024;
+const MAX_OVERLAY_HEADER_BYTES = 32 * 1024;
+const MIN_ENTRY_REQUEST_RESERVATION_BYTES = 64 * 1024;
+const MAX_PORTABLE_AGENT_CERTIFICATE_HEADER_BYTES = 16 * 1024;
 
 export interface EntryNodeOptions {
   port?: number;
@@ -32,6 +40,7 @@ export interface EntryNodeOptions {
   /** Fallback when no ~/.lattice/node.yaml */
   relayUrls?: string[];
   nodeConfig?: LatticeNodeYaml | null;
+  replayStore?: ReplayStore;
 }
 
 export class EntryNode {
@@ -44,15 +53,31 @@ export class EntryNode {
   private resolver: LpGatewayResolver;
   private chain: NodeChainConfig | null;
   private nodeLabel: string | undefined;
+  private relayPool: OverlayRpcPool;
+  private replayStore: ReplayStore;
+  private readonly ownsReplayStore: boolean;
+  private readonly ingress = new OverlayIngressLimiter(overlayIngressLimitsFromEnv());
+  private readonly trustedAgentIssuers: ReadonlyMap<string, AgentIssuerTrust>;
+  private readonly issuerCertificateCache = new IssuerCertificateCache();
+  private relayFailures = 0;
 
   constructor(opts: EntryNodeOptions = {}) {
+    this.ownsReplayStore = !opts.replayStore;
+    this.replayStore = opts.replayStore ?? replayStoreFromEnv();
     const cfgFromDisk = opts.nodeConfig !== undefined ? opts.nodeConfig : loadNodeConfig();
     this.cfg = cfgFromDisk;
+    const configuredIssuers = new Map(resolveEntryTrustedAgentIssuers(cfgFromDisk).map(issuer => [issuer.issuer_id, issuer]));
+    // The cell's own CA is already an operator-approved issuer. This permits
+    // portable identities across its Entry replicas without copying one agent
+    // file to every process; an externally supplied config cannot override it.
+    const localCa = loadCA();
+    configuredIssuers.set(localCa.caId, { issuer_id: localCa.caId, public_key: localCa.publicKey });
+    this.trustedAgentIssuers = configuredIssuers;
     this.distributedMesh = distributedMeshEffective(cfgFromDisk);
     this.nodeLabel = requireDistributedNodeId(cfgFromDisk, this.distributedMesh);
     const kp = getOrCreateOverlayKeyPair();
     this.myPublicKey = kp.publicKey;
-    this.sessionMgr = new SessionManager('entry', kp.privateKey);
+    this.sessionMgr = new SessionManager('entry', kp.privateKey, undefined, sessionMaxEntriesFromEnv());
 
     this.relayTargets = opts.relayUrls?.length
       ? normalizeUpstreamRelays({ ...(cfgFromDisk ?? {}), upstreamRelays: opts.relayUrls }, opts.relayUrls)
@@ -75,6 +100,7 @@ export class EntryNode {
 
     this.chain = resolveNodeChainConfig(cfgFromDisk);
     this.resolver = new LpGatewayResolver(cfgFromDisk ?? null, this.chain);
+    this.relayPool = new OverlayRpcPool({ ...overlayRpcPoolOptionsFromEnv(), wsOptions: wsTlsClientOptions(cfgFromDisk) });
 
     const bound = bindHttpListen(
       (req, res) => this.handleHttp(req, res),
@@ -101,10 +127,20 @@ export class EntryNode {
   }
 
   close(): void {
+    this.relayPool.close();
     this.httpClose();
+    if (this.ownsReplayStore) (this.replayStore as { close?: () => void }).close?.();
   }
 
   private handleHttp(req: http.IncomingMessage, res: http.ServerResponse) {
+    if (serveCellStatus(req, res, 'entry', () => ({
+      ...this.ingress.snapshot(),
+      outboundInFlight: this.relayPool.inFlight(),
+      failures: this.relayFailures,
+      issuerCertificateCacheEntries: this.issuerCertificateCache.snapshot().entries,
+      issuerCertificateCacheHits: this.issuerCertificateCache.snapshot().hits,
+      issuerCertificateCacheMisses: this.issuerCertificateCache.snapshot().misses,
+    }))) return;
     let agent: string;
     try {
       agent = this.agentName(req);
@@ -113,9 +149,22 @@ export class EntryNode {
       res.end(JSON.stringify({ error: 'Invalid Lattice agent identity' }));
       return;
     }
+    const reservationBytes = entryReservationBytes(req);
+    if (!this.ingress.tryAcquire(req.socket, reservationBytes)) {
+      res.writeHead(503, { 'content-type': 'application/json', 'retry-after': '1' });
+      res.end(JSON.stringify({ error: 'ENTRY_BACKPRESSURE' }));
+      return;
+    }
+    let released = false;
+    const release = () => {
+      if (released) return;
+      released = true;
+      this.ingress.release(req.socket, reservationBytes);
+    };
     if (isRevoked(agent)) {
       res.writeHead(403);
       res.end(JSON.stringify({ error: 'Agent revoked' }));
+      release();
       return;
     }
 
@@ -129,11 +178,11 @@ export class EntryNode {
       bodyBytes += d.length;
       if (bodyBytes > MAX_AGENT_REQUEST_BYTES) {
         rejected = true;
-        req.destroy();
         if (!res.headersSent) {
           res.writeHead(413, { 'content-type': 'application/json' });
           res.end(JSON.stringify({ error: 'Request body too large' }));
         }
+        release();
         return;
       }
       chunks.push(d);
@@ -143,45 +192,51 @@ export class EntryNode {
         res.writeHead(400, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ error: 'Invalid request body' }));
       }
+      release();
     });
     req.on('end', () => {
       if (rejected) return;
       const rawBody = Buffer.concat(chunks);
-      const identity = this.verifyAgentRequest(req, agent, rawBody);
-      if (!identity.ok) {
-        res.writeHead(identity.status, { 'content-type': 'application/json' });
-        res.end(JSON.stringify({ error: identity.error }));
-        return;
-      }
-
-      const body = rawBody.toString('base64');
-
-      const msg: OverlayMessage = {
-          id: crypto.randomBytes(8).toString('hex'),
-          type: 'request',
-          source: agent,
-          destination: resource,
-          payload: {
-            method: req.method,
-            url: req.url,
-            headers: overlayHeaders(req.headers),
-            body,
-            agent_proof: identity.proof,
-          },
-          trace: ['entry'],
-          source_pubkey: this.myPublicKey,
-          source_node_label: this.nodeLabel,
-          source_node_role: 'entry',
-        };
-
-      console.log(chalk.cyan('[EntryNode]') + ` Routing ${req.method} ${req.url} -> ${resource} via Relay`);
-      void this.forwardToRelayWithFailover(msg, res, 0).catch(() => {
+      void this.handleCompletedRequest(req, res, agent, resource, rawBody).catch(() => {
         if (!res.headersSent) {
-          res.writeHead(502, { 'content-type': 'application/json' });
-          res.end(JSON.stringify({ error: 'Overlay forwarding failed' }));
+          res.writeHead(503, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Entry request verification unavailable' }));
         }
-      });
+      }).finally(release);
     });
+  }
+
+  private async handleCompletedRequest(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    agent: string,
+    resource: string,
+    rawBody: Buffer,
+  ): Promise<void> {
+    const identity = await this.verifyAgentRequest(req, agent, rawBody);
+    if (!identity.ok) {
+      res.writeHead(identity.status, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: identity.error }));
+      return;
+    }
+    const msg: OverlayMessage = {
+      id: crypto.randomBytes(8).toString('hex'),
+      type: 'request',
+      source: agent,
+      destination: resource,
+      payload: {
+        method: req.method,
+        url: req.url,
+        headers: overlayHeaders(req.headers),
+        body: rawBody.toString('base64'),
+        agent_proof: identity.proof,
+      },
+      trace: ['entry'],
+      source_pubkey: this.myPublicKey,
+      source_node_label: this.nodeLabel,
+      source_node_role: 'entry',
+    };
+    await this.forwardToRelayWithFailover(msg, res, 0);
   }
 
   private async relayPubkeyFor(target: UpstreamRelay): Promise<string | undefined> {
@@ -210,29 +265,14 @@ export class EntryNode {
         relayPubkey,
       );
       signedMsg = signOverlayMessage(msg, signKey);
-    } catch (e: any) {
-      console.error(chalk.red('[EntryNode]') + ` Relay ${url} identity failed: ${e?.message ?? e}`);
+    } catch {
+      this.relayFailures++;
       await this.forwardToRelayWithFailover(msg, res, urlIndex + 1);
       return;
     }
 
-    const tlsOpts = wsTlsClientOptions(this.cfg);
-    const ws = new WebSocket(url, undefined, { rejectUnauthorized: true, ...tlsOpts });
-
-    ws.on('open', () => {
-      ws.send(JSON.stringify(signedMsg));
-    });
-
-    ws.on('message', (data) => {
-      void (async () => {
-      const response = parseOverlayMessage(data.toString());
-      if (!response) {
-        res.writeHead(502, { 'content-type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Invalid overlay response' }));
-        ws.close();
-        return;
-      }
-
+    try {
+      const response = await this.relayPool.request(url, signedMsg);
       const peer = await validateDistributedPeer({
         distributedMesh: this.distributedMesh,
         cfg: this.cfg,
@@ -242,10 +282,7 @@ export class EntryNode {
         expectedLabel: target.label,
       });
       if (!peer.ok) {
-        res.writeHead(502, { 'content-type': 'application/json' });
-        res.end(JSON.stringify({ error: peer.error }));
-        ws.close();
-        return;
+        throw new Error(peer.error);
       }
 
       const ok = verifyIncomingOverlayFromPeer({
@@ -256,10 +293,7 @@ export class EntryNode {
         msg: response,
       });
       if (!ok) {
-        res.writeHead(502, { 'content-type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Unauthenticated overlay response' }));
-        ws.close();
-        return;
+        throw new Error('Unauthenticated overlay response');
       }
 
       if (response.id === msg.id && response.type === 'response') {
@@ -269,22 +303,13 @@ export class EntryNode {
         } else {
           res.end();
         }
-        ws.close();
+        return;
       }
-      })().catch(() => {
-        if (!res.headersSent) {
-          res.writeHead(502, { 'content-type': 'application/json' });
-          res.end(JSON.stringify({ error: 'Invalid overlay response' }));
-        }
-        ws.close();
-      });
-    });
-
-    ws.on('error', (err) => {
-      console.error(chalk.red('[EntryNode]') + ` Relay ${url} failed: ${err.message}`);
-      ws.close();
+      throw new Error('Unexpected overlay response');
+    } catch {
+      this.relayFailures++;
       void this.forwardToRelayWithFailover(msg, res, urlIndex + 1);
-    });
+    }
   }
 
   private agentName(req: http.IncomingMessage): string {
@@ -292,16 +317,24 @@ export class EntryNode {
     return normalizeAgentName(value);
   }
 
-  private verifyAgentRequest(
+  private async verifyAgentRequest(
     req: http.IncomingMessage,
     agent: string,
     body: Buffer,
-  ): { ok: true; proof: NonNullable<OverlayMessage['payload']['agent_proof']> } | { ok: false; status: number; error: string } {
-    let agentState;
+  ): Promise<{ ok: true; proof: NonNullable<OverlayMessage['payload']['agent_proof']> } | { ok: false; status: number; error: string }> {
+    let publicKey: string | undefined;
+    let certificate: unknown;
     try {
-      agentState = loadAgent(agent);
+      const agentState = loadAgentPublicIdentity(agent);
+      publicKey = agentState.publicKey;
+      certificate = agentState.signedCert;
     } catch {
-      return { ok: false, status: 401, error: 'Unknown agent identity' };
+      certificate = portableAgentCertificate(req);
+      const issuerId = signedCertificateIssuerId(certificate);
+      const issuer = issuerId ? this.trustedAgentIssuers.get(issuerId) : undefined;
+      const cert = issuer ? this.issuerCertificateCache.verify(certificate, issuer) : null;
+      if (!cert) return { ok: false, status: 401, error: 'Unknown agent identity' };
+      publicKey = cert.public_key;
     }
 
     const signature = singleHeader(req.headers['x-lattice-signature']);
@@ -329,12 +362,19 @@ export class EntryNode {
       bodyHash: hashRequestBody(body),
     });
 
-    const publicKey = agentState.publicKey ?? agentState.cert?.public_key;
     if (!publicKey || !verifySignature(payload, signature, publicKey)) {
       return { ok: false, status: 401, error: 'Invalid Lattice agent signature' };
     }
-    const compositeKey = `${agent}:${timestamp}:${nonce}`;
-    if (!nonceStore.add(compositeKey, getReplayWindowMs())) {
+    // Entry replicas share this namespace, but Gateway's independent
+    // end-to-end verification of the same request must not look like a replay.
+    const compositeKey = entryReplayKey(agent, timestamp, nonce);
+    let nonceAccepted: boolean;
+    try {
+      nonceAccepted = await this.replayStore.claim(compositeKey, getReplayWindowMs());
+    } catch {
+      return { ok: false, status: 503, error: 'REPLAY_STORE_UNAVAILABLE' };
+    }
+    if (!nonceAccepted) {
       return { ok: false, status: 401, error: 'REPLAY_DETECTED' };
     }
 
@@ -348,9 +388,30 @@ export class EntryNode {
         nonce,
         body_hash: hashRequestBody(body),
         host: singleHeader(req.headers.host) ?? '',
+        certificate,
       },
     };
   }
+}
+
+function portableAgentCertificate(req: http.IncomingMessage): unknown | undefined {
+  const header = singleHeader(req.headers['x-lattice-agent-certificate']);
+  if (!header || Buffer.byteLength(header, 'utf8') > MAX_PORTABLE_AGENT_CERTIFICATE_HEADER_BYTES || !/^[A-Za-z0-9_-]+$/.test(header)) {
+    return undefined;
+  }
+  try {
+    const decoded = Buffer.from(header, 'base64url');
+    if (decoded.length === 0 || decoded.length > MAX_PORTABLE_AGENT_CERTIFICATE_HEADER_BYTES) return undefined;
+    return JSON.parse(decoded.toString('utf8'));
+  } catch {
+    return undefined;
+  }
+}
+
+function signedCertificateIssuerId(signed: unknown): string | undefined {
+  if (!signed || typeof signed !== 'object') return undefined;
+  const issuer = (signed as { ca_cert_id?: unknown }).ca_cert_id;
+  return typeof issuer === 'string' ? issuer : undefined;
 }
 
 function singleHeader(value: string | string[] | undefined): string | undefined {
@@ -359,15 +420,35 @@ function singleHeader(value: string | string[] | undefined): string | undefined 
 
 function overlayHeaders(headers: http.IncomingHttpHeaders): Record<string, string | string[] | number> {
   const result: Record<string, string | string[] | number> = {};
+  let totalBytes = 0;
   for (const [name, value] of Object.entries(headers)) {
     if (value === undefined) continue;
     if (!/^[a-z0-9-]{1,128}$/i.test(name)) continue;
     if (Array.isArray(value)) {
       const filtered = value.filter(v => typeof v === 'string' && !/[\r\n]/.test(v)).slice(0, 16);
-      if (filtered.length) result[name] = filtered;
+      const bytes = Buffer.byteLength(name, 'utf8') + filtered.reduce((sum, item) => sum + Buffer.byteLength(item, 'utf8'), 0);
+      if (filtered.length && totalBytes + bytes <= MAX_OVERLAY_HEADER_BYTES) {
+        result[name] = filtered;
+        totalBytes += bytes;
+      }
     } else if (!/[\r\n]/.test(value)) {
-      result[name] = value;
+      const bytes = Buffer.byteLength(name, 'utf8') + Buffer.byteLength(value, 'utf8');
+      if (totalBytes + bytes <= MAX_OVERLAY_HEADER_BYTES) {
+        result[name] = value;
+        totalBytes += bytes;
+      }
     }
   }
   return result;
+}
+
+function entryReservationBytes(req: http.IncomingMessage): number {
+  const contentLength = Number(singleHeader(req.headers['content-length']));
+  if (!Number.isSafeInteger(contentLength) || contentLength < 0 || contentLength > MAX_AGENT_REQUEST_BYTES) {
+    return Math.ceil(MAX_AGENT_REQUEST_BYTES * 4 / 3) + MAX_OVERLAY_HEADER_BYTES;
+  }
+  return Math.max(
+    MIN_ENTRY_REQUEST_RESERVATION_BYTES,
+    Math.ceil(contentLength * 4 / 3) + MAX_OVERLAY_HEADER_BYTES,
+  );
 }

@@ -7,12 +7,41 @@ interface PASStateFile {
   scores: Record<string, { score: number; factors: PASScore['factors']; updated_at: string; hmac: string }>;
 }
 
+export interface PowerAccumulationTrackerOptions {
+  maxEntries?: number;
+  maxStateFileBytes?: number;
+}
+
+const DEFAULT_MAX_ENTRIES = 8_192;
+const DEFAULT_MAX_STATE_FILE_BYTES = 8 * 1024 * 1024;
+
+function boundedOption(value: number | undefined, fallback: number, min: number, max: number, name: string): number {
+  const resolved = value ?? fallback;
+  if (!Number.isSafeInteger(resolved) || resolved < min || resolved > max) {
+    throw new Error(`${name} must be between ${min} and ${max}`);
+  }
+  return resolved;
+}
+
 export class PowerAccumulationTracker {
-  private scores: Map<string, PASScore> = new Map();
+  private readonly scores = new Map<string, PASScore>();
   private threshold: number = 100;
   private savePath: string | null = null;
   private hmacKey: string | null = null;
   private saveTimer: NodeJS.Timeout | null = null;
+  private readonly maxEntries: number;
+  private readonly maxStateFileBytes: number;
+
+  constructor(options: PowerAccumulationTrackerOptions = {}) {
+    this.maxEntries = boundedOption(options.maxEntries, DEFAULT_MAX_ENTRIES, 1, 65_536, 'maxEntries');
+    this.maxStateFileBytes = boundedOption(
+      options.maxStateFileBytes, DEFAULT_MAX_STATE_FILE_BYTES, 1_024, 64 * 1024 * 1024, 'maxStateFileBytes',
+    );
+  }
+
+  snapshot(): { entries: number; maxEntries: number } {
+    return { entries: this.scores.size, maxEntries: this.maxEntries };
+  }
 
   /**
    * Configures the auto-save path and HMAC key.
@@ -26,15 +55,25 @@ export class PowerAccumulationTracker {
    * Initializes or gets the PAS for an agent.
    */
   getScore(agent_id: string): PASScore {
-    let score = this.scores.get(agent_id);
-    if (!score) {
-      score = PASScoreSchema.parse({
+    const existing = this.scores.get(agent_id);
+    if (existing) {
+      // Keep active agents warm without allowing cardinality growth.
+      this.scores.delete(agent_id);
+      this.scores.set(agent_id, existing);
+      return existing;
+    }
+    if (this.scores.size >= this.maxEntries) {
+      // Evicting a high PAS score would let pressure reset its risk state.
+      // Capacity therefore rejects the new identity rather than weakening the
+      // policy decision that the tracker is meant to protect.
+      throw new Error(`PAS state capacity exhausted (${this.maxEntries})`);
+    }
+    const score = PASScoreSchema.parse({
         score: 0,
         factors: {},
         last_updated: new Date().toISOString(),
-      });
-      this.scores.set(agent_id, score);
-    }
+    });
+    this.scores.set(agent_id, score);
     return score;
   }
 
@@ -104,9 +143,24 @@ export class PowerAccumulationTracker {
    * Entries that fail verification are skipped with a warning.
    */
   load(filePath: string, hmacKey: string): void {
+    const stat = fs.statSync(filePath);
+    if (!Number.isSafeInteger(stat.size) || stat.size < 0 || stat.size > this.maxStateFileBytes) {
+      throw new Error(`PAS state exceeds ${this.maxStateFileBytes} bytes`);
+    }
     const raw = fs.readFileSync(filePath, 'utf-8');
-    const data: PASStateFile = JSON.parse(raw);
-    for (const [agentId, entry] of Object.entries(data.scores)) {
+    const data = JSON.parse(raw) as PASStateFile;
+    if (!data || data.version !== 1 || !data.scores || Array.isArray(data.scores) || typeof data.scores !== 'object') {
+      throw new Error('Invalid PAS state file');
+    }
+    const entries = Object.entries(data.scores);
+    if (entries.length > this.maxEntries) {
+      throw new Error(`PAS state has more than ${this.maxEntries} entries`);
+    }
+    const newEntries = entries.reduce((total, [agentId]) => total + (this.scores.has(agentId) ? 0 : 1), 0);
+    if (this.scores.size + newEntries > this.maxEntries) {
+      throw new Error(`PAS state capacity exhausted (${this.maxEntries})`);
+    }
+    for (const [agentId, entry] of entries) {
       const payload = JSON.stringify({ agentId, score: entry.score, factors: entry.factors });
       const expected = createHmac('sha256', hmacKey).update(payload).digest('hex');
       const hmacBuf = Buffer.from(entry.hmac, 'hex');

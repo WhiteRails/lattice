@@ -1,12 +1,26 @@
 {
   "name": "lattice-protocol-mvp",
   "version": "0.1.0",
-  "description": "Lattice Protocol MVP implementation",
+  "description": "Lattice controlled overlay protocol for autonomous agents",
   "main": "dist/index.js",
+  "bin": {
+    "latticectl": "bin/latticectl.js"
+  },
+  "files": [
+    "bin",
+    "dist",
+    "README.md"
+  ],
   "scripts": {
     "test": "vitest run",
     "build": "tsc",
+    "build:native": "cmake -S daemon -B build/daemon && cmake --build build/daemon",
+    "test:rust": "cargo test --manifest-path clients/rust/Cargo.toml",
+    "test:native": "npm run build:native && LATTICED_BIN=\"$PWD/build/daemon/latticed\" cargo test --manifest-path clients/rust/Cargo.toml",
+    "test:replay-redis": "LATTICE_REDIS_INTEGRATION=1 vitest run tests/redis-replay.integration.test.ts",
     "lattice": "ts-node cli/lattice.ts",
+    "package:bundle": "sh scripts/build-release-bundle.sh",
+    "prepack": "node scripts/clean-dist.js && npm run build",
     "services:echo": "ts-node services/echo/index.ts",
     "services:github": "ts-node services/github-proxy/index.ts",
     "services:gmail": "ts-node services/gmail-proxy/index.ts",

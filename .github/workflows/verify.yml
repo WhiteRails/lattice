@@ -1,0 +1,43 @@
+name: Verify
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 20
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # stable, resolved 2026-08-24
+        with:
+          components: rustfmt
+
+      - name: Install Node dependencies
+        run: npm ci
+
+      - name: Verify TypeScript
+        run: npm run build
+
+      - name: Verify TypeScript tests
+        run: npm test
+
+      - name: Verify dependency audit
+        run: npm audit --audit-level=high
+
+      - name: Verify C daemon and Rust client interoperability
+        run: npm run test:native
+
+      - name: Verify Rust formatting
+        run: cargo fmt --manifest-path clients/rust/Cargo.toml --check

@@ -9,8 +9,36 @@ function compositeKey(target_type: string, target_hash: string): string {
   return `${target_type}::${target_hash}`;
 }
 
+export interface RevocationNetworkOptions {
+  maxEntries?: number;
+  pageSize?: number;
+}
+
+const DEFAULT_MAX_ENTRIES = 100_000;
+const DEFAULT_PAGE_SIZE = 1_000;
+
+function boundedOption(value: number | undefined, fallback: number, min: number, max: number, name: string): number {
+  const resolved = value ?? fallback;
+  if (!Number.isSafeInteger(resolved) || resolved < min || resolved > max) {
+    throw new Error(`${name} must be between ${min} and ${max}`);
+  }
+  return resolved;
+}
+
 export class RevocationNetwork {
-  private revocations: Map<string, RevocationRecord> = new Map();
+  private readonly revocations = new Map<string, RevocationRecord>();
+  private readonly targetHashes = new Set<string>();
+  private readonly maxEntries: number;
+  private readonly pageSize: number;
+
+  constructor(options: RevocationNetworkOptions = {}) {
+    this.maxEntries = boundedOption(options.maxEntries, DEFAULT_MAX_ENTRIES, 1, 1_000_000, 'maxEntries');
+    this.pageSize = boundedOption(options.pageSize, DEFAULT_PAGE_SIZE, 1, 10_000, 'pageSize');
+  }
+
+  snapshot(): { entries: number; maxEntries: number } {
+    return { entries: this.revocations.size, maxEntries: this.maxEntries };
+  }
 
   /**
    * Publishes a revocation record (certificate, signing key, or other target).
@@ -44,7 +72,14 @@ export class RevocationNetwork {
 
     const signature = signData(JSON.stringify(record), params.issuerPrivateKey);
     const finalRecord = RevocationRecordSchema.parse({ ...record, signature });
-    this.revocations.set(compositeKey(params.target_type, params.target_hash), finalRecord);
+    const key = compositeKey(params.target_type, params.target_hash);
+    if (!this.revocations.has(key) && this.revocations.size >= this.maxEntries) {
+      // A valid revocation is never evicted to make room. The publisher must
+      // select another shard rather than weakening freshness decisions.
+      throw new Error(`Revocation shard capacity exhausted (${this.maxEntries})`);
+    }
+    this.revocations.set(key, finalRecord);
+    this.targetHashes.add(params.target_hash);
     return finalRecord;
   }
 
@@ -52,19 +87,25 @@ export class RevocationNetwork {
     return this.revocations.has(compositeKey(target_type, target_hash));
   }
 
-  /** Back-compat: treat hash as unique key across types (last write wins if types collide). */
-  isRevokedLegacy(target_hash: string): boolean {
-    for (const k of this.revocations.keys()) {
-      if (k.endsWith(`::${target_hash}`)) return true;
-    }
-    return false;
+  /** Lookup by hash when the caller does not have the target type. */
+  isRevokedAnyTarget(target_hash: string): boolean {
+    return this.targetHashes.has(target_hash);
   }
 
   getRevocation(target_type: string, target_hash: string): RevocationRecord | undefined {
     return this.revocations.get(compositeKey(target_type, target_hash));
   }
-  listRevocations(): RevocationRecord[] {
-    return [...this.revocations.values()];
+  /** A shard page, never a global revocation dump. */
+  listRevocations(limit = this.pageSize): RevocationRecord[] {
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 10_000) {
+      throw new Error('limit must be between 1 and 10000');
+    }
+    const page: RevocationRecord[] = [];
+    for (const record of this.revocations.values()) {
+      page.push(record);
+      if (page.length >= limit) break;
+    }
+    return page;
   }
 
   verifyRevocation(record: RevocationRecord, issuerPublicKey: string): boolean {

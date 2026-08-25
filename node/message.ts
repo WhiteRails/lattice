@@ -15,6 +15,8 @@ export interface AgentProof {
   nonce: string;
   body_hash: string;
   host: string;
+  /** Issuer-signed certificate, validated by the Gateway when policy opts in. */
+  certificate?: unknown;
 }
 
 export interface OverlayMessage {
@@ -48,6 +50,11 @@ const AgentProofSchema = z.object({
   nonce: z.string().regex(/^[A-Za-z0-9_-]{8,256}$/),
   body_hash: z.string().regex(/^[a-f0-9]{64}$/),
   host: z.string().min(1).max(253),
+  certificate: z.object({
+    cert: z.record(z.unknown()),
+    ca_signature: z.string().min(8).max(1_024),
+    ca_cert_id: z.string().min(1).max(256),
+  }).strict().optional(),
 }).strict();
 
 const HeaderValueSchema = z.union([
@@ -100,6 +107,10 @@ export function parseOverlayMessage(raw: string): OverlayMessage | null {
 
 /** Canonical JSON with a bounded recursion budget for signing untrusted data. */
 export function stableStringify(value: unknown, depth = 0): string {
+  // JSON omits object properties whose value is undefined. The signing
+  // canonicalization must have identical wire semantics; otherwise a valid
+  // outbound frame becomes unverifiable after JSON.parse on the next hop.
+  if (value === undefined) return 'null';
   if (depth > MAX_OVERLAY_DEPTH) throw new Error('Canonical JSON exceeds maximum depth');
   if (value === null || typeof value !== 'object') return JSON.stringify(value);
   if (Array.isArray(value)) {
@@ -107,7 +118,7 @@ export function stableStringify(value: unknown, depth = 0): string {
     return `[${value.map(item => stableStringify(item, depth + 1)).join(',')}]`;
   }
   const record = value as Record<string, unknown>;
-  const keys = Object.keys(record).sort();
+  const keys = Object.keys(record).filter(key => record[key] !== undefined).sort();
   if (keys.length > 1_024) throw new Error('Canonical JSON object exceeds maximum key count');
   return `{${keys.map(k => `${JSON.stringify(k)}:${stableStringify(record[k], depth + 1)}`).join(',')}}`;
 }

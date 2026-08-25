@@ -10,7 +10,7 @@
  *
  * Security model:
  *   - Announcements carry the gateway's X25519 public key (base64 SPKI)
- *   - Server signs its GET /v1/routes response with HMAC(overlaySecret)
+ *   - Server signs each GET /v1/routes/<fqdn> response with HMAC(overlaySecret)
  *   - Clients verify server HMAC before trusting routes (optional: requires shared CA secret)
  *   - TTL-based expiry: stale routes auto-removed; gateway must re-announce periodically
  */
@@ -22,13 +22,24 @@ import chalk from 'chalk';
 import type { RoutingPayload } from './routing-cache';
 import { normalizeRoutingPayload } from './routing-cache';
 import { stableStringify } from './message';
-import { readHttpsTlsCredentials } from './ws-stack';
+import { applyInboundHttpNetworkLimits, readHttpsTlsCredentials } from './ws-stack';
+import { inboundNetworkLimitsFromEnv } from './network-limits';
 import type { LatticeNodeYaml } from './node-config';
 
 export const FEDERATION_DEFAULT_PORT = 9000;
 export const FEDERATION_DEFAULT_TTL_SECONDS = 300;
 export const FEDERATION_ANNOUNCE_PATH = '/v1/announce';
 export const FEDERATION_ROUTES_PATH = '/v1/routes';
+export const DEFAULT_FEDERATION_MAX_ROUTES = 100_000;
+const MIN_FEDERATION_MAX_ROUTES = 1_000;
+const HARD_MAX_FEDERATION_MAX_ROUTES = 5_000_000;
+const MAX_FEDERATION_RESPONSE_BYTES = 65_536;
+
+export interface FederationRegistryOptions {
+  /** Maximum live names held by this registry shard. Existing names may renew. */
+  maxRoutes?: number;
+}
+export const FEDERATION_ROUTE_PREFIX = `${FEDERATION_ROUTES_PATH}/`;
 export const FEDERATION_HEALTH_PATH = '/v1/health';
 
 /** One announced route in the federation registry. */
@@ -39,12 +50,18 @@ export interface FederationEntry {
   announcerPubKey?: string;  // X25519 pubkey of announcing node (informational)
 }
 
-/** Body of GET /v1/routes */
-export interface FederationRoutesResponse {
+interface ExpiringRoute {
+  fqdn: string;
+  expiresAtMs: number;
+}
+
+/** Compact response for one name. Public discovery never dumps a route table. */
+export interface FederationRouteResponse {
   version: 1;
   generatedAt: string;
-  routes: Record<string, FederationEntry>;  // keyed by fqdn
-  /** HMAC-SHA256(overlaySecret, stableStringify({version,generatedAt,routes})) */
+  fqdn: string;
+  route: FederationEntry;
+  /** HMAC-SHA256(overlaySecret, stableStringify({version,generatedAt,fqdn,route})) */
   serverSig?: string;
 }
 
@@ -72,19 +89,43 @@ const AnnounceSchema = z.object({
   announceHmac: z.string().regex(/^[a-f0-9]{64}$/).optional(),
 }).strict();
 
+function federationMaxRoutesFromEnv(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env.LATTICE_FEDERATION_MAX_ROUTES;
+  if (raw === undefined || raw.trim() === '') return DEFAULT_FEDERATION_MAX_ROUTES;
+  if (!/^[0-9]+$/.test(raw.trim())) {
+    throw new Error('LATTICE_FEDERATION_MAX_ROUTES must be an integer');
+  }
+  return validMaxRoutes(Number(raw), MIN_FEDERATION_MAX_ROUTES);
+}
+
+function validMaxRoutes(value: number, minimum = 1): number {
+  if (!Number.isSafeInteger(value) || value < minimum || value > HARD_MAX_FEDERATION_MAX_ROUTES) {
+    throw new Error(
+      `Federation maxRoutes must be between ${minimum} and ${HARD_MAX_FEDERATION_MAX_ROUTES}`,
+    );
+  }
+  return value;
+}
+
 // ─── Server ─────────────────────────────────────────────────────────────────
 
 export class FederationRegistryServer {
-  private routes: Map<string, FederationEntry> = new Map();
+  private readonly routes = new Map<string, FederationEntry>();
+  /** Indexed min-heap: one expiry row per live route, even after renewals. */
+  private readonly expiryHeap: ExpiringRoute[] = [];
+  private readonly expiryIndex = new Map<string, number>();
   private server: http.Server | https.Server;
   private sweepInterval: ReturnType<typeof setInterval> | null = null;
+  private readonly maxRoutes: number;
 
   constructor(
     private readonly bindHost: string,
     private readonly bindPort: number,
     private readonly overlaySecret: string,
     private readonly tls?: LatticeNodeYaml['tls'],
+    options: FederationRegistryOptions = {},
   ) {
+    this.maxRoutes = validMaxRoutes(options.maxRoutes ?? federationMaxRoutesFromEnv());
     const handler = (req: http.IncomingMessage, res: http.ServerResponse) => {
       void this.handleRequest(req, res).catch((e: unknown) => {
         if (!res.headersSent) {
@@ -98,6 +139,10 @@ export class FederationRegistryServer {
     this.server = creds
       ? https.createServer(creds, handler)
       : http.createServer(handler);
+    // A registry is a public control-plane shard, so it needs the same bounded
+    // socket budget as dataplane roles. Route-entry limits alone do not stop
+    // slow headers or idle keep-alives from consuming all descriptors.
+    applyInboundHttpNetworkLimits(this.server, inboundNetworkLimitsFromEnv());
   }
 
   start(): void {
@@ -122,27 +167,41 @@ export class FederationRegistryServer {
 
   /** Directly register a local route (e.g. when this node runs a gateway too). */
   localAnnounce(payload: RoutingPayload, ttlSeconds = FEDERATION_DEFAULT_TTL_SECONDS): void {
-    this.upsertEntry(payload, ttlSeconds);
+    if (!this.upsertEntry(payload, ttlSeconds)) {
+      throw new Error(`Federation registry capacity reached (${this.maxRoutes} routes)`);
+    }
   }
 
   getRoutes(): Map<string, FederationEntry> {
     return this.routes;
   }
 
-  private sweep(): void {
-    const now = Date.now();
-    for (const [fqdn, entry] of this.routes) {
-      if (new Date(entry.expiresAt).getTime() < now) {
-        this.routes.delete(fqdn);
-        console.log(chalk.cyan('[Federation]') + ` Expired route: ${fqdn}`);
-      }
-    }
+  snapshot(): { routes: number; expiryEntries: number; maxRoutes: number } {
+    return { routes: this.routes.size, expiryEntries: this.expiryHeap.length, maxRoutes: this.maxRoutes };
   }
 
-  private upsertEntry(payload: RoutingPayload, ttlSeconds: number, announcerPubKey?: string): void {
+  private sweep(): void {
+    const now = Date.now();
+    let expired = 0;
+    while (this.expiryHeap[0]?.expiresAtMs <= now) {
+      const entry = this.removeExpiryAt(0)!;
+      this.routes.delete(entry.fqdn);
+      expired++;
+    }
+    if (expired) console.log(chalk.cyan('[Federation]') + ` Expired ${expired} route(s)`);
+  }
+
+  private upsertEntry(payload: RoutingPayload, ttlSeconds: number, announcerPubKey?: string): boolean {
     const normalized = normalizeRoutingPayload(payload);
+    // Sweep before rejecting a new route so expired names never consume a
+    // shard slot until the next periodic sweep.
+    if (!this.routes.has(normalized.fqdn)) {
+      this.sweep();
+      if (this.routes.size >= this.maxRoutes) return false;
+    }
     const now = new Date();
-    const expiresAt = new Date(now.getTime() + ttlSeconds * 1000);
+    const expiresAtMs = now.getTime() + ttlSeconds * 1000;
+    const expiresAt = new Date(expiresAtMs);
     // Only include optional fields if defined — avoids stableStringify/JSON.stringify mismatch
     const entry: FederationEntry = {
       payload: normalized,
@@ -151,27 +210,26 @@ export class FederationRegistryServer {
     };
     if (announcerPubKey) entry.announcerPubKey = announcerPubKey;
     this.routes.set(normalized.fqdn, entry);
+    this.setExpiry(normalized.fqdn, expiresAtMs);
     console.log(
       chalk.cyan('[Federation]') +
         ` Announced: ${normalized.fqdn} → [${normalized.gatewayEndpoints.join(', ')}] TTL=${ttlSeconds}s`,
     );
+    return true;
   }
 
-  private buildRoutesResponse(): FederationRoutesResponse {
-    const now = new Date().toISOString();
-    const routes: Record<string, FederationEntry> = {};
-    const nowMs = Date.now();
-    for (const [fqdn, entry] of this.routes) {
-      if (new Date(entry.expiresAt).getTime() > nowMs) {
-        routes[fqdn] = entry;
-      }
-    }
-    const body: Omit<FederationRoutesResponse, 'serverSig'> = { version: 1, generatedAt: now, routes };
-    const sig = crypto
+  private buildRouteResponse(fqdn: string, route: FederationEntry): FederationRouteResponse {
+    const body: Omit<FederationRouteResponse, 'serverSig'> = {
+      version: 1,
+      generatedAt: new Date().toISOString(),
+      fqdn,
+      route,
+    };
+    const serverSig = crypto
       .createHmac('sha256', Buffer.from(this.overlaySecret, 'utf8'))
       .update(stableStringify(body), 'utf8')
       .digest('hex');
-    return { ...body, serverSig: sig };
+    return { ...body, serverSig };
   }
 
   private async handleRequest(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
@@ -188,13 +246,41 @@ export class FederationRegistryServer {
 
     if (req.method === 'GET' && url === FEDERATION_HEALTH_PATH) {
       res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ ok: true, routes: this.routes.size }));
+      res.end(JSON.stringify({ ok: true, routes: this.routes.size, maxRoutes: this.maxRoutes }));
       return;
     }
 
     if (req.method === 'GET' && url === FEDERATION_ROUTES_PATH) {
+      res.writeHead(410, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({
+        error: 'Global route listing is not available; request /v1/routes/<fqdn>',
+      }));
+      return;
+    }
+
+    if (req.method === 'GET' && url.startsWith(FEDERATION_ROUTE_PREFIX)) {
+      let fqdn: string;
+      try {
+        fqdn = decodeURIComponent(url.slice(FEDERATION_ROUTE_PREFIX.length)).toLowerCase();
+      } catch {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Invalid route name' }));
+        return;
+      }
+      if (!/^(?:[a-z0-9-]+\.)+(?:lattice|id)$/.test(fqdn)) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Invalid route name' }));
+        return;
+      }
+      const entry = this.routes.get(fqdn);
+      if (!entry || this.routeExpiry(fqdn) === undefined || this.routeExpiry(fqdn)! <= Date.now()) {
+        this.removeRoute(fqdn);
+        res.writeHead(404, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Route not found' }));
+        return;
+      }
       res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify(this.buildRoutesResponse(), null, 2));
+      res.end(JSON.stringify(this.buildRouteResponse(fqdn, entry)));
       return;
     }
 
@@ -239,7 +325,11 @@ export class FederationRegistryServer {
       }
 
       const ttl = Math.max(30, Math.min(announce.ttlSeconds ?? FEDERATION_DEFAULT_TTL_SECONDS, 3600));
-      this.upsertEntry(announce.payload, ttl, announce.announcerPubKey);
+      if (!this.upsertEntry(announce.payload, ttl, announce.announcerPubKey)) {
+        res.writeHead(503, { 'content-type': 'application/json', 'retry-after': '1' });
+        res.end(JSON.stringify({ error: 'Federation shard at route capacity' }));
+        return;
+      }
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ ok: true, fqdn: announce.payload.fqdn, ttlSeconds: ttl }));
       return;
@@ -248,41 +338,129 @@ export class FederationRegistryServer {
     res.writeHead(404, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ error: 'Not found' }));
   }
+
+  private routeExpiry(fqdn: string): number | undefined {
+    const index = this.expiryIndex.get(fqdn);
+    return index === undefined ? undefined : this.expiryHeap[index]?.expiresAtMs;
+  }
+
+  private removeRoute(fqdn: string): void {
+    this.routes.delete(fqdn);
+    const index = this.expiryIndex.get(fqdn);
+    if (index !== undefined) this.removeExpiryAt(index);
+  }
+
+  private setExpiry(fqdn: string, expiresAtMs: number): void {
+    const index = this.expiryIndex.get(fqdn);
+    if (index === undefined) {
+      this.expiryHeap.push({ fqdn, expiresAtMs });
+      this.expiryIndex.set(fqdn, this.expiryHeap.length - 1);
+      this.siftUp(this.expiryHeap.length - 1);
+      return;
+    }
+    const previous = this.expiryHeap[index]!.expiresAtMs;
+    this.expiryHeap[index] = { fqdn, expiresAtMs };
+    if (expiresAtMs < previous) this.siftUp(index);
+    else this.siftDown(index);
+  }
+
+  private removeExpiryAt(index: number): ExpiringRoute | undefined {
+    const removed = this.expiryHeap[index];
+    const last = this.expiryHeap.pop();
+    if (!removed || !last) return undefined;
+    this.expiryIndex.delete(removed.fqdn);
+    if (index === this.expiryHeap.length) return removed;
+    this.expiryHeap[index] = last;
+    this.expiryIndex.set(last.fqdn, index);
+    const parent = Math.floor((index - 1) / 2);
+    if (index > 0 && this.expiryHeap[index]!.expiresAtMs < this.expiryHeap[parent]!.expiresAtMs) this.siftUp(index);
+    else this.siftDown(index);
+    return removed;
+  }
+
+  private siftUp(index: number): void {
+    let child = index;
+    while (child > 0) {
+      const parent = Math.floor((child - 1) / 2);
+      if (this.expiryHeap[parent]!.expiresAtMs <= this.expiryHeap[child]!.expiresAtMs) break;
+      this.swapExpiry(parent, child);
+      child = parent;
+    }
+  }
+
+  private siftDown(index: number): void {
+    let parent = index;
+    while (true) {
+      const left = parent * 2 + 1;
+      if (left >= this.expiryHeap.length) return;
+      const right = left + 1;
+      const child = right < this.expiryHeap.length &&
+        this.expiryHeap[right]!.expiresAtMs < this.expiryHeap[left]!.expiresAtMs ? right : left;
+      if (this.expiryHeap[parent]!.expiresAtMs <= this.expiryHeap[child]!.expiresAtMs) return;
+      this.swapExpiry(parent, child);
+      parent = child;
+    }
+  }
+
+  private swapExpiry(left: number, right: number): void {
+    const a = this.expiryHeap[left]!;
+    const b = this.expiryHeap[right]!;
+    this.expiryHeap[left] = b;
+    this.expiryHeap[right] = a;
+    this.expiryIndex.set(a.fqdn, right);
+    this.expiryIndex.set(b.fqdn, left);
+  }
 }
 
 // ─── Client ─────────────────────────────────────────────────────────────────
 
-/** Fetches and optionally verifies a federation registry response. */
-export async function fetchFederationRoutes(
+/** Resolves one name without transferring the federation's entire route table. */
+export async function fetchFederationRoute(
   registryUrl: string,
+  fqdn: string,
   opts: { overlaySecret?: string; timeoutMs?: number } = {},
-): Promise<FederationRoutesResponse | null> {
-  const url = `${registryUrl.replace(/\/$/, '')}${FEDERATION_ROUTES_PATH}`;
+): Promise<FederationEntry | null> {
+  const canonicalFqdn = fqdn.trim().toLowerCase();
+  if (!/^(?:[a-z0-9-]+\.)+(?:lattice|id)$/.test(canonicalFqdn)) return null;
+  const url = `${registryUrl.replace(/\/$/, '')}${FEDERATION_ROUTE_PREFIX}${encodeURIComponent(canonicalFqdn)}`;
   try {
     const raw = await httpGet(url, opts.timeoutMs ?? 5000);
-    const parsed = JSON.parse(raw) as FederationRoutesResponse;
-    if (parsed.version !== 1 || !parsed.routes) return null;
-
-    // Mandatory HMAC verification when we share the overlay secret
-    if (opts.overlaySecret) {
-      if (!parsed.serverSig) {
-        console.warn(chalk.yellow('[Federation]') + ` No serverSig from ${registryUrl} — ignoring unsigned response`);
-        return null;
-      }
-      const { serverSig, ...body } = parsed;
-      const expected = crypto
-        .createHmac('sha256', Buffer.from(opts.overlaySecret, 'utf8'))
-        .update(stableStringify(body), 'utf8')
-        .digest('hex');
-      if (!crypto.timingSafeEqual(Buffer.from(serverSig, 'hex'), Buffer.from(expected, 'hex'))) {
-        console.warn(chalk.yellow('[Federation]') + ` HMAC mismatch from ${registryUrl} — ignoring`);
-        return null;
-      }
-    }
-    return parsed;
+    const parsed = JSON.parse(raw) as FederationRouteResponse;
+    if (parsed.version !== 1 || parsed.fqdn !== canonicalFqdn || !parsed.route) return null;
+    if (!verifyFederationSignature(parsed, opts.overlaySecret, registryUrl)) return null;
+    return parsed.route;
   } catch (e: any) {
     console.warn(chalk.yellow('[Federation]') + ` Failed to fetch ${url}: ${e?.message}`);
     return null;
+  }
+}
+
+function verifyFederationSignature(
+  response: { serverSig?: string },
+  overlaySecret: string | undefined,
+  registryUrl: string,
+): boolean {
+  if (!overlaySecret) return true;
+  if (!response.serverSig) {
+    console.warn(chalk.yellow('[Federation]') + ` No serverSig from ${registryUrl} — ignoring unsigned response`);
+    return false;
+  }
+  try {
+    const { serverSig, ...body } = response;
+    const expected = crypto
+      .createHmac('sha256', Buffer.from(overlaySecret, 'utf8'))
+      .update(stableStringify(body), 'utf8')
+      .digest('hex');
+    const got = Buffer.from(serverSig, 'hex');
+    const exp = Buffer.from(expected, 'hex');
+    if (got.length !== exp.length || !crypto.timingSafeEqual(got, exp)) {
+      console.warn(chalk.yellow('[Federation]') + ` HMAC mismatch from ${registryUrl} — ignoring`);
+      return false;
+    }
+    return true;
+  } catch {
+    console.warn(chalk.yellow('[Federation]') + ` Invalid signature from ${registryUrl} — ignoring`);
+    return false;
   }
 }
 
@@ -322,10 +500,7 @@ function httpGet(url: string, timeoutMs: number): Promise<string> {
   return new Promise((resolve, reject) => {
     const lib = url.startsWith('https') ? https : http;
     const req = lib.get(url, { timeout: timeoutMs }, (res) => {
-      const chunks: Buffer[] = [];
-      res.on('data', (d: Buffer) => chunks.push(d));
-      res.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
-      res.on('error', reject);
+      void readLimitedResponse(res, MAX_FEDERATION_RESPONSE_BYTES).then(resolve, reject);
     });
     req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
     req.on('error', reject);
@@ -346,16 +521,48 @@ function httpPost(url: string, body: string, timeoutMs: number): Promise<string>
         timeout: timeoutMs,
       },
       (res) => {
-        const chunks: Buffer[] = [];
-        res.on('data', (d: Buffer) => chunks.push(d));
-        res.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
-        res.on('error', reject);
+        void readLimitedResponse(res, MAX_FEDERATION_RESPONSE_BYTES).then(resolve, reject);
       },
     );
     req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
     req.on('error', reject);
     req.write(body);
     req.end();
+  });
+}
+
+/** A registry client only accepts one compact, named route response. */
+function readLimitedResponse(res: http.IncomingMessage, maxBytes: number): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const declared = Number(res.headers['content-length'] ?? 0);
+    if (Number.isFinite(declared) && declared > maxBytes) {
+      res.destroy();
+      reject(new Error('federation response too large'));
+      return;
+    }
+    const chunks: Buffer[] = [];
+    let total = 0;
+    let settled = false;
+    const fail = (error: Error) => {
+      if (settled) return;
+      settled = true;
+      reject(error);
+    };
+    res.on('data', (chunk: Buffer) => {
+      total += chunk.length;
+      if (total > maxBytes) {
+        res.destroy();
+        fail(new Error('federation response too large'));
+        return;
+      }
+      chunks.push(chunk);
+    });
+    res.on('end', () => {
+      if (settled) return;
+      settled = true;
+      resolve(Buffer.concat(chunks).toString('utf8'));
+    });
+    res.on('error', error => fail(error instanceof Error ? error : new Error(String(error))));
   });
 }
 

@@ -1,5 +1,8 @@
 node_modules/
 dist/
+artifacts/
+build/
+clients/rust/target/
 *.log
 .env
 .env.*

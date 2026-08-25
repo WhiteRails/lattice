@@ -1,0 +1,23 @@
+[package]
+name = "lattice-client"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Rust client for the native Lattice daemon IPC protocol"
+
+[dependencies]
+hmac = "0.12.1"
+serde_json = "1.0.149"
+sha2 = "0.10.8"
+
+[lib]
+name = "lattice_client"
+path = "src/lib.rs"
+
+[[bin]]
+name = "lattice"
+path = "src/main.rs"
+
+[[bin]]
+name = "lt"
+path = "src/lt.rs"

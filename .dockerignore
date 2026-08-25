@@ -1,0 +1,10 @@
+.git
+.github
+.gitignore
+node_modules
+dist
+build
+clients/rust/target
+CLAUDE-SECURITY-*
+coverage
+npm-debug.log*

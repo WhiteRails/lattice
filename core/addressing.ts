@@ -50,13 +50,3 @@ export function hashSubjectForLatticeSuffix(subjectId: string): string {
 export function generateWhiteAddressFromSubjectId(subjectId: string): string {
   return `${hashSubjectForLatticeSuffix(subjectId)}.lattice`;
 }
-
-/**
- * Generates a Lattice address from a public key.
- * @deprecated Prefer {@link generateWhiteAddressFromSubjectId} with a stable `subject_id`.
- * This derives a synthetic subject from the public key material for backwards compatibility.
- */
-export function generateWhiteAddress(publicKey: string): string {
-  const syntheticSubject = `did:traceveil:key:${crypto.createHash('sha256').update(publicKey, 'utf8').digest('hex')}`;
-  return generateWhiteAddressFromSubjectId(syntheticSubject);
-}

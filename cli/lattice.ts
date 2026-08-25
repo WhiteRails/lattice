@@ -16,7 +16,7 @@ import {
   saveAgent, loadAgent, agentExists, listAgents,
   saveService, loadService, serviceExists, listServices,
   saveRevocation, isRevoked, listRevocations,
-  tailLog, logPath, LATTICE_DIR,
+  tailLog, logPath, LATTICE_DIR, MAX_TAIL_LOG_BYTES,
 } from '../node/state';
 import { PolicyLoader } from '../node/policy-loader';
 import { ping }         from '../node/ping';
@@ -54,7 +54,7 @@ import {
 import { loadNodeConfig, saveNodeConfig, nodeConfigPath, parseBindHostPort, type LatticeNodeRole } from '../node/node-config';
 import {
   FederationRegistryServer,
-  fetchFederationRoutes,
+  fetchFederationRoute,
   postFederationAnnounce,
   FEDERATION_DEFAULT_PORT,
   FEDERATION_DEFAULT_TTL_SECONDS,
@@ -78,6 +78,7 @@ import { LatticeCA }         from '../core/ca';
 import { generateKeyPair, hashRequestBody, requestSignaturePayload, signData } from '../core/identity';
 import * as crypto from 'crypto';
 import { ethers } from 'ethers';
+import { runBoundedLoad } from '../node/bounded-load';
 
 const program = new Command();
 program.name('lattice').description('Certified overlay network for autonomous AI agents').version('0.1.0');
@@ -282,6 +283,22 @@ agent.command('revoke <name>').description('Revoke an agent').action((name) => {
   saveRevocation(name);
   ok(`Agent '${chalk.red(name)}' revoked — future requests blocked`);
 });
+
+agent.command('trust-issuer <name>').description('Trust an issuer-signed AgentCert for this policy principal')
+  .requiredOption('--issuer <id>', 'Issuer identifier')
+  .requiredOption('--public-key-file <path>', 'Issuer Ed25519 public PEM')
+  .option('--subject <subject>', 'Expected certificate agent_id; default agent:local:<name>')
+  .action((name, opts) => {
+    requireInit();
+    const issuerKey = fs.readFileSync(opts.publicKeyFile, 'utf8').trim();
+    const policy = new PolicyLoader();
+    policy.trustAgentIssuer(name, {
+      issuer_id: opts.issuer,
+      public_key: issuerKey,
+      subject: opts.subject?.trim() || `agent:local:${name}`,
+    });
+    ok(`Issuer '${opts.issuer}' trusted for agent policy '${name}'`);
+  });
 
 agent.command('list').description('List agents').action(() => {
   requireInit();
@@ -734,6 +751,7 @@ meshCli
       bodyHash: hashRequestBody(body),
     });
     const signature = signData(payload, agent.privateKey);
+    const certificateHeader = portableAgentCertificateHeader(agent.signedCert);
     const entry = new URL(opts.entry);
     const expected = parseInt(String(opts.expectStatus), 10);
     const client = entry.protocol === 'https:' ? https : http;
@@ -752,6 +770,7 @@ meshCli
             'x-lattice-signature': signature,
             'x-lattice-timestamp': timestamp,
             'x-lattice-nonce': nonce,
+            ...(certificateHeader ? { 'x-lattice-agent-certificate': certificateHeader } : {}),
           },
         },
         res => {
@@ -774,6 +793,124 @@ meshCli
     ok(`mesh smoke passed: ${opts.host}${reqPath} → ${result.status}`);
     if (result.body.trim()) console.log(result.body);
   });
+
+meshCli
+  .command('load')
+  .description('Run bounded signed load against an Entry for ramp and soak validation')
+  .requiredOption('--agent <name>', 'Local agent identity to sign each request')
+  .requiredOption('--entry <url>', 'Entry HTTP/HTTPS base URL, e.g. http://entry-a.example:7777')
+  .requiredOption('--host <fqdn>', 'Lattice Host header, e.g. echo.lattice')
+  .requiredOption('--duration-seconds <seconds>', 'Run duration (1..604800 seconds)')
+  .option('--concurrency <count>', 'Fixed simultaneous requests (1..65536)', '16')
+  .option('--max-requests <count>', 'Optional global cap for a ramp')
+  .option('--path <path>', 'Request path', '/ping')
+  .option('--report-interval-seconds <seconds>', 'Progress report interval', '10')
+  .action(async (opts: {
+    agent: string;
+    entry: string;
+    host: string;
+    durationSeconds: string;
+    concurrency: string;
+    maxRequests?: string;
+    path?: string;
+    reportIntervalSeconds: string;
+  }) => {
+    requireInit();
+    const durationSeconds = positiveIntegerOption(opts.durationSeconds, 'duration-seconds', 604_800);
+    const concurrency = positiveIntegerOption(opts.concurrency, 'concurrency', 65_536);
+    const maxRequests = opts.maxRequests === undefined
+      ? undefined
+      : positiveIntegerOption(opts.maxRequests, 'max-requests', 1_000_000_000);
+    const reportIntervalSeconds = positiveIntegerOption(opts.reportIntervalSeconds, 'report-interval-seconds', 3_600);
+    const entry = new URL(opts.entry);
+    if (entry.protocol !== 'http:' && entry.protocol !== 'https:') err('--entry must use http or https');
+    const reqPath = String(opts.path || '/ping').startsWith('/') ? String(opts.path || '/ping') : `/${opts.path}`;
+    const agent = loadAgent(opts.agent);
+    const certificateHeader = portableAgentCertificateHeader(agent.signedCert);
+    const client = entry.protocol === 'https:' ? https : http;
+    const keepAliveAgent = entry.protocol === 'https:'
+      ? new https.Agent({ keepAlive: true, maxSockets: concurrency, maxFreeSockets: concurrency })
+      : new http.Agent({ keepAlive: true, maxSockets: concurrency, maxFreeSockets: concurrency });
+    const send = () => new Promise<{ status: number }>((resolve, reject) => {
+      const body = Buffer.alloc(0);
+      const timestamp = new Date().toISOString();
+      const signature = signData(requestSignaturePayload({
+        agent: opts.agent, method: 'GET', host: opts.host, url: reqPath, timestamp, bodyHash: hashRequestBody(body),
+      }), agent.privateKey);
+      const req = client.request({
+        protocol: entry.protocol,
+        hostname: entry.hostname,
+        port: entry.port || (entry.protocol === 'https:' ? 443 : 80),
+        path: reqPath,
+        method: 'GET',
+        agent: keepAliveAgent,
+        timeout: 60_000,
+        headers: {
+          host: opts.host,
+          'x-lattice-agent': opts.agent,
+          'x-lattice-signature': signature,
+          'x-lattice-timestamp': timestamp,
+          'x-lattice-nonce': crypto.randomBytes(12).toString('hex'),
+          ...(certificateHeader ? { 'x-lattice-agent-certificate': certificateHeader } : {}),
+        },
+      }, response => {
+        response.resume();
+        response.once('end', () => resolve({ status: response.statusCode ?? 0 }));
+        response.once('error', reject);
+      });
+      req.once('timeout', () => req.destroy(new Error('Entry request timed out')));
+      req.once('error', reject);
+      req.end();
+    });
+    const report = (summary: Awaited<ReturnType<typeof runBoundedLoad>>) => {
+      console.log(JSON.stringify({
+        type: 'lattice-mesh-load-progress', ...formatLoadSummary(summary),
+      }));
+    };
+    try {
+      const summary = await runBoundedLoad({
+        durationMs: durationSeconds * 1_000,
+        concurrency,
+        maxRequests,
+        request: send,
+        onProgress: report,
+        progressIntervalMs: reportIntervalSeconds * 1_000,
+      });
+      console.log(JSON.stringify({ type: 'lattice-mesh-load-final', ...formatLoadSummary(summary) }));
+    } finally {
+      keepAliveAgent.destroy();
+    }
+  });
+
+function positiveIntegerOption(raw: string, name: string, maximum: number): number {
+  if (!/^[0-9]+$/.test(raw) || !Number.isSafeInteger(Number(raw)) || Number(raw) < 1 || Number(raw) > maximum) {
+    err(`--${name} must be an integer between 1 and ${maximum}`);
+  }
+  return Number(raw);
+}
+
+function portableAgentCertificateHeader(signedCert: unknown): string | undefined {
+  if (!signedCert) return undefined;
+  const serialized = JSON.stringify(signedCert);
+  if (Buffer.byteLength(serialized, 'utf8') > 12 * 1024) {
+    throw new Error('Agent certificate is too large for the Entry request header');
+  }
+  return Buffer.from(serialized, 'utf8').toString('base64url');
+}
+
+function formatLoadSummary(summary: Awaited<ReturnType<typeof runBoundedLoad>>) {
+  return {
+    started: summary.started,
+    completed: summary.completed,
+    failures: summary.failures,
+    statusClasses: summary.statusClasses,
+    elapsedMs: summary.elapsedMs,
+    requestsPerSecond: Number(summary.requestsPerSecond.toFixed(2)),
+    p50UpperBoundMs: summary.p50UpperBoundMs,
+    p95UpperBoundMs: summary.p95UpperBoundMs,
+    p99UpperBoundMs: summary.p99UpperBoundMs,
+  };
+}
 
 // ── run ───────────────────────────────────────────────────────────────────────
 program.command('run').description('Run an agent command inside Lattice sandbox')
@@ -804,7 +941,12 @@ logs.command('tail').description('Tail the action log')
   .option('--follow', 'Follow log (watch for new entries)', false)
   .action((opts) => {
     requireInit();
-    const entries = tailLog(parseInt(opts.n));
+    let entries: object[];
+    try {
+      entries = tailLog(parseInt(opts.n, 10));
+    } catch (error) {
+      err(error instanceof Error ? error.message : String(error));
+    }
     if (!entries.length) { console.log(chalk.dim('No log entries yet.')); return; }
 
     printLogEntries(entries);
@@ -815,7 +957,12 @@ logs.command('tail').description('Tail the action log')
       setInterval(() => {
         const newSize = fs.statSync(f).size;
         if (newSize <= size) return;
-        const chunk = fs.readFileSync(f).slice(size).toString();
+        if (newSize - size > MAX_TAIL_LOG_BYTES) {
+          console.warn(chalk.yellow(`Skipped ${newSize - size} bytes of action log; follow window is capped at ${MAX_TAIL_LOG_BYTES} bytes.`));
+          size = newSize;
+          return;
+        }
+        const chunk = fs.readFileSync(f).subarray(size).toString();
         size = newSize;
         chunk.trim().split('\n').filter(Boolean).forEach(l => {
           try { printLogEntry(JSON.parse(l)); } catch {}
@@ -1480,37 +1627,30 @@ registryCli
 
 registryCli
   .command('list')
-  .description('List all routes registered with a federation registry')
+  .description('Resolve one route from a federation registry (global listing is intentionally unavailable)')
+  .requiredOption('--fqdn <name.lattice>', 'The route name to resolve')
   .option('--registry <url>', 'Federation registry URL (default: http://127.0.0.1:9000)')
   .option('--verify-sig', 'Verify response HMAC using local CA overlaySecret')
-  .action(async (opts: { registry?: string; verifySig?: boolean }) => {
+  .action(async (opts: { fqdn: string; registry?: string; verifySig?: boolean }) => {
     requireInit();
     const registryUrl = opts.registry ?? 'http://127.0.0.1:9000';
     const ca = opts.verifySig ? loadCA() : null;
-    const resp = await fetchFederationRoutes(registryUrl, {
+    const fqdn = normalizeLatticeFqdn(opts.fqdn);
+    const entry = await fetchFederationRoute(registryUrl, fqdn, {
       overlaySecret: ca?.overlaySecret,
     });
-    if (!resp) err(`Could not fetch routes from ${registryUrl}`);
+    if (!entry) err(`Could not fetch route ${fqdn} from ${registryUrl}`);
     const now = Date.now();
-    const entries = Object.entries(resp.routes);
-    if (!entries.length) {
-      console.log(chalk.dim('No routes registered.'));
-      return;
+    const expired = new Date(entry.expiresAt).getTime() < now;
+    const ttlRemaining = Math.max(0, Math.round((new Date(entry.expiresAt).getTime() - now) / 1000));
+    const status = expired ? chalk.red('[EXPIRED]') : chalk.green(`[TTL ${ttlRemaining}s]`);
+    console.log(chalk.cyan(`Federation route from ${registryUrl}`));
+    console.log(`  ${chalk.bold('lp://' + fqdn)} ${status}`);
+    for (const ep of entry.payload.gatewayEndpoints) {
+      console.log(`    → ${chalk.cyan(ep)}`);
     }
-    console.log(chalk.cyan(`Federation routes from ${registryUrl}`) + chalk.dim(` (generated ${resp.generatedAt})`));
-    for (const [fqdn, entry] of entries) {
-      const expired = new Date(entry.expiresAt).getTime() < now;
-      const ttlRemaining = Math.max(0, Math.round((new Date(entry.expiresAt).getTime() - now) / 1000));
-      const status = expired ? chalk.red('[EXPIRED]') : chalk.green(`[TTL ${ttlRemaining}s]`);
-      console.log(`  ${chalk.bold('lp://' + fqdn)} ${status}`);
-      for (const ep of entry.payload.gatewayEndpoints) {
-        console.log(`    → ${chalk.cyan(ep)}`);
-      }
-      if (entry.payload.gatewayNodeLabel) {
-        console.log(`    label: ${chalk.dim(entry.payload.gatewayNodeLabel)}`);
-      }
-      console.log(`    pubkey: ${chalk.dim((entry.payload.gatewayPubKeyB64 ?? '').slice(0, 20))}…`);
-    }
+    if (entry.payload.gatewayNodeLabel) console.log(`    label: ${chalk.dim(entry.payload.gatewayNodeLabel)}`);
+    console.log(`    pubkey: ${chalk.dim((entry.payload.gatewayPubKeyB64 ?? '').slice(0, 20))}…`);
   });
 
 program.parse(process.argv);

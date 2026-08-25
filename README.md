@@ -1,28 +1,39 @@
 # Lattice
 
-**A certified overlay network for autonomous AI agents.**
+**A controlled overlay protocol for autonomous agents.**
 
 <p align="center">
-  <em>Don't expose agents to the open internet. Give them Lattice.</em>
+  <em>Route agent actions through explicit identity, policy, and audit controls.</em>
 </p>
 
-Lattice is a hardened overlay network infrastructure architected for the secure governance of autonomous AI agents. Unlike traditional networking stacks, Lattice air-gaps agents from the public web using a Tor-inspired architecture that mandates accountability and privacy by design. 
+Lattice routes autonomous-agent actions through named `lp://` services, capability policy, cryptographic identities and an append-only audit trail. It is an overlay and control plane, not an anonymity network and not a complete host-network isolation boundary by itself.
 
-The framework leverages cryptographic identities and zero-trust access policies to ensure that every agent interaction is both verifiable and revocable. By utilizing blockchain technology as a decentralized root of trust, Lattice maintains an immutable record of system integrity without compromising sensitive data. This enables developers to deploy autonomous services within a strictly controlled environment, where AI autonomy is bounded by granular permissions, predefined capabilities, and tamper-evident logging.
+The local cryptographic runtime is `latticed`, written in C. Agents and SDKs use the Rust `lattice` client over the versioned LTP/1 Unix-socket protocol. TypeScript remains the current Entry/Relay/Gateway control-plane implementation; its operator CLI is named `latticectl` when installed globally.
 
 ---
 
 ## How it works
 
 ```
-Agent
-  → Entry node (default-deny proxy)
-    → Relay mesh (overlay routing)
-      → Gateway (policy enforcement + SAAE log)
-        → Real service
+Rust agent / SDK
+  → LTP/1 local Unix socket → latticed (C: session authentication and signing)
+  → Entry node (capability enforcement)
+  → Relay mesh (overlay routing)
+  → Gateway (service policy + SAAE log)
+  → Real service
 ```
 
-Agents never touch raw IP addresses or DNS. They request `lp://service.lattice` and Lattice resolves the cryptographic route, enforces capability policy, and records every action in a signed, tamper-evident log.
+Agents request `lp://service.lattice`; Lattice resolves the configured route, enforces capability policy at Entry/Gateway, and records the action. Host-network isolation requires Docker or an equivalent OS-level sandbox; proxy-only mode is advisory.
+
+The native runtime migration and scale constraints are described in [the scalability architecture](docs/scalability-architecture.md) and [the C daemon / Rust client contract](docs/native-daemon.md).
+
+The production multi-cell soak and failover criteria are in [the multi-cell soak runbook](docs/multicell-soak.md).
+
+`lattice run` always starts `latticed` and injects `LATTICE_DAEMON_SOCKET` plus `LATTICE_SESSION_TOKEN_FILE` for the Rust client. Private key material is loaded by the daemon and removed from the runner's temporary directory before the agent starts.
+
+The repository CI verifies TypeScript, dependency audit, the C daemon/Rust client interoperability suite, and Rust formatting on every pull request and push to `main`.
+
+The reconciliation of the August 2026 security scan, its regression coverage, and remaining verification boundary is in [the security remediation matrix](docs/security-remediation-2026-08-24.md).
 
 ---
 
@@ -63,6 +74,8 @@ Agents operate under YAML capability policies. If an agent tries to reach a reso
 ## Requirements
 
 - Node.js 20+
+- CMake, a C compiler, and OpenSSL 3 development headers (for `latticed`)
+- Rust stable toolchain and Cargo (for `lattice-client`)
 - Docker (recommended for network namespace isolation)
 - For distributed deployment: VPS(s) + TLS (Let's Encrypt) + an EVM-compatible chain
 
@@ -70,6 +83,77 @@ Agents operate under YAML capability policies. If an agent tries to reach a reso
 
 ```bash
 npm install
+npm run build:native
+cargo build --manifest-path clients/rust/Cargo.toml
+```
+
+## Native binaries and daemon configuration
+
+Lattice separates its commands like Tor separates `tor` from the applications
+that use it:
+
+| Command | Role |
+| --- | --- |
+| `latticed` | Native C daemon; starts from flags or a declarative configuration file. |
+| `lattice` | Rust client for daemon `status`, `ping`, `sign`, and local load checks. |
+| `lt` | Local-model Lattice agent; it can only inspect connectivity through `status` and `ping`. |
+| `latticectl` | Node-based operator control plane for identities, policies, Entry, Relay, and Gateway. |
+
+Build a same-platform release bundle. It contains `latticed`, `lattice`, a
+sample configuration, a systemd unit, and a SHA-256 checksum:
+
+```bash
+npm run package:bundle
+tar -xzf artifacts/lattice-<version>-<os>-<arch>.tar.gz
+```
+
+The daemon uses a deliberately small, `torrc`-style configuration format:
+
+```text
+# /etc/lattice/latticed.conf
+Socket /run/lattice/latticed.sock
+MaxClients 256
+MaxBufferedBytes 134217728
+# KeyFile /etc/lattice/agent-ed25519.pem
+# SessionTokenFile /run/lattice/session.token
+```
+
+Validate before starting, then query it through the Rust CLI:
+
+```bash
+latticed --config /etc/lattice/latticed.conf --verify-config
+latticed --config /etc/lattice/latticed.conf
+lattice --socket /run/lattice/latticed.sock status
+lattice --socket /run/lattice/latticed.sock ping hello
+```
+
+`lt` follows the compact Unix agent experience popularized by `fx`, but its
+harness is intentionally not a general coding agent. The release bundle embeds
+`llama.cpp` plus the Apache-2.0 SmolLM2-135M-Instruct Q4_K_M model (about 105
+MB), so it needs neither Ollama nor a network model server at runtime. It exposes only
+`lattice_status` and `lattice_ping` to that model. It cannot execute a shell,
+read or write files, browse, use MCP, alter policy, manage keys, or sign data.
+
+```bash
+lt --socket /run/lattice/latticed.sock ask "¿Lattice está disponible?"
+lt                                      # modo interactivo; /exit para salir
+```
+
+CLI flags override configuration directives. `KeyFile` and
+`SessionTokenFile` are optional as a pair; when configured they enable signing
+and must remain private. The daemon rejects configuration files that are not
+regular files owned by the current user or root, or that are group/world
+writable. The release bundle is native to the build OS/architecture and still
+requires a compatible OpenSSL 3 runtime. Build one bundle per supported target.
+The `Native bundles` workflow builds Linux x86_64 and macOS ARM64 artifacts on
+version tags (or on manual dispatch) without publishing a release automatically.
+
+Install the operator CLI separately where Node-based control-plane commands are
+needed:
+
+```bash
+npm install --global lattice-protocol-mvp
+latticectl --help
 ```
 
 ---
@@ -96,8 +180,12 @@ Create an agent, grant a capability, and run it:
 ```bash
 npm run lattice -- agent create bot1
 npm run lattice -- grant bot1 lp://echo.lattice echo.ping
-npm run lattice -- run --agent bot1 -- node your_agent.js
+npm run lattice -- run --agent bot1 -- \
+  cargo run --manifest-path clients/rust/Cargo.toml -- sign 'canonical payload'
 ```
+
+The local Entry/Relay/Gateway smoke stack is a development implementation. The
+agent-side signing path in the command above is exclusively C plus Rust.
 
 Tail the live transparency log:
 
@@ -294,10 +382,12 @@ npm run lattice -- id
 
 ```
 cli/        CLI (npm run lattice -- ...)
+clients/rust/ Rust lattice SDK and CLI (`lattice` and the restricted `lt` agent)
 contracts/  LatticeChain.sol
 core/       Types, PKI, policy helpers
+daemon/     latticed C daemon, config template, and systemd unit
 docs/       Architecture decisions and specs
-node/       Entry / Relay / Gateway + resolver + routing-cache
+node/       Current Entry / Relay / Gateway control plane + resolver + routing-cache
 services/   Example backends (echo, proxies)
 tests/      Vitest
 ```

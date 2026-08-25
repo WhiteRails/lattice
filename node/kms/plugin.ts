@@ -1,5 +1,7 @@
 import { spawn } from 'child_process';
 
+const MAX_KMS_PLUGIN_OUTPUT_BYTES = 64 * 1024;
+
 export class PluginBackend {
   get type() { return 'plugin' as const; }
 
@@ -23,20 +25,38 @@ export class PluginBackend {
       }
       const child = spawn(cmd, args, { stdio: ['pipe', 'pipe', 'inherit'], shell: false });
       let out = '';
+      let outputBytes = 0;
+      let settled = false;
+      const finish = (error?: Error, result?: string) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        if (error) reject(error);
+        else resolve(result!);
+      };
       const timeout = setTimeout(() => {
         try { child.kill('SIGTERM'); } catch {}
-        reject(new Error('KMS plugin timed out after 10s'));
+        finish(new Error('KMS plugin timed out after 10s'));
       }, 10000);
-      child.stdout.on('data', (d: Buffer) => { out += d.toString(); });
+      child.stdout.on('data', (d: Buffer) => {
+        outputBytes += d.length;
+        if (outputBytes > MAX_KMS_PLUGIN_OUTPUT_BYTES) {
+          try { child.kill('SIGTERM'); } catch {}
+          finish(new Error(`KMS plugin response exceeds ${MAX_KMS_PLUGIN_OUTPUT_BYTES} bytes`));
+          return;
+        }
+        out += d.toString('utf8');
+      });
       child.on('close', (code) => {
-        clearTimeout(timeout);
-        if (code !== 0) return reject(new Error(`KMS plugin exited with code ${code}`));
+        if (code !== 0) return finish(new Error(`KMS plugin exited with code ${code}`));
         try {
           const res = JSON.parse(out);
-          if (res.error) return reject(new Error(res.error));
-          resolve(res.result);
-        } catch { reject(new Error('Invalid KMS plugin response')); }
+          if (res.error) return finish(new Error(res.error));
+          if (typeof res.result !== 'string') return finish(new Error('Invalid KMS plugin result'));
+          finish(undefined, res.result);
+        } catch { finish(new Error('Invalid KMS plugin response')); }
       });
+      child.on('error', error => finish(error));
       child.stdin.write(JSON.stringify(req) + '\n');
       child.stdin.end();
     });

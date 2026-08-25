@@ -2,7 +2,7 @@ import { WebSocketServer, WebSocket } from 'ws';
 import * as crypto from 'crypto';
 import { OverlayMessage, parseOverlayMessage, signOverlayMessage } from './message';
 import { loadCA, getOrCreateOverlayKeyPair } from './state';
-import { SessionManager } from './session';
+import { SessionManager, sessionMaxEntriesFromEnv } from './session';
 import chalk from 'chalk';
 import { chooseOverlaySignKey, verifyIncomingOverlayFromPeer } from './overlay-sign-key';
 import type { LatticeNodeYaml, NodeChainConfig } from './node-config';
@@ -17,6 +17,11 @@ import { LpGatewayResolver, LpRoutingNotFoundError } from './lp-resolver';
 import { bindOverlayWebSocketServer, wsTlsClientOptions } from './ws-stack';
 import { overlayPubkeysEqual, validateDistributedPeer } from './peer-identity';
 import { fqdnFromLpAddress } from './routing-cache';
+import { OverlayRpcPool, overlayRpcPoolOptionsFromEnv } from './overlay-rpc';
+import { OverlayIngressLimiter, overlayIngressLimitsFromEnv } from './overlay-ingress';
+import { rendezvousOrder } from './rendezvous';
+import { serveCellStatus } from './node-metrics';
+import { OverlayResponseMultiplexer } from './overlay-response-multiplexer';
 
 export const DEFAULT_RELAY_PORT = 8888;
 
@@ -24,6 +29,13 @@ export interface RelayNodeOptions {
   port?: number;
   bindHostPort?: string;
   nodeConfig?: LatticeNodeYaml | null;
+}
+
+interface HiddenGatewayConnection {
+  ws: WebSocket;
+  pubkey: string;
+  nodeLabel?: string;
+  responses: OverlayResponseMultiplexer;
 }
 
 export class RelayNode {
@@ -37,12 +49,16 @@ export class RelayNode {
   private resolver: LpGatewayResolver;
   private chain: NodeChainConfig | null;
   private nodeLabel: string | undefined;
+  private gatewayPool: OverlayRpcPool;
+  private readonly ingress = new OverlayIngressLimiter(overlayIngressLimitsFromEnv());
+  private gatewayFailures = 0;
+  private invalidFrames = 0;
   /**
    * Hidden-service rendezvous table.
    * Key: fqdn (e.g. "echo.lattice")
    * Value: the outbound WebSocket the gateway dialled into us.
    */
-  private hiddenGateways: Map<string, { ws: WebSocket; pubkey: string; nodeLabel?: string }> = new Map();
+  private hiddenGateways: Map<string, HiddenGatewayConnection> = new Map();
 
   constructor(opts: RelayNodeOptions = {}) {
     const cfgFromDisk = opts.nodeConfig !== undefined ? opts.nodeConfig : loadNodeConfig();
@@ -52,8 +68,8 @@ export class RelayNode {
 
     const relayKeyPair = getOrCreateOverlayKeyPair();
     this.myPublicKey = relayKeyPair.publicKey;
-    this.upstreamMgr = new SessionManager('relay-upstream', relayKeyPair.privateKey);
-    this.downstreamMgr = new SessionManager('relay-downstream', relayKeyPair.privateKey);
+    this.upstreamMgr = new SessionManager('relay-upstream', relayKeyPair.privateKey, undefined, sessionMaxEntriesFromEnv());
+    this.downstreamMgr = new SessionManager('relay-downstream', relayKeyPair.privateKey, undefined, sessionMaxEntriesFromEnv());
 
     const defaultPort =
       cfgFromDisk?.bind?.relay ?
@@ -68,16 +84,38 @@ export class RelayNode {
 
     this.chain = resolveNodeChainConfig(cfgFromDisk);
     this.resolver = new LpGatewayResolver(cfgFromDisk ?? null, this.chain);
+    this.gatewayPool = new OverlayRpcPool({ ...overlayRpcPoolOptionsFromEnv(), wsOptions: wsTlsClientOptions(cfgFromDisk) });
 
-    const bound = bindOverlayWebSocketServer(bindHost, bindPort, cfgFromDisk?.tls);
+    const bound = bindOverlayWebSocketServer(
+      bindHost,
+      bindPort,
+      cfgFromDisk?.tls,
+      undefined,
+      (req, res) => {
+        if (serveCellStatus(req, res, 'relay', () => ({
+          ...this.ingress.snapshot(),
+          outboundInFlight: this.gatewayPool.inFlight(),
+          residentPeers: this.hiddenGateways.size,
+          failures: this.gatewayFailures + this.invalidFrames,
+        }))) return;
+        res.writeHead(404, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Not found' }));
+      },
+    );
     this.wss = bound.wss;
     this.closeStack = bound.close;
 
     this.wss.on('connection', (ws) => {
       ws.on('message', (data) => {
-        void this.handleMessage(ws, data.toString()).catch((e: unknown) => {
-          console.warn(chalk.yellow('[RelayNode]') + ` Dropped invalid overlay frame: ${String(e)}`);
-        });
+        const raw = data.toString();
+        const frameBytes = Math.max(1, Buffer.byteLength(raw, 'utf8'));
+        if (!this.ingress.tryAcquire(ws, frameBytes)) {
+          ws.close(1013, 'overlay backpressure');
+          return;
+        }
+        void this.handleMessage(ws, raw).catch((e: unknown) => {
+          this.invalidFrames++;
+        }).finally(() => this.ingress.release(ws, frameBytes));
       });
     });
 
@@ -92,6 +130,7 @@ export class RelayNode {
   }
 
   close(): void {
+    this.gatewayPool.close();
     this.closeStack();
   }
 
@@ -144,11 +183,25 @@ export class RelayNode {
     if (existing && existing.ws !== gatewayWs && existing.ws.readyState === WebSocket.OPEN) {
       existing.ws.close();
     }
-    this.hiddenGateways.set(fqdn, { ws: gatewayWs, pubkey: route.gatewayPubKeyB64, nodeLabel: route.gatewayNodeLabel });
+    const hiddenGateway: HiddenGatewayConnection = {
+      ws: gatewayWs,
+      pubkey: route.gatewayPubKeyB64,
+      nodeLabel: route.gatewayNodeLabel,
+      responses: new OverlayResponseMultiplexer(this.ingress.snapshot().maxInFlight, 30_000),
+    };
+    this.hiddenGateways.set(fqdn, hiddenGateway);
     console.log(chalk.magenta('[RelayNode]') + ` Hidden gateway registered: ${fqdn} (pubkey ${msg.source_pubkey?.slice(0, 12)}…)`);
+
+    // One response dispatcher per Gateway connection. The old design added a
+    // listener for every in-flight request, making delivery O(pending).
+    gatewayWs.on('message', raw => {
+      const response = parseOverlayMessage(raw.toString());
+      if (response?.type === 'response') hiddenGateway.responses.resolve(response);
+    });
 
     // Clean up on disconnect
     gatewayWs.once('close', () => {
+      hiddenGateway.responses.close();
       if (this.hiddenGateways.get(fqdn)?.ws === gatewayWs) {
         this.hiddenGateways.delete(fqdn);
         console.log(chalk.magenta('[RelayNode]') + ` Hidden gateway disconnected: ${fqdn}`);
@@ -215,8 +268,6 @@ export class RelayNode {
 
     msg.trace.push('relay');
 
-    console.log(chalk.magenta('[RelayNode]') + ` Routing ${msg.id} -> ${msg.destination}`);
-
     let route;
     try {
       route = await this.resolver.resolveDestination(msg.destination);
@@ -231,12 +282,9 @@ export class RelayNode {
       return;
     }
 
-    const tlsOpts = wsTlsClientOptions(this.cfg);
-
     // Check if a hidden gateway has registered for this fqdn
     const hiddenGateway = this.hiddenGateways.get(route.fqdn);
     if (hiddenGateway && hiddenGateway.ws.readyState === WebSocket.OPEN) {
-      console.log(chalk.magenta('[RelayNode]') + ` Routing ${msg.id} to hidden gateway: ${route.fqdn}`);
       try {
         const relaySignKeyDown = chooseOverlaySignKey(
           this.downstreamMgr,
@@ -255,30 +303,14 @@ export class RelayNode {
           relaySignKeyDown,
         );
 
-        hiddenGateway.ws.send(JSON.stringify(downstreamMsg));
-
-        // Wait for the response matching our request id on the persistent connection
-        const responsePromise = new Promise<OverlayMessage>((resolve, reject) => {
-          const timeout = setTimeout(() => {
-            hiddenGateway.ws.off('message', onMsg);
-            reject(new Error('hidden gateway timeout'));
-          }, 30_000);
-          const onMsg = (gwData: import('ws').RawData) => {
-            let parsed: OverlayMessage;
-            try {
-              parsed = parseOverlayMessage(gwData.toString())!;
-            } catch {
-              return; // ignore non-JSON frames, keep waiting
-            }
-            if (!parsed) return;
-            // Only resolve for the response to our specific request
-            if (parsed.id !== msg.id) return;
-            clearTimeout(timeout);
-            hiddenGateway.ws.off('message', onMsg);
-            resolve(parsed);
-          };
-          hiddenGateway.ws.on('message', onMsg);
-        });
+        // Register correlation before sending so a very fast peer cannot race
+        // its response between send() and listener setup.
+        const responsePromise = hiddenGateway.responses.waitFor(msg.id);
+        try {
+          hiddenGateway.ws.send(JSON.stringify(downstreamMsg));
+        } catch (e: any) {
+          hiddenGateway.responses.reject(msg.id, e instanceof Error ? e : new Error(String(e)));
+        }
 
         let response: OverlayMessage;
         try {
@@ -340,47 +372,37 @@ export class RelayNode {
       return;
     }
 
+    // Stable agent affinity keeps replay/deduplication state local to one
+    // replica during normal operation and spreads independent principals over
+    // the fleet without a centralized routing table.
+    const gatewayEndpoints = rendezvousOrder(route.gatewayEndpoints, `${route.fqdn}\u0000${msg.source}`);
     const tryEndpoint = async (idx: number): Promise<void> => {
-      if (idx >= route.gatewayEndpoints.length) {
+      if (idx >= gatewayEndpoints.length) {
         this.sendError(clientWs, msg, 'Gateway unreachable (all endpoints failed)');
         return;
       }
 
-      const targetUrl = route.gatewayEndpoints[idx]!;
-      const gatewayWs = new WebSocket(targetUrl, undefined, { rejectUnauthorized: true, ...tlsOpts });
-
-      gatewayWs.on('open', () => {
-        try {
-          const relaySignKeyDown = chooseOverlaySignKey(
-            this.downstreamMgr,
-            this.distributedMesh,
-            loadCA().overlaySecret,
-            route.gatewayPubKeyB64,
-          );
-          const downstreamMsg = signOverlayMessage(
-            {
-              ...msg,
-              auth: undefined,
-              source_pubkey: this.myPublicKey,
-              source_node_label: this.nodeLabel,
-              source_node_role: 'relay',
-            },
-            relaySignKeyDown,
-          );
-          gatewayWs.send(JSON.stringify(downstreamMsg));
-        } catch (e: any) {
-          this.sendError(clientWs, msg, e?.message ?? 'sign failed');
-          gatewayWs.close();
-        }
-      });
-
-      gatewayWs.on('message', (gwData) => {
-        void (async () => {
-        const response = parseOverlayMessage(gwData.toString());
+      const targetUrl = gatewayEndpoints[idx]!;
+      try {
+        const relaySignKeyDown = chooseOverlaySignKey(
+          this.downstreamMgr,
+          this.distributedMesh,
+          loadCA().overlaySecret,
+          route.gatewayPubKeyB64,
+        );
+        const downstreamMsg = signOverlayMessage(
+          {
+            ...msg,
+            auth: undefined,
+            source_pubkey: this.myPublicKey,
+            source_node_label: this.nodeLabel,
+            source_node_role: 'relay',
+          },
+          relaySignKeyDown,
+        );
+        const response = await this.gatewayPool.request(targetUrl, downstreamMsg);
         if (!response || response.type !== 'response') {
-          gatewayWs.close();
-          await tryEndpoint(idx + 1);
-          return;
+          throw new Error('Invalid gateway response');
         }
 
         const gwIdentity = await validateDistributedPeer({
@@ -393,9 +415,7 @@ export class RelayNode {
           expectedPubKeyB64: route.gatewayPubKeyB64,
         });
         if (!gwIdentity.ok) {
-          gatewayWs.close();
-          await tryEndpoint(idx + 1);
-          return;
+          throw new Error('Gateway response identity failed');
         }
 
         const okGwPub = verifyIncomingOverlayFromPeer({
@@ -406,15 +426,11 @@ export class RelayNode {
           msg: response,
         });
         if (!okGwPub) {
-          gatewayWs.close();
-          await tryEndpoint(idx + 1);
-          return;
+          throw new Error('Gateway response auth failed');
         }
 
         if (this.distributedMesh && !overlayPubkeysEqual(response.source_pubkey, route.gatewayPubKeyB64)) {
-          gatewayWs.close();
-          await tryEndpoint(idx + 1);
-          return;
+          throw new Error('Gateway response key mismatch');
         }
 
         response.trace.push('relay');
@@ -442,17 +458,12 @@ export class RelayNode {
         } catch {
           this.sendError(clientWs, msg, 'relay signing failed');
         }
-        gatewayWs.close();
-        })().catch(() => {
-          gatewayWs.close();
-          void tryEndpoint(idx + 1).catch(() => {});
-        });
-      });
-
-      gatewayWs.on('error', () => {
-        gatewayWs.close();
-        void tryEndpoint(idx + 1).catch(() => {});
-      });
+      } catch {
+        // Preserve failover without emitting an attacker-amplifiable line per
+        // retry. Cell metrics expose the aggregate failure rate.
+        this.gatewayFailures++;
+        await tryEndpoint(idx + 1);
+      }
     };
 
     await tryEndpoint(0);

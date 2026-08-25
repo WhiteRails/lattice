@@ -27,19 +27,49 @@ function nowIso(): string {
   return new Date().toISOString();
 }
 
+export interface LatticeRegistryOptions {
+  maxEntries?: number;
+  pageSize?: number;
+}
+
+const DEFAULT_MAX_ENTRIES = 100_000;
+const DEFAULT_PAGE_SIZE = 1_000;
+const MAX_KEYS_PER_SUBJECT = 64;
+const MAX_ENDPOINTS_PER_SUBJECT = 64;
+const MAX_ACCEPTED_AGENT_ISSUERS = 64;
+
+function boundedOption(value: number | undefined, fallback: number, min: number, max: number, name: string): number {
+  const resolved = value ?? fallback;
+  if (!Number.isSafeInteger(resolved) || resolved < min || resolved > max) {
+    throw new Error(`${name} must be between ${min} and ${max}`);
+  }
+  return resolved;
+}
+
 /**
  * LatticeRegistry — federated registry: stable subject, multiple rotatable keys.
  *
  * Every mutation is appended as a RegistryTransparencyEvent to the transparency log.
  */
 export class LatticeRegistry {
-  private records: Map<string, RegistryRecord> = new Map();
-  private orgToSubject: Map<string, string> = new Map();
+  private readonly records = new Map<string, RegistryRecord>();
+  private readonly subjectToName = new Map<string, string>();
+  private readonly orgToSubject = new Map<string, string>();
+  private readonly maxEntries: number;
+  private readonly pageSize: number;
 
   constructor(
     private readonly registryId: string,
     private readonly log?: LatticeLog,
-  ) {}
+    options: LatticeRegistryOptions = {},
+  ) {
+    this.maxEntries = boundedOption(options.maxEntries, DEFAULT_MAX_ENTRIES, 1, 1_000_000, 'maxEntries');
+    this.pageSize = boundedOption(options.pageSize, DEFAULT_PAGE_SIZE, 1, 10_000, 'pageSize');
+  }
+
+  snapshot(): { entries: number; maxEntries: number } {
+    return { entries: this.records.size, maxEntries: this.maxEntries };
+  }
 
   register(params: {
     name: string;
@@ -60,7 +90,22 @@ export class LatticeRegistry {
     if (this.records.has(params.name)) {
       throw new Error(`Name '${params.name}' is already registered`);
     }
+    if (this.records.size >= this.maxEntries) {
+      throw new Error(`Registry shard capacity exhausted (${this.maxEntries})`);
+    }
+    if (params.gateway_endpoints.length > MAX_ENDPOINTS_PER_SUBJECT) {
+      throw new Error(`Registry endpoint count exceeds ${MAX_ENDPOINTS_PER_SUBJECT}`);
+    }
+    if (params.accepted_agent_issuers.length > MAX_ACCEPTED_AGENT_ISSUERS) {
+      throw new Error(`Accepted issuer count exceeds ${MAX_ACCEPTED_AGENT_ISSUERS}`);
+    }
     const subject_id = params.subject_id ?? deriveDefaultSubjectId(params.name);
+    if (this.subjectToName.has(subject_id)) {
+      throw new Error(`Subject '${subject_id}' is already registered`);
+    }
+    if (params.linked_org_id && this.orgToSubject.has(params.linked_org_id)) {
+      throw new Error(`Organization '${params.linked_org_id}' is already linked`);
+    }
     const keyId = params.signing_key_id ?? 'key_initial_signing';
     const purpose = params.key_purpose ?? 'SIGNING';
     const key: KeyRecord = KeyRecordSchema.parse({
@@ -92,6 +137,7 @@ export class LatticeRegistry {
     });
 
     this.records.set(params.name, record);
+    this.subjectToName.set(subject_id, params.name);
     if (params.linked_org_id) {
       this.orgToSubject.set(params.linked_org_id, subject_id);
     }
@@ -121,6 +167,7 @@ export class LatticeRegistry {
     const record = this.get(params.name);
     const old = record.keys.find(k => k.key_id === params.old_key_id && k.key_purpose === 'SIGNING');
     if (!old) throw new Error(`Old signing key '${params.old_key_id}' not found`);
+    if (record.keys.length >= MAX_KEYS_PER_SUBJECT) throw new Error(`Key history exceeds ${MAX_KEYS_PER_SUBJECT} entries`);
 
     old.status = 'DEPRECATED';
     old.valid_until = params.old_key_valid_until;
@@ -182,6 +229,7 @@ export class LatticeRegistry {
     const record = this.get(params.name);
     const k = record.keys.find(x => x.key_id === params.compromised_key_id);
     if (!k) throw new Error(`Key '${params.compromised_key_id}' not found`);
+    if (record.keys.length >= MAX_KEYS_PER_SUBJECT) throw new Error(`Key history exceeds ${MAX_KEYS_PER_SUBJECT} entries`);
     k.status = 'REVOKED_COMPROMISED';
     k.valid_until = params.compromise_window.confirmed_at;
 
@@ -263,7 +311,8 @@ export class LatticeRegistry {
   isOrgHighRiskFrozen(linkedOrgId: string): boolean {
     const sid = this.orgToSubject.get(linkedOrgId);
     if (!sid) return false;
-    const rec = [...this.records.values()].find(r => r.subject_id === sid);
+    const name = this.subjectToName.get(sid);
+    const rec = name ? this.records.get(name) : undefined;
     if (!rec?.freeze?.active) return false;
     return rec.freeze.effect.block_high_risk_actions === true;
   }
@@ -272,7 +321,8 @@ export class LatticeRegistry {
   isNewCertIssuanceBlockedForOrg(linkedOrgId: string): boolean {
     const sid = this.orgToSubject.get(linkedOrgId);
     if (!sid) return false;
-    const rec = [...this.records.values()].find(r => r.subject_id === sid);
+    const name = this.subjectToName.get(sid);
+    const rec = name ? this.records.get(name) : undefined;
     if (!rec?.freeze?.active) return false;
     return rec.freeze.effect.block_new_cert_issuance === true;
   }
@@ -358,8 +408,15 @@ export class LatticeRegistry {
     return this.records.get(name)?.gateway_endpoints ?? [];
   }
 
-  listNames(): string[] {
-    return [...this.records.keys()];
+  /** A page from this registry shard, never the federation-wide name set. */
+  listNames(limit = this.pageSize): string[] {
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 10_000) throw new Error('limit must be between 1 and 10000');
+    const page: string[] = [];
+    for (const name of this.records.keys()) {
+      page.push(name);
+      if (page.length >= limit) break;
+    }
+    return page;
   }
 
   latticeSuffixForName(name: string): string {
