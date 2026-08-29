@@ -1,81 +1,98 @@
 # Lattice Network Protocol
 
 <p align="center">
-  <img src="docs/assets/lattice.svg" alt="Logo de Lattice" width="180" />
+  <img src="docs/assets/lattice.svg" alt="Lattice logo" width="180" />
 </p>
 
-Lattice es una red privada administrada para conectar agentes, personas y
-servicios sin exponerlos directamente a Internet. La aplicación sigue usando
-TCP, UDP o ICMP normalmente; `lattice-netd` captura esos paquetes en una
-interfaz virtual y los lleva por **LNP/1**, un túnel QUIC con TLS 1.3, mTLS,
-rutas firmadas y políticas L3/L4.
+Lattice is a managed private network for connecting agents, people, and
+services without exposing them directly to the Internet. Applications keep
+using TCP, UDP, or ICMP normally; `lattice-netd` captures those packets on a
+virtual interface and carries them through **LNP/1**, a QUIC tunnel with TLS
+1.3, mTLS, signed routes, and L3/L4 policy.
 
 ```text
-tu aplicación → interfaz Lattice (TUN) → QUIC/mTLS → Gateway → servicio privado
+your application → Lattice interface (TUN) → QUIC/mTLS → Gateway → private service
 ```
 
-La primera distribución instalable es Linux. Los adaptadores macOS y Windows
-están en el repositorio para compilación y pruebas, pero requieren firma,
-notarización y permisos propios de cada plataforma antes de distribuirse.
+The first installable distribution is Linux. macOS and Windows adapters are
+included for compilation and testing, but require platform entitlements,
+signing, and notarization before they can be distributed.
 
-## Empieza en cinco minutos
+## Get started in five minutes
 
-### 1. Prueba el código sin tocar tu red
+### 1. Try the code without changing your network
 
-Necesitas Rust 1.88+, Node.js 20+ y, para el daemon nativo, CMake/OpenSSL.
+You need Rust 1.88+, Node.js 20+, and CMake/OpenSSL for the native daemon.
 
 ```bash
-git clone <URL-del-repositorio>
+git clone <repository-url>
 cd AgneticProtocol
 npm install
 npm run build:network
 npm run test:network
 ```
 
-Esto compila `lattice-netd`, `lattice-gatewayd`, `lattice-resolver` y
-`lattice-netctl`, y ejecuta las pruebas del workspace. Todavía no crea una
-VPN: para eso hacen falta un perfil firmado, permisos de TUN y un Gateway.
+This builds `lattice-netd`, `lattice-gatewayd`, `lattice-resolver`, and
+`lattice-netctl`, then runs the network workspace tests. It does not create a
+VPN by itself: a signed profile, TUN permissions, and a Gateway are required.
 
-### 2. Instala el cliente Linux
+### 2. Install the Linux client
 
-Descarga un release bundle de Lattice, descomprímelo y ejecuta como root:
+Download a Lattice release bundle, extract it, and run:
 
 ```bash
 sudo ./install-network.sh
 ```
 
-El instalador coloca los binarios, unidades systemd, el handler de URI
-`lttc://`, reglas de forwarding y los directorios protegidos de perfiles. No
-instala una identidad automáticamente: la clave privada se genera en el
-almacén del sistema durante el enrolamiento.
+The installer places the binaries, systemd units, the `lttc://` URI handler,
+forwarding settings, and protected profile directories. It does not create an
+identity automatically: the private key is generated in the OS store during
+enrollment.
 
-### 3. Enrola un perfil
+### 3. Enroll a profile
 
-Un operador debe entregarte un `profile.offer.json` firmado. El bundle contiene
-la raíz TLS privada, el pin del Gateway, rutas/políticas iniciales y un token
-de un solo uso; **nunca** contiene una clave privada.
+An operator must provide a signed `profile.offer.json`. The offer contains the
+private TLS root, Gateway pin, initial routes/policies, and a one-time token;
+**it never contains a private key**.
+
+First, create the control-plane key pair on the operator or Gateway host:
 
 ```bash
-export LATTICE_CONTROL_PUBLIC_KEY_B64='<clave-publica-de-control-pinneada>'
+lattice-netctl pki-init --out /secure/lattice-pki --organization example
+```
+
+`pki-init` generates `control-signing-key.pem` (keep this private) and the
+corresponding pinned public key at
+`/secure/lattice-pki/control-public-key.b64`. Read only the public value:
+
+```bash
+CONTROL_KEY=$(tr -d '[:space:]' < /secure/lattice-pki/control-public-key.b64)
+echo "$CONTROL_KEY"
+```
+
+Use that base64 value when enrolling a client. Never copy
+`control-signing-key.pem` to a client machine or commit it to Git.
+
+```bash
+export LATTICE_CONTROL_PUBLIC_KEY_B64="$CONTROL_KEY"
 sudo -E lattice profile enroll /secure/profile.offer.json
 sudo lattice profile status
 ```
 
-Si necesitas el UUID para los comandos siguientes, léelo del offer (no lo
-inventes):
+The command creates the client key locally, sends a pinned CSR, and stores the
+profile under `/var/lib/lattice/profiles/<uuid>` with restrictive permissions.
+Certificates and leases are short-lived; if signed state is stale for 24 hours,
+the tunnel closes (fail closed).
+
+If you need the profile UUID, read it from the offer instead of inventing one:
 
 ```bash
 jq -r '.payload.profile_template.profile_id' /secure/profile.offer.json
 ```
 
-El comando crea la clave local, envía un CSR con pinning y guarda el perfil en
-`/var/lib/lattice/profiles/<uuid>` con permisos restrictivos. Certificados y
-leases son breves; si el estado firmado queda vencido durante 24 horas, el
-túnel se cierra (fail closed).
+### 4. Connect and verify
 
-### 4. Conecta y verifica
-
-El modo recomendado es systemd, que mantiene el pin y el estado del perfil:
+The recommended mode is systemd, which keeps the profile pin and state active:
 
 ```bash
 sudo systemctl enable --now lattice-resolver
@@ -85,81 +102,80 @@ ip -br addr | grep -E 'lp|lattice' || true
 ip route
 ```
 
-Para una prueba manual, conserva la misma clave de control y ejecuta:
+For a manual test, keep the same pinned control key in the environment:
 
 ```bash
 sudo -E lattice profile connect --profile-id <profile-uuid>
 ```
 
-Si no hay TUN, permisos o un perfil válido, el comando falla; no activa un
-proxy alternativo ni deja tráfico abierto.
+If TUN, permissions, or the profile are invalid, the command fails; it does
+not enable a proxy fallback or leave traffic open.
 
-Para detener o renovar el perfil:
+To stop or renew a profile:
 
 ```bash
 sudo lattice profile disconnect --profile-id <profile-uuid>
 sudo -E lattice profile renew --bundle /secure/profile.offer.json
 ```
 
-### 5. Prueba DNS y un servicio
+### 5. Test DNS and a service
 
-Los nombres privados se resuelven desde rutas firmadas. En un host Linux con
-`systemd-resolved` puedes comprobar una entrada así:
+Private names are resolved from signed routes. On a Linux host using
+`systemd-resolved`:
 
 ```bash
 resolvectl query echo.lattice
 ```
 
-Cuando el binding publica HTTPS y la CA privada está instalada, prueba el
-servicio con `curl --fail --noproxy '*' https://<servicio>.coral/health` (o con
-su alias `.reef`). El ejemplo Docker usa endpoints HTTP de prueba y los valida
-con `network/tests/dev-client-e2e.sh`.
+When a binding publishes HTTPS and the private CA is installed, test it with
+`curl --fail --noproxy '*' https://<service>.coral/health` (or its `.reef`
+alias). The Docker example uses HTTP test endpoints and validates them with
+`network/tests/dev-client-e2e.sh`.
 
-En el cliente Docker de desarrollo no existe `systemd-resolved`. Los scripts
-de abajo suponen el stack de desarrollo ya levantado (contenedores
-`lattice-lnp-e2e` y `lattice-dev-gateway`, con `/dev/net/tun`). Desde el host
-Docker ejecuta el puente de DNS dividido y luego la prueba E2E:
+The Docker development client does not have `systemd-resolved`. The scripts
+below assume the development stack is already running (containers named
+`lattice-lnp-e2e` and `lattice-dev-gateway`, with `/dev/net/tun`). From the
+Docker host, configure split DNS and run the E2E check:
 
 ```bash
 network/tests/configure-dev-dns.sh
 network/tests/dev-client-e2e.sh <profile-uuid>
 ```
 
-El puente envía únicamente `.lattice`, `.coral` y `.reef` al resolver de Lattice
-y conserva los resolvers públicos para el resto. Si consultas un nombre
-público directamente al resolver Lattice, recibirás `REFUSED` por diseño.
+The bridge sends only `.lattice`, `.coral`, and `.reef` to the Lattice resolver
+and keeps public resolvers for everything else. A public name queried directly
+against the Lattice resolver returns `REFUSED` by design.
 
-### Diagnóstico rápido
+### Quick troubleshooting
 
-- `profile status` no muestra perfiles: todavía no ejecutaste el enrolamiento o
-  estás mirando otro `--state-dir`.
-- `ping echo.lattice` dice *Name or service not known*: comprueba primero
-  `resolvectl status`; en Docker vuelve a ejecutar
-  `network/tests/configure-dev-dns.sh` y usa `dig @127.0.0.1 -p 5353
-  echo.lattice` para aislar el problema de DNS.
-- No aparece una interfaz `lp...`: el proceso no tiene TUN/permisos o el perfil
-  fue rechazado. Revisa `journalctl -u lattice-netd@<profile-uuid>`; no
-  desactives el kill-switch para “probar”.
+- `profile status` shows no profiles: enrollment has not run, or you are using
+  a different `--state-dir`.
+- `ping echo.lattice` says *Name or service not known*: check `resolvectl
+  status`; in Docker, rerun `network/tests/configure-dev-dns.sh` and isolate
+  DNS with `dig @127.0.0.1 -p 5353 echo.lattice`.
+- No `lp...` interface appears: the process lacks TUN/network permissions or
+  the profile was rejected. Check `journalctl -u lattice-netd@<profile-uuid>`;
+  do not disable the kill switch to test.
 
-## Cómo se nombran las cosas
+## Naming
 
-Cada namespace tiene una función distinta:
+Each namespace has one job:
 
-| Nombre | Significado | Ejemplo |
+| Name | Meaning | Example |
 | --- | --- | --- |
-| `lttc://` | Deep link que activa un perfil y abre HTTPS | `lttc://alice.coral/health` |
-| `*.coral` | Identidad de un participante o servicio delegado | `alice.coral`, `api.alice.coral` |
-| `<hash>.coral` | Identidad canónica derivada del SPKI TLS del servicio | `<base32-sha256>.coral` |
-| `*.reef` | Nombre legible registrado on-chain | `clipma.reef` |
-| `*.lattice` | Infraestructura propia de la red | `resolver.lattice`, `echo.lattice` |
+| `lttc://` | Deep link that activates a profile and opens HTTPS | `lttc://alice.coral/health` |
+| `*.coral` | Participant identity or delegated service | `alice.coral`, `api.alice.coral` |
+| `<hash>.coral` | Canonical identity derived from the service TLS SPKI | `<base32-sha256>.coral` |
+| `*.reef` | Human-readable on-chain registered name | `clipma.reef` |
+| `*.lattice` | Lattice infrastructure | `resolver.lattice`, `echo.lattice` |
 
-La IP virtual (`10.x`, `fd00:...`) sólo es una ruta actual. La identidad real
-la fijan la firma del perfil, el certificado TLS y su pin SPKI. Un alias humano
-es válido únicamente cuando está firmado y delegado por la identidad canónica.
-Por eso el mismo servicio puede cambiar de Wi-Fi, Gateway o IP sin cambiar de
-nombre.
+The virtual IP (`10.x`, `fd00:...`) is only a current route. The actual
+identity is established by the profile signature, TLS certificate, and SPKI
+pin. A human alias is valid only when signed and delegated by its canonical
+identity. A service can therefore change Wi-Fi, Gateway, or IP without changing
+its name.
 
-Ejemplos:
+Examples:
 
 ```text
 lttc://alice.coral/                  → https://alice.coral/
@@ -168,51 +184,50 @@ lttc://clipma.reef/orders?id=42      → https://clipma.reef/orders?id=42
 lttc://echo/health                    → https://echo.lattice/health
 ```
 
-El parser acepta sólo `lttc://`. Rechaza `lattice://`, `lp://`, credenciales,
-puertos explícitos, fragmentos, IP literales y hosts no canónicos. Chrome no
-recibe una contraseña ni se configura con un proxy: el handler valida el deep
-link, activa el perfil requerido y deja que Chrome conecte por HTTPS usando la
-CA privada instalada en el dispositivo administrado.
+The parser accepts only `lttc://`. It rejects `lattice://`, `lp://`,
+credentials, explicit ports, fragments, IP literals, and non-canonical hosts.
+Chrome receives no password and is not configured with a proxy: the handler
+validates the deep link, activates the required profile, and lets Chrome use
+HTTPS with the private CA installed on the managed device.
 
-## Qué incluye LNP/1
+## What LNP/1 includes
 
-- **`lattice-net-core`**: frames de control, fragmentación acotada, perfiles,
-  leases, políticas, validación URI y pinning TLS.
-- **`lattice-netd`**: cliente QUIC, TUN, rutas, DNS, kill-switch y ciclo de vida
-  del perfil; `lattice run --agent ...` exige aislamiento verificable.
-- **`lattice-gatewayd`**: Gateway mTLS que autoriza perfil, agente, servicio o
-  CIDR, protocolo y puerto antes de reenviar paquetes.
-- **`lattice-resolver`**: resolver autoritativo sólo para `.lattice`, `.coral`
-  y `.reef`; nunca filtra consultas privadas a DNS público.
-- **`lattice-netctl`**: PKI X.509 privada, CSR, bundles, revocación y allowlists
-  de egress.
-- **`latticed`**: custodia local de claves Ed25519 y leases de agente breves.
+- **`lattice-net-core`**: control frames, bounded fragmentation, profiles,
+  leases, policy, URI validation, and TLS pinning.
+- **`lattice-netd`**: QUIC client, TUN, routes, DNS, kill switch, and profile
+  lifecycle; `lattice run --agent ...` requires verifiable isolation.
+- **`lattice-gatewayd`**: mTLS Gateway authorizing profile, agent, service or
+  CIDR, protocol, and port before forwarding packets.
+- **`lattice-resolver`**: authoritative resolver for `.lattice`, `.coral`, and
+  `.reef`; it never leaks private queries to public DNS.
+- **`lattice-netctl`**: private X.509 PKI, CSRs, bundles, revocation, and egress
+  allowlists.
+- **`latticed`**: local Ed25519 key custody and short-lived agent leases.
 
-QUIC aporta cifrado y control de congestión; Lattice no inventa criptografía.
-LNP/1 anuncia MTU 1280 y limita tamaño, cantidad, tiempo y memoria de
-reensamblado. Split-tunnel y full-tunnel son decisiones explícitas del perfil;
-el full-tunnel necesita un Gateway de salida con allowlist.
+QUIC provides encryption and congestion control; Lattice does not invent
+cryptography. LNP/1 advertises MTU 1280 and bounds reassembly size, count, age,
+and memory. Split-tunnel and full-tunnel are explicit profile choices; a
+full-tunnel profile requires a Gateway with an egress allowlist.
 
-## Aislamiento por agente
+## Per-agent isolation
 
-En Linux, el modo por agente crea un namespace dedicado y permite únicamente
-loopback, la interfaz Lattice y el endpoint UDP exacto del Gateway:
+On Linux, per-agent mode creates a dedicated namespace and permits only
+loopback, the Lattice interface, and the exact Gateway UDP endpoint:
 
 ```bash
 sudo --preserve-env=LATTICE_CONTROL_PUBLIC_KEY_B64 \
-  lattice run --agent bot1 --profile <profile-uuid> -- /ruta/a/tu-agente
+  lattice run --agent bot1 --profile <profile-uuid> -- /path/to/your-agent
 ```
 
-Si el sistema no puede demostrar ese aislamiento, el comando se niega a
-ejecutar. macOS y Windows sólo habilitarán per-app cuando sus políticas nativas
-o MDM lo hagan verificable.
+If the system cannot prove that isolation, the command refuses to run. macOS
+and Windows enable per-app mode only when native or MDM policy is verifiable.
 
-## Migración desde el overlay anterior
+## Migrating from the previous overlay
 
-El overlay HTTP/Relay y las direcciones `lp://` quedan archivados: no hay
-fallback de runtime. El migrador transforma una sola vez namespaces, servicios
-y grants a bindings de IP virtual y reglas L3/L4; no copia claves privadas ni
-certificados JSON antiguos.
+The HTTP/Relay overlay and `lp://` addresses are archived; there is no runtime
+fallback. The migrator transforms namespaces, services, and grants once into
+virtual-IP bindings and L3/L4 rules. It never copies old private keys or JSON
+certificates.
 
 ```bash
 npm run migrate:network -- \
@@ -224,67 +239,65 @@ npm run migrate:network -- \
   --out /secure/profile-template.json
 ```
 
-Las autorizaciones HTTP sólo se conservan si se indica explícitamente
-`--terminate-tls`; un paquete cifrado no implica por sí solo permiso HTTP.
+HTTP authorizations are preserved only with an explicit `--terminate-tls`; an
+encrypted packet does not imply HTTP permission by itself.
 
-## Estado por plataforma
+## Platform status
 
-- **Linux:** cliente instalable con TUN, systemd, `iproute2`, `nftables`, DNS
-  dividido y namespaces. Es la única distribución de esta entrega.
-- **macOS:** host `NEPacketTunnelProvider` compilable. Requiere Network
-  Extension entitlement, firma y notarización de Apple.
-- **Windows:** host `IVpnPlugIn`/MSIX compilable. Requiere firma de Microsoft y
-  política de filtrado para per-app.
-- **Móvil:** fuera de alcance.
+- **Linux:** installable client with TUN, systemd, `iproute2`, `nftables`, split
+  DNS, and namespaces. This is the only distribution in this release.
+- **macOS:** compilable `NEPacketTunnelProvider` host. Requires Network
+  Extension entitlement, Apple signing, and notarization.
+- **Windows:** compilable `IVpnPlugIn`/MSIX host. Requires Microsoft signing and
+  a traffic-filter policy for per-app mode.
+- **Mobile:** out of scope.
 
-## Desarrollo y validación
+## Development and validation
 
 ```bash
 npm run build                 # TypeScript
-npm run build:contracts       # ABI/bin de LatticeChain
-npm run build:network         # workspace Rust LNP/1
-npm run test:network          # pruebas Rust del workspace
-npm run test:rust             # cliente Rust/LTP
+npm run build:contracts       # LatticeChain ABI/bin
+npm run build:network         # LNP/1 Rust workspace
+npm run test:network          # Rust workspace tests
+npm run test:rust             # LTP/1 Rust client
 cargo clippy --manifest-path network/Cargo.toml --workspace --all-targets -- -D warnings
 ```
 
-Los tests de red privilegiados necesitan Linux con `/dev/net/tun`,
-`iproute2`, `nftables`, `setpriv` y permisos de red. Las pruebas de macOS y
-Windows se ejecutan en sus runners nativos. Antes de habilitar una VPN fuera
-de un entorno local todavía deben completarse las pruebas E2E autenticadas,
-DNS sin filtración, revocación, caída del control plane, bloqueo de bypass
-IPv4/IPv6/DoH/proxy y una auditoría de seguridad fresca.
+Privileged network tests require Linux with `/dev/net/tun`, `iproute2`,
+`nftables`, `setpriv`, and network permissions. macOS and Windows tests run on
+native CI runners. Before enabling a VPN outside a local environment, complete
+authenticated E2E tests, DNS leak checks, revocation, control-plane outage,
+IPv4/IPv6/DoH/proxy bypass blocking, and a fresh security audit.
 
-## Seguridad y operación
+## Security and operations
 
-Registra sólo identidad/perfil, servicio o IP de destino, protocolo, bytes,
-decisión, versión de política y huellas. Nunca registres payloads ni consultas
-DNS completas. Revoca perfiles/certificados desde el control plane y renueva
-antes de 90 días.
+Log only profile identity, destination service or IP, protocol, bytes, decision,
+policy version, and fingerprints. Never log payloads or complete DNS queries.
+Revoke profiles/certificates from the control plane and renew before 90 days.
 
-Más detalle:
+More detail:
 
-- [Especificación de nombres](docs/lattice-naming-protocol.md)
+- [Naming specification](docs/lattice-naming-protocol.md)
 - [LNP/1](docs/lnp-1.md)
-- [Soporte de plataformas](docs/platform-support.md)
-- [Esquema `lttc://`](docs/lattice-uri-scheme.md)
-- [Runbook operativo](RUNBOOK.md)
+- [Platform support](docs/platform-support.md)
+- [`lttc://` scheme](docs/lattice-uri-scheme.md)
+- [Operations runbook](RUNBOOK.md)
 
-## Estructura del repositorio
+## Repository layout
 
 ```text
-network/       workspace Rust de LNP/1 (cliente, Gateway, resolver y PKI)
-clients/rust/  cliente nativo LTP/1 y wrapper del comando `lattice`
-daemon/        `latticed`, custodia local de claves
-node/          control plane/overlay archivado para migración y auditoría
-contracts/     LatticeChain y bindings on-chain
-services/      servicios de ejemplo (incluido echo)
-tests/         pruebas TypeScript
-docs/          especificaciones y runbooks
+network/       LNP/1 Rust workspace (client, Gateway, resolver, PKI)
+clients/rust/  native LTP/1 client and `lattice` wrapper
+daemon/        `latticed`, local key custody
+node/          archived control plane/overlay for migration and audit
+contracts/     LatticeChain and on-chain bindings
+services/      example services (including echo)
+tests/         TypeScript tests
+docs/          specifications and runbooks
 ```
 
-Consulta los términos de licencia incluidos en el release que distribuyas.
+Refer to the license terms included with the release you distribute.
 
-Lattice está diseñada para fallar cerrada: un perfil ausente, una firma
-inválida, una ruta vencida o un adaptador no verificable bloquea el tráfico en
-lugar de degradar silenciosamente a HTTP, proxy o `lp://`.
+Lattice is designed to fail closed: a missing profile, invalid signature,
+expired route, or unverifiable adapter blocks traffic instead of silently
+degrading to HTTP, a proxy, or `lp://`.
