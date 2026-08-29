@@ -17,5 +17,8 @@ serde_json.workspace = true
 tokio.workspace = true
 tun-rs.workspace = true
 uuid.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 ipnet.workspace = true
 sha2.workspace = true

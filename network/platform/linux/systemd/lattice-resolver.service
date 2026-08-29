@@ -1,0 +1,23 @@
+[Unit]
+Description=Lattice aggregate private DNS resolver
+After=network.target
+
+[Service]
+Type=simple
+User=root
+Group=lattice
+EnvironmentFile=/etc/lattice/network.env
+ExecStart=/usr/local/bin/lattice-resolver --bind 127.0.0.1:5353 --profiles-dir /var/lib/lattice/profiles
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+ReadOnlyPaths=/var/lib/lattice/profiles
+
+[Install]
+WantedBy=multi-user.target

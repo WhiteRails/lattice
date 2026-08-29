@@ -1,5 +1,9 @@
 # Lattice Protocol — Trust Model & Post-Quantum Spec
 
+> **Archived transport design.** Identity concepts remain historical context,
+> but the `lp://`/onion data plane described here is not a supported runtime.
+> See [`lnp-1.md`](lnp-1.md) for the current network security boundary.
+
 The Lattice Protocol implements the **Traceveil Trust Chain**, moving beyond a simple "who are you" identity model into a full **Multi-Issuer Agent PKI** optimized for autonomous AI, coupled with **Post-Quantum Cryptographic Agility** and **Selective Accountability**.
 
 ## 1. Multi-Issuer Agent PKI

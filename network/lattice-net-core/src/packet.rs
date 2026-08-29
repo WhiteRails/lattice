@@ -177,18 +177,26 @@ impl PacketReassembler {
         }
     }
 
-    pub fn push(&mut self, fragment: PacketFragment, now: Instant) -> Result<Option<Vec<u8>>, PacketError> {
+    pub fn push(
+        &mut self,
+        fragment: PacketFragment,
+        now: Instant,
+    ) -> Result<Option<Vec<u8>>, PacketError> {
         self.evict_expired(now);
         validate_fragment(&fragment)?;
-        if !self.entries.contains_key(&fragment.packet_id) && self.entries.len() >= self.max_packets {
+        if !self.entries.contains_key(&fragment.packet_id) && self.entries.len() >= self.max_packets
+        {
             return Err(PacketError::ReassemblyBudget);
         }
-        let entry = self.entries.entry(fragment.packet_id).or_insert_with(|| Assembly {
-            total_len: fragment.total_len as usize,
-            fragments: BTreeMap::new(),
-            bytes: 0,
-            created: now,
-        });
+        let entry = self
+            .entries
+            .entry(fragment.packet_id)
+            .or_insert_with(|| Assembly {
+                total_len: fragment.total_len as usize,
+                fragments: BTreeMap::new(),
+                bytes: 0,
+                created: now,
+            });
         if entry.total_len != fragment.total_len as usize {
             return Err(PacketError::ConflictingFragment);
         }
@@ -201,7 +209,9 @@ impl PacketReassembler {
             };
         }
         let new_bytes = fragment.payload.len();
-        if self.bytes + new_bytes > self.max_bytes || entry.fragments.len() >= MAX_FRAGMENTS_PER_PACKET {
+        if self.bytes + new_bytes > self.max_bytes
+            || entry.fragments.len() >= MAX_FRAGMENTS_PER_PACKET
+        {
             return Err(PacketError::ReassemblyBudget);
         }
         for (&existing_offset, existing) in &entry.fragments {
@@ -239,7 +249,9 @@ impl PacketReassembler {
         let expired: Vec<_> = self
             .entries
             .iter()
-            .filter_map(|(&id, entry)| (now.duration_since(entry.created) >= self.ttl).then_some(id))
+            .filter_map(|(&id, entry)| {
+                (now.duration_since(entry.created) >= self.ttl).then_some(id)
+            })
             .collect();
         for id in expired {
             if let Some(entry) = self.entries.remove(&id) {
@@ -281,12 +293,27 @@ mod tests {
         let now = Instant::now();
         let mut reassembler = PacketReassembler::default();
         reassembler
-            .push(PacketFragment { packet_id: 1, offset: 0, total_len: 40, payload: vec![0; 20] }, now)
+            .push(
+                PacketFragment {
+                    packet_id: 1,
+                    offset: 0,
+                    total_len: 40,
+                    payload: vec![0; 20],
+                },
+                now,
+            )
             .unwrap();
         let error = reassembler
-            .push(PacketFragment { packet_id: 1, offset: 10, total_len: 40, payload: vec![0; 20] }, now)
+            .push(
+                PacketFragment {
+                    packet_id: 1,
+                    offset: 10,
+                    total_len: 40,
+                    payload: vec![0; 20],
+                },
+                now,
+            )
             .unwrap_err();
         assert_eq!(error, PacketError::ConflictingFragment);
     }
 }
-

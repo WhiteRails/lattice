@@ -5,6 +5,7 @@ use uuid::Uuid;
 use crate::{LNP_LINK_MTU, LNP_VERSION};
 
 pub const MAX_CONTROL_FRAME_BYTES: usize = 64 * 1024;
+pub const MAX_ENROLLMENT_FRAME_BYTES: usize = 1024 * 1024;
 pub const CONTROL_HEADER_BYTES: usize = 4;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -26,6 +27,23 @@ pub enum ControlFrame {
     },
     KeepAlive {
         unix_time: i64,
+    },
+    Error {
+        code: String,
+        message: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum EnrollmentFrame {
+    Request {
+        token: String,
+        csr_pem: String,
+    },
+    Response {
+        profile_bundle_json: String,
+        client_cert_chain_pem: String,
     },
     Error {
         code: String,
@@ -62,8 +80,24 @@ pub enum ControlFrameError {
 }
 
 pub fn encode_control(frame: &ControlFrame) -> Result<Vec<u8>, ControlFrameError> {
+    encode_frame(frame, MAX_CONTROL_FRAME_BYTES)
+}
+
+pub fn decode_control(input: &[u8]) -> Result<(ControlFrame, usize), ControlFrameError> {
+    decode_frame(input, MAX_CONTROL_FRAME_BYTES)
+}
+
+pub fn encode_enrollment(frame: &EnrollmentFrame) -> Result<Vec<u8>, ControlFrameError> {
+    encode_frame(frame, MAX_ENROLLMENT_FRAME_BYTES)
+}
+
+pub fn decode_enrollment(input: &[u8]) -> Result<(EnrollmentFrame, usize), ControlFrameError> {
+    decode_frame(input, MAX_ENROLLMENT_FRAME_BYTES)
+}
+
+fn encode_frame<T: Serialize>(frame: &T, maximum: usize) -> Result<Vec<u8>, ControlFrameError> {
     let payload = serde_json::to_vec(frame)?;
-    if payload.len() > MAX_CONTROL_FRAME_BYTES {
+    if payload.len() > maximum {
         return Err(ControlFrameError::TooLarge);
     }
     let mut out = Vec::with_capacity(CONTROL_HEADER_BYTES + payload.len());
@@ -72,12 +106,15 @@ pub fn encode_control(frame: &ControlFrame) -> Result<Vec<u8>, ControlFrameError
     Ok(out)
 }
 
-pub fn decode_control(input: &[u8]) -> Result<(ControlFrame, usize), ControlFrameError> {
+fn decode_frame<T: for<'de> Deserialize<'de>>(
+    input: &[u8],
+    maximum: usize,
+) -> Result<(T, usize), ControlFrameError> {
     if input.len() < CONTROL_HEADER_BYTES {
         return Err(ControlFrameError::Incomplete);
     }
     let payload_len = u32::from_be_bytes(input[..4].try_into().unwrap()) as usize;
-    if payload_len > MAX_CONTROL_FRAME_BYTES {
+    if payload_len > maximum {
         return Err(ControlFrameError::TooLarge);
     }
     let consumed = CONTROL_HEADER_BYTES + payload_len;
@@ -104,7 +141,9 @@ mod tests {
     #[test]
     fn oversized_length_is_rejected_before_json_parsing() {
         let input = ((MAX_CONTROL_FRAME_BYTES + 1) as u32).to_be_bytes();
-        assert!(matches!(decode_control(&input), Err(ControlFrameError::TooLarge)));
+        assert!(matches!(
+            decode_control(&input),
+            Err(ControlFrameError::TooLarge)
+        ));
     }
 }
-

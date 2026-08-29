@@ -1,0 +1,49 @@
+name: network-adapters
+
+on:
+  push:
+    paths: ["network/**", "clients/rust/**", ".github/workflows/network-adapters.yml"]
+  pull_request:
+    paths: ["network/**", "clients/rust/**", ".github/workflows/network-adapters.yml"]
+
+jobs:
+  rust:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo check --manifest-path network/Cargo.toml --workspace
+
+  macos-host:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: swift build --package-path network/platform/macos
+
+  windows-host:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+      - run: dotnet build network/platform/windows/LatticeVpnPlugin/LatticeVpnPlugin.csproj
+
+  linux-network-e2e:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install privileged network-test dependencies
+        run: sudo apt-get update && sudo apt-get install --yes dnsutils iproute2 nftables
+      - name: Build LNP/1 binaries
+        run: cargo build --locked --manifest-path network/Cargo.toml --bins
+      - name: Pinned CSR enrollment
+        run: bash network/tests/enrollment-e2e.sh
+      - name: Linux full-tunnel enforcement
+        run: sudo env LATTICE_E2E_MODE=full LATTICE_E2E_BIN_DIR="$GITHUB_WORKSPACE/network/target/debug" bash network/tests/linux-e2e.sh
+      - name: Linux split-tunnel enforcement
+        run: sudo env LATTICE_E2E_MODE=split LATTICE_E2E_BIN_DIR="$GITHUB_WORKSPACE/network/target/debug" bash network/tests/linux-e2e.sh

@@ -8,8 +8,7 @@ Type=simple
 User=root
 Group=lattice
 EnvironmentFile=/etc/lattice/profiles/%i.env
-LoadCredentialEncrypted=client-key:/etc/credstore.encrypted/lattice-client-key-%i
-ExecStart=/usr/local/bin/lattice-netd profile-connect --profile-id %i --state-dir /var/lib/lattice/profiles --client-key-ref %d/client-key
+ExecStart=/usr/local/bin/lattice-netd profile-connect --profile-id %i --state-dir /var/lib/lattice/profiles --client-key-ref /var/lib/lattice/profiles/%i/client-key.pem
 Restart=on-failure
 RestartSec=2
 TimeoutStopSec=15
@@ -30,4 +29,3 @@ ReadWritePaths=/var/lib/lattice /run/lattice
 
 [Install]
 WantedBy=multi-user.target
-

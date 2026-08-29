@@ -28,4 +28,3 @@ pub enum FlowDecision {
     Allow,
     Deny,
 }
-

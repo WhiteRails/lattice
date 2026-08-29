@@ -1,5 +1,8 @@
 # Lattice Onion v1
 
+> **Archived transport.** Onion v1 is retained as audited design history and is
+> not a runtime fallback. LNP/1 is the only supported data plane.
+
 `distributedMesh: true` now requires `overlayProtocol: onion-v1`. The process fails closed when the route is not v3, when fewer than three operator-diverse relays are available, when WSS or its registered SPKI pin fails, or when HPKE/onion authentication fails. There is no plaintext fallback in mesh mode.
 
 ## Security boundary

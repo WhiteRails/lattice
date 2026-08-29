@@ -10,16 +10,8 @@ permissions:
 
 jobs:
   bundle:
-    name: ${{ matrix.name }}
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: linux-x86_64
-            runner: ubuntu-24.04
-          - name: macos-arm64
-            runner: macos-14
+    name: linux-x86_64
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
@@ -32,13 +24,8 @@ jobs:
         with:
           toolchain: stable
 
-      - name: Install OpenSSL development headers (Linux)
-        if: runner.os == 'Linux'
+      - name: Install OpenSSL development headers
         run: sudo apt-get update && sudo apt-get install --yes libssl-dev
-
-      - name: Select Homebrew OpenSSL (macOS)
-        if: runner.os == 'macOS'
-        run: echo "OPENSSL_ROOT_DIR=$(brew --prefix openssl@3)" >> "$GITHUB_ENV"
 
       - name: Install Node dependencies
         run: npm ci
@@ -49,6 +36,6 @@ jobs:
       - name: Upload native bundle and checksum
         uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4.6.0
         with:
-          name: lattice-${{ matrix.name }}
+          name: lattice-linux-x86_64
           path: artifacts/*
           if-no-files-found: error

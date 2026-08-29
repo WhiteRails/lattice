@@ -180,7 +180,7 @@ export class LpGatewayResolver {
   }
 
   /**
-   * Resolve a self-authenticating lp://<hex>.id address.
+   * Resolve a self-authenticating lp://<base32-key>.coral address.
    * The pubkey is embedded in the address — no chain lookup needed.
    * Routing-cache/federation provide the endpoints; pubkey provides identity.
    */
@@ -188,7 +188,8 @@ export class LpGatewayResolver {
     const pubkeyB64 = pubkeyFromSelfAuthFqdn(fqdn);
     if (!pubkeyB64) throw new LpRoutingNotFoundError(`Invalid self-auth address: ${fqdn}`);
 
-    // The .id key establishes identity, not authority for arbitrary endpoints.
+    // The key-derived `.coral` name establishes identity, not authority for
+    // arbitrary endpoints.
     // Only an operator-authenticated local route may name where to dial.
     const payload = lookupRoutingPayload(this.cfg, fqdn, { requireLocalSig: true });
 
@@ -226,7 +227,8 @@ export class LpGatewayResolver {
   async resolveDestination(lpDestination: string): Promise<ResolvedGatewayRoute> {
     const fqdn = fqdnFromLpAddress(lpDestination);
 
-    // Self-authenticating .id address — pubkey IS the identity, no chain needed
+    // Self-authenticating `<id>.coral` address — pubkey IS the identity, no
+    // chain lookup is permitted.
     if (isSelfAuthAddress(fqdn)) {
       return this.resolveSelfAuth(fqdn, lpDestination);
     }

@@ -1,0 +1,26 @@
+[package]
+name = "lattice-network-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+lattice-net-core = { path = "../lattice-net-core" }
+
+[[bin]]
+name = "lnp_parsers"
+path = "fuzz_targets/lnp_parsers.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "reassembly"
+path = "fuzz_targets/reassembly.rs"
+test = false
+doc = false
+bench = false

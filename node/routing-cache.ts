@@ -142,8 +142,8 @@ export function fqdnFromLpAddress(lp: string): string {
   if (s.startsWith('lp://')) s = s.slice(5);
   s = s.split('/')[0] ?? '';
   const lower = s.toLowerCase();
-  if (!lower.endsWith('.lattice') && !lower.endsWith('.id')) {
-    throw new Error(`Invalid Lattice service address (expected *.lattice or *.id): ${lp}`);
+  if (!lower.endsWith('.lattice') && !lower.endsWith('.coral') && !lower.endsWith('.reef')) {
+    throw new Error(`Invalid Lattice service address (expected *.lattice, *.coral or *.reef): ${lp}`);
   }
   return lower;
 }

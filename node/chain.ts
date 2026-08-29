@@ -117,12 +117,12 @@ export function resolvePrivateKeyFromCli(opts: { key?: string; keyFile?: string 
   return k;
 }
 
-/** ASCII `label.lattice` (single label). Mirrors LatticeChain namespace rules. */
+/** ASCII `label.reef` (single label). Mirrors LatticeChain namespace rules. */
 export function assertValidPublicLatticeFqdn(fqdn: string): void {
   const s = fqdn.trim();
-  if (!/^[a-z0-9-]+\.lattice$/.test(s)) {
+  if (!/^[a-z0-9-]+\.reef$/.test(s)) {
     throw new Error(
-      'FQDN must be ASCII lowercase: one label [a-z0-9-]+ followed by `.lattice` (e.g. echo.lattice). Reserved slugs require the contract owner.',
+      'FQDN must be ASCII lowercase: one label [a-z0-9-]+ followed by `.reef` (e.g. clipma.reef). Reserved slugs require the contract owner.',
     );
   }
 }
@@ -267,6 +267,38 @@ export async function chainUpdateNamespaceServiceBinding(
   const meta = hasMetaArg ? optionalBytes32(metadataHash) : row.metadataHash;
   const c = getSignerContract(rpcUrl, privateKey, contractAddress);
   const tx = await c.updateNamespaceServiceBinding(fqdn.trim(), svc, meta);
+  const receipt = await tx.wait();
+  return receipt.hash;
+}
+
+export async function chainPublishNetworkServiceBinding(
+  rpcUrl: string,
+  privateKey: string,
+  contractAddress: string,
+  fqdn: string,
+  virtualIpBytes16: string,
+  ipVersion: 4 | 6,
+  gatewayQuicEndpoint: string,
+  gatewayTlsSpkiSha256: string,
+  networkPolicyHash: string,
+  httpPolicyHash: string | undefined,
+  version: bigint,
+): Promise<string> {
+  assertValidPublicLatticeFqdn(fqdn);
+  if (!/^0x[0-9a-fA-F]{32}$/.test(virtualIpBytes16)) throw new Error('virtual IP must encode to bytes16');
+  if (!gatewayQuicEndpoint || Buffer.byteLength(gatewayQuicEndpoint, 'utf8') > 512) throw new Error('invalid QUIC endpoint');
+  if (version <= 0n) throw new Error('binding version must be positive');
+  const c = getSignerContract(rpcUrl, privateKey, contractAddress);
+  const tx = await c.publishNetworkServiceBinding(
+    fqdn.trim(),
+    virtualIpBytes16,
+    ipVersion,
+    gatewayQuicEndpoint,
+    optionalBytes32(gatewayTlsSpkiSha256),
+    optionalBytes32(networkPolicyHash),
+    optionalBytes32(httpPolicyHash),
+    version,
+  );
   const receipt = await tx.wait();
   return receipt.hash;
 }

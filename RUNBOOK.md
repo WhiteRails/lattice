@@ -1,578 +1,210 @@
-# Lattice Security Operations Runbook
+# Lattice LNP/1 operations runbook
 
-**Version:** 1.0
-**Project:** Lattice Security Hardening
-**Compliance:** AC-21 (procedures 1–4 are required controls)
+This runbook covers the supported OS-level VPN. It contains no proxy or
+WebSocket fallback procedure.
 
----
+## 1. Preconditions
 
-## Table of Contents
+- A private Lattice X.509 root/intermediate and Ed25519 control signing key.
+- A managed client whose trust store may receive the private service root.
+- Linux: `iproute2`, `nftables`, `systemd`, `util-linux` and TUN.
+- UDP reachability to the configured QUIC port (default 7443).
 
-1. [AC-21-P1: Session Key Rotation](#ac-21-p1-session-key-rotation)
-2. [AC-21-P2: Operator Key Compromise Response](#ac-21-p2-operator-key-compromise-response)
-3. [AC-21-P3: Agent Revocation in Production](#ac-21-p3-agent-revocation-in-production)
-4. [AC-21-P4: PAS State Rollback](#ac-21-p4-pas-state-rollback)
-5. [KMS Plugin Development](#kms-plugin-development)
-6. [Proxy Mode Network Limitation](#proxy-mode-network-limitation)
-7. [F1 Distributed Public Overlay Bring-Up](#f1-distributed-public-overlay-bring-up)
-8. [Lattice Onion v1](docs/lattice-onion-v1.md)
+Never copy a CA private key or the control signing key to a client or Gateway.
+Runtime services get only their leaf key, chain, trust root and signed profile.
 
----
-
-## F1 Distributed Public Overlay Bring-Up
-
-> **Scope.** F1 proves a distributed public Onion v1 overlay: Entry reaches a Gateway through exactly three operator-diverse Relays over pinned WSS, without sharing `overlaySecret`. Hidden mode uses two independent three-hop circuits terminating at an authenticated rendezvous descriptor.
-
-### Minimum topology
-
-- Chain VPS: Anvil JSON-RPC reachable by operators, e.g. `http://chain.example:8545`.
-- Three Relay VPSes operated independently: `relay-1` (guard), `relay-2` (middle) and `relay-3` (exit), WSS `:8888`.
-- Gateway VPS: `gw-echo.example.com`, role `gateway`, WSS `:8889`, backend on localhost.
-- Entry VPS: `entry-1.example.com`, role `entry`, local HTTP proxy `127.0.0.1:7777`.
-
-Production will not build a circuit with fewer than three distinct relay labels and three distinct `operatorId` values. Give every node a stable `nodeId` (`relay-1`, `gateway-echo`, `entry-1`, etc.).
-
-### TLS / WSS
-
-On every public Relay/Gateway VPS:
+## 2. Initialize PKI
 
 ```bash
-sudo certbot certonly --standalone -d relay-1.example.com
-sudo certbot certonly --standalone -d gw-echo.example.com
+umask 077
+lattice-netctl pki-init --out /secure/lattice-pki --organization example
 ```
 
-Use the generated Let's Encrypt paths in `~/.lattice/node.yaml`:
-
-```yaml
-tls:
-  certFile: /etc/letsencrypt/live/<domain>/fullchain.pem
-  keyFile: /etc/letsencrypt/live/<domain>/privkey.pem
-```
-
-### Chain and namespace setup
-
-On the Chain VPS:
+Back up the root offline. Pin `pki-anchor.json` through a separate managed
+channel; never trust the key embedded in a bundle by itself.
 
 ```bash
-anvil --host 0.0.0.0 --port 8545
-npm run lattice -- chain deploy --rpc http://127.0.0.1:8545 --key-file /secure/operator.key
-npm run lattice -- chain cert-type register lattice-node --level 1 --rpc http://127.0.0.1:8545 --contract <contract> --key-file /secure/operator.key
-npm run lattice -- chain issuer register lattice-ops --type lattice-node --pub-key-hash 0x0000000000000000000000000000000000000000000000000000000000000000 --rpc http://127.0.0.1:8545 --contract <contract> --key-file /secure/operator.key
+lattice-netctl certificate-csr \
+  --name gateway.example.com --kind server \
+  --key-out /secure/gateway-key.pem --csr-out /tmp/gateway.csr
+lattice-netctl certificate-sign \
+  --pki /secure/lattice-pki --csr /tmp/gateway.csr \
+  --kind server --cert-out /tmp/gateway-chain.pem
 ```
 
-Initialize purpose-separated keys, calculate each TLS certificate's SPKI SHA-256 pin, then register each node identity on the newly deployed Onion v1 contract:
+The output contains leaf plus intermediate; trust stores contain the root.
+
+## 3. Issue a profile
 
 ```bash
-npm run lattice -- node keys init
-npm run lattice -- node register --label relay-1 --roles relay --operator operator-a --tls-fingerprint-sha256 <64-hex> --rpc http://chain.example:8545 --contract <contract> --key-file /secure/operator.key
-npm run lattice -- node register --label gateway-echo --roles gateway --operator operator-gateway --tls-fingerprint-sha256 <64-hex> --rpc http://chain.example:8545 --contract <contract> --key-file /secure/operator.key
-npm run lattice -- node register --label entry-1 --roles entry --operator operator-entry --tls-fingerprint-sha256 <64-hex> --rpc http://chain.example:8545 --contract <contract> --key-file /secure/operator.key
+lattice-netctl enrollment-token-issue --pki /secure/lattice-pki
+lattice-netctl enrollment-offer-issue \
+  --pki /secure/lattice-pki \
+  --template /secure/profile-template.json \
+  --endpoint 203.0.113.10:7442 --server-name enroll.example.com \
+  --server-cert /secure/enrollment-chain.pem \
+  --out /secure/profile.offer.json
 ```
 
-### Node configs
+Required invariants:
 
-Relay:
+- MTU 1280 and explicit `split` or `full` mode.
+- SHA-256 SPKI pins for all Gateways and inner services.
+- Full-tunnel policy contains only approved egress CIDRs/protocols/ports.
+- `max_stale_seconds` is at most 86400.
+- Per-agent profiles require leases and pin each agent's raw Ed25519 public key.
+- `http_policy` is absent unless the Gateway terminates inner TLS.
+
+Start `lattice-netctl enrollment-serve` on the pinned endpoint with its server
+certificate/key. The one-time token is consumed atomically after a valid CSR;
+the client creates its own private key and receives the final signed profile.
+Offers and profiles never contain private keys. Certificates and profiles may
+not exceed 90 days.
+
+## 4. Gateway
+
+Install signed profiles as
+`/var/lib/lattice/gateway-profiles/<profile-uuid>.json` and start:
 
 ```bash
-npm run lattice -- node init --distributed-mesh --node-id relay-1 --roles relay \
-  --relay-bind 0.0.0.0:8888 \
-  --public-relay wss://relay-1.example.com:8888 \
-  --chain-rpc http://chain.example:8545 --chain-contract <contract> \
-  --tls-cert-file /etc/letsencrypt/live/relay-1.example.com/fullchain.pem \
-  --tls-key-file /etc/letsencrypt/live/relay-1.example.com/privkey.pem
+export LATTICE_CONTROL_PUBLIC_KEY_B64="$(tr -d '\n' </secure/lattice-pki/control-public-key.b64)"
+sudo lattice-gatewayd \
+  --bind '[::]:7443' \
+  --tls-root /etc/lattice/pki/tls-root-cert.pem \
+  --server-cert /etc/lattice/pki/gateway-chain.pem \
+  --server-key /run/credentials/lattice-gatewayd.service/server-key \
+  --profiles-dir /var/lib/lattice/gateway-profiles \
+  --tun-ipv4 100.127.0.1/16
 ```
 
-Gateway:
+Route virtual IPs from the Gateway TUN to private backends. A dedicated
+full-tunnel Gateway must enforce its egress allowlist as a second boundary.
+
+Audit only profile identity, destination service/IP, protocol, port, bytes,
+decision, policy version and fingerprints—never payloads or full DNS questions.
+
+## 5. Linux client
+
+The release bundle's `install-network.sh` installs the four LNP binaries,
+systemd units and `lattice:` desktop handler.
 
 ```bash
-npm run lattice -- node init --distributed-mesh --node-id gateway-echo --roles gateway \
-  --gateway-bind 0.0.0.0:8889 \
-  --public-gateway wss://gw-echo.example.com:8889 \
-  --chain-rpc http://chain.example:8545 --chain-contract <contract> \
-  --tls-cert-file /etc/letsencrypt/live/gw-echo.example.com/fullchain.pem \
-  --tls-key-file /etc/letsencrypt/live/gw-echo.example.com/privkey.pem
+export LATTICE_CONTROL_PUBLIC_KEY_B64='<pinned-control-key>'
+sudo lattice profile enroll \
+  /secure/profile.offer.json
+sudo systemctl enable --now lattice-resolver lattice-netd@<profile-uuid>
 ```
 
-Entry:
+Root enrolment stores the private key at
+`/var/lib/lattice/profiles/<uuid>/client-key.pem` (mode `0600`) and writes the
+pinned control key into `/etc/lattice/profiles/<uuid>.env` for the matching
+systemd unit. Start the shared `lattice-resolver` plus
+`lattice-netd@<uuid>`; do not replace this enrolled key with a copied browser
+or application credential. Verify TUN, routes, nftables and DNS:
 
 ```bash
-npm run lattice -- node init --distributed-mesh --node-id entry-1 --roles entry \
-  --entry-bind 127.0.0.1:7777 \
-  --upstream-relays relay-1=wss://relay-1.example.com:8888 \
-  --chain-rpc http://chain.example:8545 --chain-contract <contract>
+sudo lattice profile status --profile-id <profile-uuid>
+ip address show lp<first-8-profile-uuid-hex>
+ip route show
+sudo nft list ruleset
+resolvectl query echo.lattice
 ```
 
-### Service announce and route distribution
+Full mode installs profile route tables and an output-drop kill switch; only
+loopback, TUN and the exact Gateway UDP endpoint bypass it.
 
-On the Gateway VPS:
+Configure egress only through a dedicated full-tunnel profile, then sign and
+issue the resulting template:
 
 ```bash
-npm run services:echo
-npm run lattice -- gateway announce lp://echo.lattice \
-  --backend http://127.0.0.1:9001 \
-  --endpoint wss://gw-echo.example.com:8889 \
-  --gateway-node-label gateway-echo
-npm run lattice -- chain namespace register echo.lattice \
-  --owner-issuer lattice-ops --public \
-  --metadata-hash <metadataHash from gateway announce> \
-  --rpc http://chain.example:8545 --contract <contract> --key-file /secure/operator.key
-npm run lattice -- routing export --fqdn echo.lattice --out echo.route.json
+lattice-netctl profile-egress-allow --template /secure/full-template.json \
+  --cidr 198.51.100.0/24 --out /secure/full-template-allowlisted.json
 ```
 
-Copy `echo.route.json` to every Relay that should route this service, then:
+## 5.1 One-time legacy migration
+
+Generate only a new unsigned profile template from the archived service/policy
+metadata. The migrator excludes all legacy private keys and certificates. It
+converts `lp://` grants to L3/L4 and needs `--terminate-tls` before it preserves
+an explicit HTTP action policy.
 
 ```bash
-npm run lattice -- routing import --file echo.route.json --verify-chain --rpc http://chain.example:8545 --contract <contract>
+npm run migrate:network -- \
+  --lattice-home /secure/legacy-lattice --agent bot1 --organization example \
+  --gateway 203.0.113.10:7443 --gateway-name gateway.example.com \
+  --gateway-pin <gateway-spki-sha256> --service-tls-pin <service-spki-sha256> \
+  --enrollment-token <one-time-token> --out /secure/profile-template.json
 ```
 
-### Start roles
+Review this template, issue a new enrolment offer, enroll a fresh X.509 client
+credential, then revoke and decommission the overlay. Do not copy its agent or
+CA material into LNP/1.
+
+## 6. Agent isolation
+
+Confirm `net.ipv4.ip_forward=1`, then:
 
 ```bash
-# Relay VPS
-npm run lattice -- node start --role relay
-
-# Gateway VPS
-npm run lattice -- node start --role gateway --service lp://echo.lattice --target http://127.0.0.1:9001
-
-# Entry VPS
-npm run lattice -- node start --role entry
+sudo --preserve-env=LATTICE_CONTROL_PUBLIC_KEY_B64,LATTICE_SOCKET,LATTICE_SESSION_TOKEN_FILE \
+  lattice run --agent <agent-id> --profile <profile-uuid> -- <command> [args...]
 ```
 
-### Acceptance smoke
+The process starts only after its namespace veth, dedicated LNP tunnel, private
+resolver and output-drop firewall are ready. It runs with `SUDO_UID`/`SUDO_GID`,
+cleared groups and `no_new_privs`. Any missing enforcement condition fails
+closed before executing the command.
 
-On the Entry VPS:
+## 7. DNS and browser
+
+Route only the `lattice` domain to `lattice-resolver`. Unknown private names are
+NXDOMAIN and public names are REFUSED. Confirm packet capture shows no private
+question on public DNS interfaces.
+
+Install the private service root only on managed clients, then test:
 
 ```bash
-npm run lattice -- agent create bot1
-npm run lattice -- mesh smoke --agent bot1 --entry http://127.0.0.1:7777 --host echo.lattice --path /ping --expect-status 200
+lattice open 'lttc://echo/health'
 ```
 
-Expected: HTTP 200 with the backend response body, Relay/Gateway logs showing the request, and trace progression through `entry`, `relay`, `gateway`.
+Expected: strict URI validation and `https://echo.lattice/health`. Browser trust
+covers inner HTTPS; outer QUIC uses independent LNP mTLS.
 
-### Required agent-key pinning
-
-Gateways now verify the agent signature end-to-end rather than trusting the relay's `source` claim. Before granting a remote agent access, pin its Ed25519 public key on every Gateway that serves the resource:
+## 8. Renewal and revocation
 
 ```bash
-# Obtain this PEM through your approved identity/provisioning channel.
-npm run lattice -- policy pin-agent-key bot1 --public-key-file /secure/provisioning/bot1-public.pem
-npm run lattice -- grant bot1 lp://echo.lattice ping
+lattice profile renew --bundle /secure/renewed.bundle.json
+lattice-netctl profile-revoke \
+  --pki /secure/lattice-pki \
+  --profile /secure/profile.bundle.json \
+  --out /secure/profile.revoked.json
 ```
 
-`lattice agent create bot1` performs the pin automatically when the Entry and Gateway share state. A Gateway with no pinned key fails closed, even if a relay is registered and the agent name has an allow rule.
-
-### Issuer-backed agent trust
-
-For a fleet where individual agent-key pinning is impractical, a policy can instead trust one issuer and the expected certificate subject. The Gateway verifies the certificate signature, issuer identifier, subject, expiry, and the key that signed the request:
-
-```bash
-npm run lattice -- agent trust-issuer bot1 \
-  --issuer acme-agent-ca \
-  --public-key-file /secure/provisioning/acme-agent-ca-public.pem \
-  --subject agent:acme:bot1
-```
-
-This is an alternative to a matching `trusted_public_key` policy pin; if both are configured, either valid binding is accepted. The issuer key must still come from an approved trust-distribution channel.
-
-Para que un **Entry** acepte identidades remotas sin replicar un archivo por
-agente, configure la misma raíz de emisor que corresponda a esa célula. El CLI
-envía el certificado firmado del agente automáticamente en las operaciones
-`mesh smoke` y `mesh load`; esto no concede acceso al servicio, que sigue
-siendo decidido por la policy del Gateway.
-
-```yaml
-# ~/.lattice/node.yaml
-agentTrust:
-  issuers:
-    - issuer_id: acme-agent-ca
-      public_key: |-
-        -----BEGIN PUBLIC KEY-----
-        ...
-        -----END PUBLIC KEY-----
-```
-
-Mantenga esta lista como un conjunto pequeño de raíces aprobadas (máximo 64),
-nunca como un inventario de claves de agentes. Un certificado de un emisor no
-configurado se rechaza en Entry con `401`.
-
-Si una Gateway debe servir una población completa de ese emisor sin archivos
-de policy por agente, declare el grant local de servicio y acción. El
-certificado debe traer exactamente la capability `lp://echo.lattice:ping`; una
-policy individual existente para el agente tiene precedencia.
-
-```yaml
-gateway:
-  issuerGrants:
-    - issuer_id: acme-agent-ca
-      public_key: |-
-        -----BEGIN PUBLIC KEY-----
-        ...
-        -----END PUBLIC KEY-----
-      services:
-        - address: lp://echo.lattice
-          actions: [ping]
-```
-
-Negative checks:
-
-- Change a node's on-chain pubkey or use an unregistered `nodeId`: peers must reject it with an unauthenticated/unregistered node error.
-- Re-announce `echo.lattice` with a new Gateway endpoint, export/import the new route bundle, and confirm smoke recovers without changing Entry code.
-
----
-
-## AC-21-P1: Session Key Rotation
-
-> **Required AC-21 Control.** Rotate per-peer X25519 overlay session keys when a node key pair is suspected compromised, after a scheduled rotation window, or when a peer node is decommissioned.
-
-### Background
-
-Each node holds an X25519 key pair (`overlayNodeKeyPair`) stored in `~/.lattice/ca/ca.json`. On first contact with a peer, ECDH + HKDF-SHA256 derives a 32-byte session key cached for up to 1 hour (TTL). Rotating the node key pair forces all active sessions to rederive.
-
-### Procedure
-
-**Forced TTL expiry (no key material change):**
-
-Session keys expire automatically after 1 hour. No operator action is required unless you need immediate expiry.
-
-**Full key pair rotation:**
-
-1. Stop the Lattice node to prevent new sessions from being established:
-   ```
-   lattice stop
-   ```
-
-2. Back up the current CA state before modifying it:
-   ```
-   cp ~/.lattice/ca/ca.json ~/.lattice/ca/ca.json.bak-$(date +%Y%m%d%H%M%S)
-   ```
-
-3. Open `~/.lattice/ca/ca.json` and remove the `overlayNodeKeyPair` field entirely (or set it to `null`). On next start, `getOrCreateOverlayKeyPair()` will generate a fresh X25519 key pair and persist it.
-
-4. Restart the node:
-   ```
-   lattice start
-   ```
-
-5. Verify the new key pair was written:
-   ```
-   cat ~/.lattice/ca/ca.json | grep -c overlayNodeKeyPair
-   ```
-   Expected output: `1`
-
-6. Notify all peer nodes of the key change so they discard cached session keys derived from the old public key. Peers will rederive on next contact.
-
-7. Confirm sessions rederive in the action log:
-   ```
-   tail -f ~/.lattice/logs/actions.jsonl | grep session
-   ```
-
-**Rotating on all nodes in a cluster:**
-
-Repeat steps 1–6 on each node sequentially. Stagger restarts to maintain quorum availability. All existing in-flight sessions will be dropped at the old TTL boundary (max 1 hour) even without explicit rotation.
-
----
-
-## AC-21-P2: Operator Key Compromise Response
-
-> **Required AC-21 Control.** Follow this procedure when the CA private key (`~/.lattice/ca/ca.json` `privateKey`) or any operator signing key is suspected or confirmed compromised.
-
-### Detection Signals
-
-- Unexpected entries in `~/.lattice/logs/actions.jsonl` signed by the operator key
-- Alert from external audit/transparency log showing unexpected CA signatures
-- Unauthorized access to the host running `~/.lattice/`
-
-### Procedure
-
-1. **Isolate immediately.** Take the affected node offline:
-   ```
-   lattice stop
-   ```
-
-2. **Preserve evidence.** Copy the full state directory before any changes:
-   ```
-   cp -r ~/.lattice/ ~/lattice-forensic-$(date +%Y%m%d%H%M%S)/
-   ```
-
-3. **Determine compromise window.** Review the action log for the earliest suspicious entry:
-   ```
-   cat ~/.lattice/logs/actions.jsonl | jq 'select(.decision == "allow")' | head -50
-   ```
-
-4. **Revoke the compromised CA certificate.** Publish a signed revocation record via the RevocationNetwork, specifying `reason_code`, `suspected_from`, and `confirmed_at` timestamps. Distribute this record to all peer nodes and transparency logs.
-
-5. **Reinitialize CA state on the affected node:**
-   ```
-   mv ~/.lattice/ca/ca.json ~/.lattice/ca/ca.json.compromised
-   lattice init
-   ```
-   This generates a new CA key pair and `overlaySecret`.
-
-6. **Re-issue all agent certificates** signed by the compromised CA. For each agent:
-   ```
-   lattice agent revoke <agent-name>
-   lattice agent issue <agent-name>
-   ```
-
-7. **Redistribute the new CA public key** to all peer nodes and service gateways that trusted the old CA.
-
-8. **Rotate the overlay session key pair** following the procedure in AC-21-P1.
-
-9. **Audit all actions taken during the compromise window** from `~/lattice-forensic-*/logs/actions.jsonl`. Report findings per your incident response policy.
-
-10. **Bring the node back online** after confirming all downstream trusts have been updated:
-    ```
-    lattice start
-    ```
-
----
-
-## AC-21-P3: Agent Revocation in Production
-
-> **Required AC-21 Control.** Revoke an agent when it is decommissioned, its key material is compromised, or its PAS score has triggered a forced pause.
-
-### Revoke the agent
-
-```
-lattice revoke <agent-name>
-```
-
-This writes the agent name to `~/.lattice/revocations/list.json`.
-
-### Verify revocation at the EntryNode
-
-Check that the entry node's revocation list includes the agent:
-
-```
-cat ~/.lattice/revocations/list.json | jq '.[] | select(. == "<agent-name>")'
-```
-
-Expected: the agent name is printed. If the file is missing or the name is absent, the revocation did not persist — rerun `lattice revoke`.
-
-### Verify revocation at the ServiceGateway
-
-The ServiceGateway checks `isRevoked(agent)` on every inbound overlay message before policy evaluation. Confirm the gateway is reading the same `~/.lattice/revocations/list.json`:
-
-1. Send a test request from the revoked agent (or simulate with a crafted overlay message).
-2. The gateway must return HTTP 403 with body `{ "error": "AGENT_REVOKED" }`.
-3. Confirm in the action log:
-   ```
-   tail -20 ~/.lattice/logs/actions.jsonl | jq 'select(.decision == "deny" and .reason == "AGENT_REVOKED")'
-   ```
-
-### Confirm blocked requests
-
-A valid revocation produces this log pattern:
-
-```json
-{
-  "timestamp": "...",
-  "agent": "<agent-name>",
-  "resource": "lp://<service>.lattice",
-  "action": "...",
-  "decision": "deny",
-  "reason": "AGENT_REVOKED"
-}
-```
-
-If you see `decision: allow` after revocation, verify both EntryNode and ServiceGateway share or sync the same `~/.lattice/revocations/list.json`. In multi-host deployments, replication of this file is the operator's responsibility.
-
-### Native daemon cleanup
-
-`lattice run` creates a private per-run directory for the C daemon and removes
-it when the agent exits. Do not delete active daemon sockets manually; stop the
-agent process first and let the runner perform cleanup.
-
----
-
-## AC-21-P4: PAS State Rollback
-
-> **Required AC-21 Control.** Reset an agent's Power Accumulation Score when a false positive has triggered a pause, after a supervised agent rehabilitation period, or following a post-incident review that clears the agent.
-
-### Background
-
-PAS scores are persisted to `~/.lattice/pas-state.json` with per-entry HMAC-SHA256 integrity. The HMAC key is derived from the node's `overlaySecret` in `~/.lattice/ca/ca.json`. Any modification to `pas-state.json` that does not recompute the HMAC will cause that entry to be skipped with a `pas_tamper_detected` warning on next load.
-
-### Procedure
-
-**Option A: Remove a single agent's score**
-
-1. Stop the Lattice node to prevent concurrent writes:
-   ```
-   lattice stop
-   ```
-
-2. Back up the current PAS state:
-   ```
-   cp ~/.lattice/pas-state.json ~/.lattice/pas-state.json.bak-$(date +%Y%m%d%H%M%S)
-   ```
-
-3. Retrieve the `overlaySecret` (HMAC key) from CA state:
-   ```
-   cat ~/.lattice/ca/ca.json | jq -r '.overlaySecret'
-   ```
-
-4. Remove the target agent's entry from the `scores` object in `pas-state.json`:
-   ```
-   cat ~/.lattice/pas-state.json | jq 'del(.scores["<agent-name>"])' > /tmp/pas-state-new.json
-   mv /tmp/pas-state-new.json ~/.lattice/pas-state.json
-   chmod 600 ~/.lattice/pas-state.json
-   ```
-
-   Because the entry is removed (not modified), no HMAC recomputation is needed. On next load, the agent will start from a zero score.
-
-5. Restart the node:
-   ```
-   lattice start
-   ```
-
-6. Verify the agent's score is absent or reset to zero:
-   ```
-   cat ~/.lattice/pas-state.json | jq '.scores["<agent-name>"]'
-   ```
-   Expected: `null` (entry removed) or a fresh zero-score entry after first agent action.
-
-**Option B: Full PAS state reset (all agents)**
-
-1. Stop the node and back up the file as in Option A steps 1–2.
-2. Replace the file with an empty state:
-   ```
-   echo '{"version":1,"scores":{}}' > ~/.lattice/pas-state.json
-   chmod 600 ~/.lattice/pas-state.json
-   ```
-3. Restart the node.
-
-**Editing existing entries (requires HMAC recomputation):**
-
-If you need to adjust a score value rather than remove it, you must recompute the HMAC. The payload format is:
-
-```
-JSON.stringify({ agentId, score, factors })
-```
-
-Compute: `HMAC-SHA256(overlaySecret, payload)` and write the hex digest back to the `hmac` field for that entry. Entries with invalid HMACs are skipped on load and will emit a `pas_tamper_detected` warning.
-
----
-
-## KMS Plugin Development
-
-The `plugin` KMS backend delegates key retrieval and signing to an external process via stdin/stdout JSON. This enables integration with hardware security modules, vault services, or custom secret stores.
-
-### Backend selection
-
-Set the environment variable before starting the Lattice node:
-
-```
-LATTICE_KMS_BACKEND=plugin
-LATTICE_KMS_PLUGIN_COMMAND=/path/to/your-kms-plugin
-```
-
-### Protocol
-
-The Lattice daemon spawns the plugin command as a child process for each request. The daemon writes one JSON request to stdin, the plugin writes one JSON response to stdout, then both sides close.
-
-**Request format:**
-
-```json
-{ "method": "getKey", "keyId": "<key-identifier>" }
-```
-
-```json
-{ "method": "sign", "keyId": "<key-identifier>", "payload": "<data-to-sign>" }
-```
-
-**Response format (success):**
-
-```json
-{ "result": "<key-or-signature-string>" }
-```
-
-**Response format (error):**
-
-```json
-{ "error": "<human-readable error message>" }
-```
-
-The plugin must exit with code `0` on success. Any non-zero exit code is treated as a hard error.
-
-### Minimal plugin example (Node.js)
-
-```js
-#!/usr/bin/env node
-const chunks = [];
-process.stdin.on('data', d => chunks.push(d));
-process.stdin.on('end', () => {
-  const req = JSON.parse(Buffer.concat(chunks).toString());
-  if (req.method === 'getKey') {
-    // Retrieve key from your store by req.keyId
-    process.stdout.write(JSON.stringify({ result: '<base64-key>' }) + '\n');
-  } else if (req.method === 'sign') {
-    // Sign req.payload with the key identified by req.keyId
-    process.stdout.write(JSON.stringify({ result: '<signature>' }) + '\n');
-  } else {
-    process.stdout.write(JSON.stringify({ error: 'unknown method' }) + '\n');
-    process.exit(1);
-  }
-});
-```
-
-Make the plugin executable (`chmod +x`) and test it in isolation before wiring it into Lattice.
-
-### Security notes
-
-- The plugin process inherits the daemon's environment. Do not leak secrets via environment variables unless intentional.
-- Plugin stderr is passed through to the daemon's stderr — suitable for diagnostic logging.
-- There is no framing beyond newline separation; keep responses on a single line.
-
----
-
-## Proxy Mode Network Limitation
-
-**Advisory-only network controls in proxy mode.**
-
-When running agents under proxy mode, network isolation controls are advisory only. The TUN-based network enforcement layer (WS8) has been deferred and is not implemented in this release. Proxy mode can log and report attempted out-of-policy network calls but cannot block them at the kernel or network level.
-
-**Consequence:** A compromised or misbehaving agent running under proxy mode can make arbitrary outbound connections that bypass Lattice policy checks.
-
-**Recommendation:** For workloads that require enforced network isolation, run agents in Docker mode. Docker mode uses container-level network namespacing to enforce `--network=none` or custom bridge policies, providing hard network boundaries that proxy mode cannot replicate.
-
-```
-lattice run --mode=docker <agent-name>
-```
-
-Do not rely on proxy mode as a security boundary for agents with access to sensitive services.
-
----
-
-## Distributed overlay (cross-host development baseline)
-
-Operational pieces added for **Fase 1** (“distributed but not hidden”):
-
-| Artifact | Purpose |
-|---|---|
-| `~/.lattice/node.yaml` | Binds (`entry`/`relay`/`gateway`), `upstreamRelays`, optional `registry.chain`, TLS files, `distributedMesh`. |
-| `~/.lattice/routing-cache.json` | **HMAC-signed** local cache mapping `fqdn → { gatewayEndpoints, gatewayPubKeyB64 }` (must match chain `metadataHash` when namespaces are anchored). |
-| `LATTICE_HOME` | **Override lattice state directory** from `~/.lattice` (tests/isolated VMs). |
-
-### CLI recap
-
-```
-lattice node init-sample                 # scaffold node.yaml (edit before prod)
-lattice node register …                  # governance: LatticeChain.registerLatticeNode
-lattice routing announce …             # rewrite routing-cache row (+ optional --publish metadata)
-lattice peer add …                     # bootstrap relay pubkey hints when chain unreachable
-```
-
-### Environment
-
-- `LATTICE_CHAIN_RPC_URL` / `LATTICE_CHAIN_ADDRESS` — override YAML `registry.chain` for Entry/Relay resolvers.
-- `LATTICE_DISTRIBUTED_MESH=1` — force ECDH mesh signing (same as `distributedMesh: true` in YAML).
-- `LATTICE_PRIMARY_RELAY_LABEL` — label used to resolve relay overlay pubkey for Entry bootstrap.
-
-### References
-
-- Milestones: `docs/milestones/phase-*.md`
-- Decisions: `docs/decisions-distributed-overlay.md`
-- Example Anvil-only compose: `docker-compose.distributed.yml`
-
----
+Renewal cannot change profile ID or client SPKI. Atomically distribute a revoked
+record to Gateways and client state. Gateways re-check every 30 seconds; changed,
+revoked, expired or stale state closes the connection. Clients close at the
+earlier of profile expiry and the 24-hour signed-state deadline.
+
+## 9. Release gates
+
+On an isolated Linux host, verify with packet capture and expected-deny cases:
+
+1. IPv4/IPv6 TCP, UDP and ICMP.
+2. Split route selection and full-tunnel no-leak behavior.
+3. Egress allowlist and QUIC/control-plane failure.
+4. IPv4, IPv6, public DNS, DoH and proxy bypass attempts.
+5. Unknown private names never fall through to public DNS.
+6. Wrong mTLS root/client/Gateway pins and profile signature.
+7. Source spoofing, stale/revoked profiles and replayed agent leases.
+8. Oversized, overlapping, excess and expired fragments.
+9. `lttc://` through Chrome to valid private HTTPS.
+
+Compile/unit evidence is not production E2E. Public enablement requires this
+privileged Linux matrix, native tests where signing allows, and a fresh audit
+with no verified critical/high issue.
+
+## 10. Rollback
+
+Stop the client/resolver, confirm Lattice nftables tables and routes were
+removed, then remove the managed private CA and URI handler. Do not restore the
+retired proxy. Reuse an earlier LNP profile only if it remains signed, fresh and
+not revoked; otherwise issue a new one.

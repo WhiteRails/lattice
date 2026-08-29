@@ -9,6 +9,7 @@ import { generateNodeKeyPair, deriveSessionKey, SessionManager } from '../node/s
 import { signOverlayMessage, parseOverlayMessage, stableStringify, type OverlayMessage } from '../node/message';
 import { verifyIncomingOverlayFromPeer } from '../node/overlay-sign-key';
 import { requestSignaturePayload, signData, verifySignature, generateKeyPair } from '../core/identity';
+import { deriveSelfAuthAddress } from '../node/self-auth';
 
 const homes: string[] = [];
 
@@ -136,7 +137,7 @@ describe('local principal hardening', () => {
 });
 
 describe('self-auth routing hardening', () => {
-  it('does not obtain .id endpoint metadata from federation', async () => {
+  it('does not obtain canonical identity endpoint metadata from federation', async () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), 'lat-security-'));
     homes.push(home);
     process.env.LATTICE_HOME = home;
@@ -150,7 +151,7 @@ describe('self-auth routing hardening', () => {
       overlaySecret: crypto.randomBytes(32).toString('base64'), createdAt: new Date().toISOString(),
     });
     const { LpGatewayResolver, LpRoutingNotFoundError } = await import('../node/lp-resolver');
-    const id = Buffer.from(generateNodeKeyPair().publicKey, 'base64').toString('hex') + '.id';
+    const id = deriveSelfAuthAddress(generateNodeKeyPair().publicKey);
     const resolver = new LpGatewayResolver({ registry: { federationUrls: ['http://127.0.0.1:1'] } } as any, null);
     await expect(resolver.resolveDestination(`lp://${id}`)).rejects.toBeInstanceOf(LpRoutingNotFoundError);
   });

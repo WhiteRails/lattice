@@ -1,5 +1,9 @@
 # Soak multi-celda y failover
 
+> **Runbook retirado.** Este procedimiento prueba el overlay HTTP/WebSocket
+> anterior y no debe ejecutarse como validación de LNP/1. Use el runbook raíz y
+> [`lnp-1.md`](lnp-1.md).
+
 Este procedimiento valida propiedades distribuidas que no se pueden inferir de
 un benchmark local. No convierte una medición en una cifra global: la capacidad
 se publica por celda, región y perfil de payload.

@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+         xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+         xmlns:desktop6="http://schemas.microsoft.com/appx/manifest/desktop/windows10/6"
+         IgnorableNamespaces="uap desktop6">
+  <Identity Name="Lattice.Network" Publisher="CN=UNSIGNED-DEVELOPMENT" Version="0.1.0.0" />
+  <Properties><DisplayName>Lattice Network</DisplayName><PublisherDisplayName>Lattice</PublisherDisplayName><Logo>Assets\StoreLogo.png</Logo></Properties>
+  <Resources><Resource Language="en-US" /></Resources>
+  <Applications>
+    <Application Id="LatticeNetwork" Executable="$targetnametoken$.exe" EntryPoint="Lattice.Network.Windows.App">
+      <uap:VisualElements DisplayName="Lattice Network" Description="LNP/1 VPN" Square150x150Logo="Assets\Logo.png" Square44x44Logo="Assets\SmallLogo.png" BackgroundColor="transparent" />
+      <Extensions>
+        <uap:Extension Category="windows.protocol"><uap:Protocol Name="lttc" /></uap:Extension>
+        <uap:Extension Category="windows.vpnPlugin">
+          <uap:VpnPlugin><uap:RuntimeType>Lattice.Network.Windows.VpnPlugin</uap:RuntimeType></uap:VpnPlugin>
+        </uap:Extension>
+      </Extensions>
+    </Application>
+  </Applications>
+  <Capabilities>
+    <Capability Name="internetClient" />
+    <uap:Capability Name="networkingVpnProvider" />
+  </Capabilities>
+</Package>

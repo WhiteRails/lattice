@@ -34,6 +34,7 @@ import {
   chainSetIssuerPermission,
   chainRegisterNamespace,
   chainUpdateNamespaceServiceBinding,
+  chainPublishNetworkServiceBinding,
   chainSetNamespaceAccessPolicy,
   chainGetNamespace,
   chainRegisterLatticeNode,
@@ -73,11 +74,12 @@ import {
   type RoutingBundle,
 } from '../node/routing-cache';
 import { LpGatewayResolver } from '../node/lp-resolver';
-import { selfAuthLpUrl, deriveSelfAuthAddress } from '../node/self-auth';
+import { deriveSelfAuthAddress } from '../node/self-auth';
 import { credentialMaskFromNames } from '../core/namespace-access';
 import { LatticeCA }         from '../core/ca';
 import { generateKeyPair, hashRequestBody, requestSignaturePayload, signData } from '../core/identity';
 import * as crypto from 'crypto';
+import * as net from 'net';
 import { ethers } from 'ethers';
 import { runBoundedLoad } from '../node/bounded-load';
 import { createNodeCryptoBackend } from '../node/node-crypto';
@@ -85,7 +87,7 @@ import { LATTICE_HPKE_SUITE } from '../node/hpke-envelope';
 import { relayCandidatesFromRoutingCache } from '../node/circuit-selector';
 
 const program = new Command();
-program.name('lattice').description('Certified overlay network for autonomous AI agents').version('0.1.0');
+program.name('latticectl').description('Lattice control-plane and on-chain operator CLI').version('0.1.0');
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 function requireInit() {
@@ -118,6 +120,32 @@ function normalizeLatticeFqdn(input: string): string {
 
 function csvValues(input: string): string[] {
   return input.split(',').map(s => s.trim()).filter(Boolean);
+}
+
+function ipToBytes16(input: string): { bytes16: string; version: 4 | 6 } {
+  const version = net.isIP(input);
+  if (version === 4) {
+    const tail = input.split('.').map(part => Number(part).toString(16).padStart(2, '0')).join('');
+    return { bytes16: `0x${'0'.repeat(24)}${tail}`, version: 4 };
+  }
+  if (version !== 6) err('--virtual-ip must be an IPv4 or IPv6 literal');
+  const halves = input.toLowerCase().split('::');
+  if (halves.length > 2) err('invalid IPv6 literal');
+  const parseHalf = (half: string): number[] => half === '' ? [] : half.split(':').flatMap(token => {
+    if (token.includes('.')) {
+      if (net.isIP(token) !== 4) err('invalid embedded IPv4 literal');
+      const octets = token.split('.').map(Number);
+      return [(octets[0] << 8) | octets[1], (octets[2] << 8) | octets[3]];
+    }
+    if (!/^[0-9a-f]{1,4}$/.test(token)) err('invalid IPv6 hextet');
+    return [parseInt(token, 16)];
+  });
+  const left = parseHalf(halves[0]);
+  const right = parseHalf(halves[1] ?? '');
+  const missing = 8 - left.length - right.length;
+  if (missing < 0 || (halves.length === 1 && missing !== 0) || (halves.length === 2 && missing < 1)) err('invalid IPv6 literal');
+  const words = [...left, ...Array(missing).fill(0), ...right];
+  return { bytes16: `0x${words.map(word => word.toString(16).padStart(4, '0')).join('')}`, version: 6 };
 }
 
 function parseNodeRoles(raw: string | undefined, fallback: LatticeNodeRole[] = ['entry']): LatticeNodeRole[] {
@@ -379,17 +407,16 @@ svc.command('list').description('List registered services').action(() => {
 });
 
 // ── id ───────────────────────────────────────────────────────────────────────
-program.command('id').description('Show this node\'s self-authenticating lp:// address (.id)').action(() => {
+program.command('id').description('Show this node\'s self-authenticating <id>.lattice address').action(() => {
   requireInit();
   const kp = getOrCreateOverlayKeyPair();
   const fqdn = deriveSelfAuthAddress(kp.publicKey);
-  const url = selfAuthLpUrl(kp.publicKey);
-  console.log(chalk.bold('Self-authenticating address:'));
-  console.log(`  lp:// URL : ${chalk.cyan(url)}`);
-  console.log(`  fqdn      : ${chalk.cyan(fqdn)}`);
+  console.log(chalk.bold('Self-authenticating Lattice identity:'));
+  console.log(`  HTTPS URL : ${chalk.cyan(`https://${fqdn}`)}`);
+  console.log(`  hostname  : ${chalk.cyan(fqdn)}`);
   console.log(`  pubkey    : ${chalk.dim(kp.publicKey)}`);
   console.log();
-  console.log(chalk.dim('Share this address to allow direct connections without a .lattice name or chain lookup.'));
+  console.log(chalk.dim('This is the canonical identity. A human *.lattice name is a signed alias, not a replacement identity.'));
 });
 
 // ── resolve ──────────────────────────────────────────────────────────────────
@@ -658,7 +685,7 @@ const routingCli = program.command('routing').description('Signed routing hints 
 routingCli
   .command('announce')
   .description('Upsert signed routing-cache row (optionally publishes metadata hash on LatticeChain)')
-  .requiredOption('--fqdn <fqdn>', '*.lattice fqdn')
+  .requiredOption('--fqdn <fqdn>', '*.reef registered name')
   .requiredOption('--endpoints <csv>', 'Comma-separated gateway ws/wss endpoints')
   .option('--gateway-node-label <label>', 'registered lattice node label for the gateway')
   .option('--gateway-pubkey-base64 <base64>', 'explicit gateway pubkey; default local overlay pubkey')
@@ -687,7 +714,7 @@ routingCli
 routingCli
   .command('export')
   .description('Export a chain-committed routing hint bundle for another node')
-  .requiredOption('--fqdn <fqdn>', '*.lattice fqdn')
+  .requiredOption('--fqdn <fqdn>', '*.reef registered name')
   .requiredOption('--out <file>', 'Output JSON bundle path')
   .action(opts => {
     requireInit();
@@ -1383,6 +1410,41 @@ chainNs
   });
 
 chainNs
+  .command('publish-network <fqdn>')
+  .description('Publish a versioned LNP/1 NetworkServiceBinding')
+  .requiredOption('--rpc <url>', 'RPC URL')
+  .requiredOption('--contract <address>', 'LatticeChain address')
+  .option('--key <key>', 'Private key (hex)')
+  .option('--key-file <path>', 'Private key file')
+  .requiredOption('--virtual-ip <ip>', 'Signed virtual IPv4 or IPv6 literal')
+  .requiredOption('--gateway <host:port>', 'QUIC Gateway endpoint')
+  .requiredOption('--gateway-pin <bytes32>', 'Gateway TLS SPKI SHA-256')
+  .requiredOption('--network-policy-hash <bytes32>', 'Canonical L3/L4 policy hash')
+  .option('--http-policy-hash <bytes32>', 'Explicit TLS-terminating HTTP policy hash')
+  .requiredOption('--binding-version <n>', 'Strictly increasing binding version')
+  .action(async (fqdn, opts) => {
+    const pk = requireChainPk(opts);
+    try {
+      const ip = ipToBytes16(String(opts.virtualIp));
+      const version = BigInt(String(opts.bindingVersion));
+      const txHash = await chainPublishNetworkServiceBinding(
+        opts.rpc,
+        pk,
+        opts.contract,
+        fqdn,
+        ip.bytes16,
+        ip.version,
+        String(opts.gateway),
+        String(opts.gatewayPin),
+        String(opts.networkPolicyHash),
+        opts.httpPolicyHash as string | undefined,
+        version,
+      );
+      ok(`NetworkServiceBinding published  tx=${chalk.green(txHash)}`);
+    } catch (e: any) { err(e.message); }
+  });
+
+chainNs
   .command('set-policy <fqdn>')
   .description('Set publicAccess, credentialMask, minAssuranceLevel (namespace admin or contract owner)')
   .requiredOption('--rpc <url>', 'RPC URL')
@@ -1749,4 +1811,24 @@ registryCli
     console.log(`    pubkey: ${chalk.dim((entry.payload.gatewayPubKeyB64 ?? '').slice(0, 20))}…`);
   });
 
-program.parse(process.argv);
+const retiredOverlayCommands = new Set([
+  'init', 'agent', 'cert', 'service', 'id', 'resolve', 'grant', 'deny', 'policy',
+  'node', 'routing', 'gateway', 'mesh', 'circuit', 'run', 'ping', 'up',
+  'registry', 'logs', 'checkpoint', 'proof',
+]);
+const requestedTopLevelCommand = process.argv[2];
+if (!requestedTopLevelCommand || ['-h', '--help'].includes(requestedTopLevelCommand)) {
+  console.log(
+    'Usage: latticectl chain <command> [options]\n\n' +
+    'Control-plane commands publish LNP/1 NetworkServiceBindings and manage their on-chain authority.\n' +
+    'Use the native `lattice profile ...`, `lattice run ...`, or `lattice-netctl ...` commands for network operation.',
+  );
+} else if (retiredOverlayCommands.has(requestedTopLevelCommand)) {
+  console.error(
+    'This HTTP/WebSocket proxy command was removed by the LNP/1 migration. ' +
+    'Use the native `lattice profile ...`, `lattice run ...`, or `lattice-netctl ...` commands.',
+  );
+  process.exitCode = 2;
+} else {
+  program.parse(process.argv);
+}

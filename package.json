@@ -1,7 +1,7 @@
 {
   "name": "lattice-protocol-mvp",
   "version": "0.1.0",
-  "description": "Lattice controlled overlay protocol for autonomous agents",
+  "description": "Lattice LNP/1 OS-native VPN control plane and migration tooling",
   "main": "dist/index.js",
   "bin": {
     "latticectl": "bin/latticectl.js"
@@ -18,21 +18,13 @@
     "test:rust": "cargo test --manifest-path clients/rust/Cargo.toml",
     "test:network": "cargo test --manifest-path network/Cargo.toml --workspace",
     "build:network": "cargo build --manifest-path network/Cargo.toml --workspace",
+    "migrate:network": "ts-node scripts/migrate-network-state.ts",
     "test:native": "npm run build:native && LATTICED_BIN=\"$PWD/build/daemon/latticed\" cargo test --manifest-path clients/rust/Cargo.toml",
     "test:replay-redis": "LATTICE_REDIS_INTEGRATION=1 vitest run tests/redis-replay.integration.test.ts",
     "lattice": "ts-node cli/lattice.ts",
     "package:bundle": "sh scripts/build-release-bundle.sh",
     "prepack": "node scripts/clean-dist.js && npm run build",
-    "services:echo": "ts-node services/echo/index.ts",
-    "services:github": "ts-node services/github-proxy/index.ts",
-    "services:gmail": "ts-node services/gmail-proxy/index.ts",
-    "services:browser": "ts-node services/browser-proxy/index.ts",
-    "demo": "ts-node examples/testnet-demo.ts",
-    "example:gov": "ts-node examples/01-government-citizen-certificate/scenario.ts",
-    "example:bank": "ts-node examples/02-bank-government-validated-transfer/scenario.ts",
-    "example:manifest": "ts-node examples/03-transparency-signed-manifest/scenario.ts",
-    "example:domains": "ts-node examples/04-lattice-domain-registry/scenario.ts",
-    "build:contracts": "solcjs --bin --abi --include-path contracts --base-path . -o contracts contracts/LatticeChain.sol"
+    "build:contracts": "solcjs --optimize --optimize-runs 200 --bin --abi --include-path contracts --base-path . -o contracts contracts/LatticeChain.sol"
   },
   "type": "commonjs",
   "devDependencies": {

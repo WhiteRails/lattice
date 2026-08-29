@@ -1,0 +1,23 @@
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    CARGO_HOME=/opt/cargo \
+    RUSTUP_HOME=/opt/rustup \
+    PATH=/opt/cargo/bin:${PATH}
+
+RUN apt-get update -qq \
+    && apt-get install -y -qq --no-install-recommends \
+        bash build-essential ca-certificates curl iproute2 iputils-ping jq \
+        libssl-dev nftables openssl pkg-config python3 \
+    && rm -rf /var/lib/apt/lists/*
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --profile minimal
+
+WORKDIR /workspace/network
+COPY . /workspace/network
+RUN CARGO_INCREMENTAL=0 cargo build --locked --bins
+COPY tests/dev-gateway-init.sh /usr/local/bin/lattice-dev-gateway
+COPY tests/dev-issue-profile.sh /usr/local/bin/lattice-dev-issue-profile
+RUN chmod 0755 /usr/local/bin/lattice-dev-gateway /usr/local/bin/lattice-dev-issue-profile
+
+CMD ["/usr/local/bin/lattice-dev-gateway"]

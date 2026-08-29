@@ -4,6 +4,8 @@ artifacts/
 build/
 clients/rust/target/
 network/target/
+# Swift Package Manager build products are generated locally.
+network/platform/macos/.build/
 # Rust workspace build output. Keep source manifests and Cargo.lock tracked.
 target/
 *.log

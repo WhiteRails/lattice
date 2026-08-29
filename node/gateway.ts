@@ -495,7 +495,7 @@ export class ServiceGateway {
     const fedUrls = resolveFederationUrls(cfg);
     if (!fedUrls.length) return;
     const fqdn = serviceAddress.replace(/^lp:\/\//, '').split('/')[0] ?? '';
-    if (!fqdn.endsWith('.lattice') && !fqdn.endsWith('.id')) return;
+    if (!fqdn.endsWith('.lattice') && !fqdn.endsWith('.coral') && !fqdn.endsWith('.reef')) return;
     const ttl = cfg?.gateway?.announceTtlSeconds ?? 300;
     const overlaySecret = loadCA().overlaySecret;
     const encryptionKey = await this.nodeCrypto.currentKey('gateway-encryption');
@@ -511,9 +511,10 @@ export class ServiceGateway {
         }
       : { mode: 'public' as const };
     if (delivery.mode === 'hidden' && delivery.rendezvous.some(item => !item.nodeLabel)) return;
-    // FQDNs to announce: the named .lattice address + the self-auth .id address
+    // FQDNs to announce: the signed human alias + the canonical key-derived
+    // `<id>.coral` identity address.
     const selfAuthFqdn = deriveSelfAuthAddress(this.myPublicKey);
-    const fqdnsToAnnounce = fqdn.endsWith('.lattice')
+    const fqdnsToAnnounce = fqdn.endsWith('.lattice') || fqdn.endsWith('.coral') || fqdn.endsWith('.reef')
       ? [fqdn, selfAuthFqdn]
       : [fqdn];
     for (const announceFqdn of fqdnsToAnnounce) {

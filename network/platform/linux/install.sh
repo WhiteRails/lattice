@@ -18,9 +18,17 @@ for binary in lattice lattice-netd lattice-gatewayd lattice-resolver lattice-net
   install -m 0755 "$bundle_root/bin/$binary" "$install_prefix/bin/$binary"
 done
 install -m 0644 "$bundle_root/lib/systemd/system/lattice-netd@.service" /etc/systemd/system/lattice-netd@.service
-install -m 0644 "$bundle_root/lib/systemd/system/lattice-resolver@.service" /etc/systemd/system/lattice-resolver@.service
+install -m 0644 "$bundle_root/lib/systemd/system/lattice-resolver.service" /etc/systemd/system/lattice-resolver.service
 install -m 0644 "$bundle_root/lib/systemd/system/lattice-gatewayd.service" /etc/systemd/system/lattice-gatewayd.service
 install -m 0644 "$bundle_root/share/applications/lattice-uri.desktop" /usr/local/share/applications/lattice-uri.desktop
+install -m 0644 "$bundle_root/lib/sysctl.d/90-lattice.conf" /etc/sysctl.d/90-lattice.conf
+sysctl -p /etc/sysctl.d/90-lattice.conf >/dev/null
+if [ -n "${LATTICE_SERVICE_ROOT_CERT:-}" ]; then
+  test -f "$LATTICE_SERVICE_ROOT_CERT"
+  openssl x509 -in "$LATTICE_SERVICE_ROOT_CERT" -noout >/dev/null
+  install -m 0644 "$LATTICE_SERVICE_ROOT_CERT" /usr/local/share/ca-certificates/lattice-service-root.crt
+  command -v update-ca-certificates >/dev/null 2>&1 && update-ca-certificates
+fi
 systemctl daemon-reload
 command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database /usr/local/share/applications || true
 echo "Lattice network binaries and systemd units installed. Enroll a signed profile before enabling a unit."

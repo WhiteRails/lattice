@@ -7,12 +7,11 @@ pragma solidity ^0.8.19;
  *      On-chain stores hashes and lifecycle metadata only (never private keys).
  *
  *      Governance: contract `owner` controls global registry + checkpoints.
- *      Per-namespace: `namespaceAdmin` (domain owner) may change routing hashes
- *      (`serviceCertHash`, `metadataHash`) and the DNS-level access policy
- *      (`publicAccess`, `credentialMask`, `minAssuranceLevel`). Gateways MUST
- *      enforce policy before forwarding to backends (see docs).
+ *      Per-namespace: `namespaceAdmin` publishes a versioned LNP/1 network
+ *      binding. Gateways consume only signed/control-plane-verified bindings;
+ *      no HTTP proxy endpoint or private key is stored on-chain.
  *
- *      Namespaces: ASCII lowercase `*.lattice` (single label). Reserved official
+ *      Namespaces: ASCII lowercase `*.reef` (single label). Reserved official
  *      slugs → only `owner` may register them initially.
  */
 contract LatticeChain {
@@ -71,6 +70,19 @@ contract LatticeChain {
     }
     mapping(bytes32 => NamespaceRecord) public namespaces;
 
+    struct NetworkServiceBinding {
+        string fqdn;
+        bytes16 virtualIp;
+        uint8 ipVersion; // 4 or 6
+        string gatewayQuicEndpoint;
+        bytes32 gatewayTlsSpkiSha256;
+        bytes32 networkPolicyHash;
+        bytes32 httpPolicyHash; // zero unless the gateway explicitly terminates TLS
+        uint64 version;
+        bool active;
+    }
+    mapping(bytes32 => NetworkServiceBinding) public networkServiceBindings;
+
     /// @notice Public overlay identities for Lattice nodes (Entry / Relay / Gateway). Governance-only writes.
     /// @dev `overlayPubKey` is opaque X25519 SPKI DER (base64-encoded off-chain becomes raw bytes here).
     ///      `tlsFingerprintSha256` is mandatory for Onion v1 link pinning.
@@ -85,7 +97,7 @@ contract LatticeChain {
     }
     mapping(bytes32 => LatticeNode) public latticeNodes;
 
-    /** keccak256(ascii lowercase slug) where slug is the label before `.lattice`. */
+    /** keccak256(ascii lowercase slug) where slug is the label before `.reef`. */
     mapping(bytes32 => bool) public reservedOfficialLatticeSlugs;
 
     /// Bit flags for `credentialMask` (accepted client *classes* — OR at verify time).
@@ -189,6 +201,17 @@ contract LatticeChain {
     );
     event NamespaceServiceUpdated(bytes32 indexed nameHash, bytes32 serviceCertHash, bytes32 metadataHash);
     event NamespacePolicyUpdated(bytes32 indexed nameHash, bool publicAccess, uint8 credentialMask, uint8 minAssuranceLevel);
+    event NetworkServiceBindingPublished(
+        bytes32 indexed nameHash,
+        string fqdn,
+        bytes16 virtualIp,
+        uint8 ipVersion,
+        string gatewayQuicEndpoint,
+        bytes32 gatewayTlsSpkiSha256,
+        bytes32 networkPolicyHash,
+        bytes32 httpPolicyHash,
+        uint64 version
+    );
     event ReservedSlugUpdated(bytes32 indexed slugHash, bool reserved);
     event RevocationAnchored(bytes32 indexed issuerId, bytes32 merkleRoot);
     event CheckpointAnchored(bytes32 indexed batchId, bytes32 merkleRoot, uint64 actionCount);
@@ -314,6 +337,53 @@ contract LatticeChain {
         emit NamespacePolicyUpdated(nameHash, publicAccess, credentialMask, minAssuranceLevel);
     }
 
+    /// @notice Publish the canonical LNP/1 binding for a registered namespace.
+    /// @dev Versions are strictly monotonic so a stale signed routing snapshot
+    ///      cannot silently replace newer network state.
+    function publishNetworkServiceBinding(
+        string calldata fqdn,
+        bytes16 virtualIp,
+        uint8 ipVersion,
+        string calldata gatewayQuicEndpoint,
+        bytes32 gatewayTlsSpkiSha256,
+        bytes32 networkPolicyHash,
+        bytes32 httpPolicyHash,
+        uint64 version
+    ) external {
+        (bool ok, bytes32 nameHash, ) = _parseLatticeFqdn(fqdn);
+        require(ok, "Invalid lattice FQDN");
+        NamespaceRecord storage n = namespaces[nameHash];
+        require(n.ownerIssuerId != bytes32(0) && n.active, "Unknown namespace");
+        require(msg.sender == n.namespaceAdmin || msg.sender == owner, "Not namespace admin");
+        require(ipVersion == 4 || ipVersion == 6, "Invalid IP version");
+        require(bytes(gatewayQuicEndpoint).length > 0 && bytes(gatewayQuicEndpoint).length <= 512, "Invalid QUIC endpoint");
+        require(gatewayTlsSpkiSha256 != bytes32(0), "Missing gateway TLS pin");
+        require(networkPolicyHash != bytes32(0), "Missing network policy hash");
+        require(version > networkServiceBindings[nameHash].version, "Binding version not monotonic");
+        networkServiceBindings[nameHash] = NetworkServiceBinding({
+            fqdn: fqdn,
+            virtualIp: virtualIp,
+            ipVersion: ipVersion,
+            gatewayQuicEndpoint: gatewayQuicEndpoint,
+            gatewayTlsSpkiSha256: gatewayTlsSpkiSha256,
+            networkPolicyHash: networkPolicyHash,
+            httpPolicyHash: httpPolicyHash,
+            version: version,
+            active: true
+        });
+        emit NetworkServiceBindingPublished(
+            nameHash,
+            fqdn,
+            virtualIp,
+            ipVersion,
+            gatewayQuicEndpoint,
+            gatewayTlsSpkiSha256,
+            networkPolicyHash,
+            httpPolicyHash,
+            version
+        );
+    }
+
     function registerLatticeNode(
         string calldata nodeLabel,
         bytes calldata overlayPubKey,
@@ -429,14 +499,14 @@ contract LatticeChain {
         returns (bool ok, bytes32 nameHash, bytes32 slugHash)
     {
         bytes memory b = bytes(fqdn);
-        if (b.length < 9) return (false, 0, 0);
+        if (b.length < 6) return (false, 0, 0);
 
-        bytes memory suffix = ".lattice";
-        for (uint i = 0; i < 8; i++) {
-            if (b[b.length - 8 + i] != suffix[i]) return (false, 0, 0);
+        bytes memory suffix = ".reef";
+        for (uint i = 0; i < 5; i++) {
+            if (b[b.length - 5 + i] != suffix[i]) return (false, 0, 0);
         }
 
-        uint prefixLen = b.length - 8;
+        uint prefixLen = b.length - 5;
         if (prefixLen == 0) return (false, 0, 0);
 
         for (uint j = 0; j < prefixLen; j++) {

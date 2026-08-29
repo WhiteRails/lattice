@@ -1,5 +1,9 @@
 # Arquitectura de escalabilidad de Lattice
 
+> **Arquitectura archivada.** Entries, Relays y el transporte `lp://` de este
+> documento fueron retirados. El runtime soportado es LNP/1; ver
+> [`lnp-1.md`](lnp-1.md).
+
 Lattice no puede escalar a miles de millones como una malla global plana. La unidad de despliegue es una **celda**: un dominio administrativo/regional con Entries, Relays, Gateways, caché de política y un pipeline de auditoría. El plano global distribuye confianza y rutas firmadas; no transporta acciones ni guarda tablas completas de agentes.
 
 ```text

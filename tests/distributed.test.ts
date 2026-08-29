@@ -285,7 +285,9 @@ describe('LpGatewayResolver + routing-cache (hybrid)', () => {
     })).resolves.toMatchObject({ ok: false });
   });
 
-  it('round-trips Entry → Relay → Gateway across isolated homes without shared overlaySecret', async () => {
+  // Historical overlay coverage: the public CLI intentionally refuses to
+  // launch Entry/Relay/Gateway after the direct LNP/1 migration.
+  it.skip('round-trips Entry → Relay → Gateway across isolated homes without shared overlaySecret', async () => {
     let relayPorts: number[];
     let gatewayPort: number;
     let entryPort: number;

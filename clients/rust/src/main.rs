@@ -1,17 +1,26 @@
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
+use chrono::{Duration, Utc};
 use lattice_client::{kind, Client, ClientOptions, HARD_MAX_PENDING_BYTES, MAX_FRAME_BYTES};
+use rand::RngCore;
+use serde::Serialize;
 use std::env;
 use std::fmt::Write as _;
 use std::fs;
 use std::io;
 use std::process::ExitCode;
 use std::time::Instant;
+use uuid::Uuid;
 
 fn usage(program: &str) {
     eprintln!(
         "Usage: {program} [--socket <path>] [--session-token-file <path>] <command>\n\n\
 Commands:\n\
-  profile enroll|renew|status|connect  Manage signed LNP/1 VPN profiles\n\
+  profile enroll|renew|status|connect|disconnect\n\
+                                      Manage signed LNP/1 VPN profiles\n\
   open <lattice://service/path>       Validate a deep link and open HTTPS\n\
+  run --agent <id> --profile <uuid> -- <command...>\n\
+                                      Run in a verified Linux network namespace\n\
   status                              Read daemon health and capacity counters\n\
   ping [payload]                      Verify LTP/1 connectivity\n\
   sign <payload>                      Sign through an authenticated daemon\n\
@@ -150,6 +159,9 @@ fn main() -> ExitCode {
 
 fn dispatch_network_command(args: &[String]) -> Option<ExitCode> {
     let command = args.get(1)?.as_str();
+    if command == "run" {
+        return Some(dispatch_agent_run(args));
+    }
     let (binary, forwarded): (&str, Vec<String>) = match command {
         "profile" => {
             let subcommand = args.get(2).map(String::as_str).unwrap_or("");
@@ -158,8 +170,11 @@ fn dispatch_network_command(args: &[String]) -> Option<ExitCode> {
                 "renew" => "profile-renew",
                 "status" => "profile-status",
                 "connect" => "profile-connect",
+                "disconnect" => "profile-disconnect",
                 _ => {
-                    eprintln!("lattice profile requires enroll, renew, status, or connect");
+                    eprintln!(
+                        "lattice profile requires enroll, renew, status, connect, or disconnect"
+                    );
                     return Some(ExitCode::from(2));
                 }
             };
@@ -178,16 +193,191 @@ fn dispatch_network_command(args: &[String]) -> Option<ExitCode> {
     let executable = env::var(&override_name)
         .ok()
         .map(std::path::PathBuf::from)
-        .or_else(|| env::current_exe().ok()?.parent().map(|directory| directory.join(binary)))
+        .or_else(|| {
+            env::current_exe()
+                .ok()?
+                .parent()
+                .map(|directory| directory.join(binary))
+        })
         .unwrap_or_else(|| binary.into());
-    match std::process::Command::new(executable).args(forwarded).status() {
+    match std::process::Command::new(executable)
+        .args(forwarded)
+        .status()
+    {
         Ok(status) if status.success() => Some(ExitCode::SUCCESS),
-        Ok(status) => Some(ExitCode::from(status.code().unwrap_or(1).clamp(1, 255) as u8)),
+        Ok(status) => Some(ExitCode::from(
+            status.code().unwrap_or(1).clamp(1, 255) as u8
+        )),
         Err(error) => {
             eprintln!("lattice: could not start {binary}: {error}");
             Some(ExitCode::from(1))
         }
     }
+}
+
+#[derive(Serialize)]
+struct AgentLeasePayload {
+    agent_id: String,
+    profile_id: Uuid,
+    namespace_id: String,
+    issued_at: chrono::DateTime<Utc>,
+    expires_at: chrono::DateTime<Utc>,
+    nonce_b64: String,
+}
+
+#[derive(Serialize)]
+struct AgentLease {
+    payload: AgentLeasePayload,
+    signature_b64: String,
+}
+
+fn dispatch_agent_run(args: &[String]) -> ExitCode {
+    let separator = match args.iter().position(|arg| arg == "--") {
+        Some(index) if index + 1 < args.len() => index,
+        _ => {
+            eprintln!("lattice run requires --agent <id> --profile <uuid> -- <command...>");
+            return ExitCode::from(2);
+        }
+    };
+    let mut agent_id = None;
+    let mut profile_id = None;
+    let mut socket = None;
+    let mut token_file = None;
+    let mut index = 2;
+    while index < separator {
+        let target = match args[index].as_str() {
+            "--agent" => &mut agent_id,
+            "--profile" => &mut profile_id,
+            "--socket" => &mut socket,
+            "--session-token-file" => &mut token_file,
+            unexpected => {
+                eprintln!("lattice run: unsupported option {unexpected}");
+                return ExitCode::from(2);
+            }
+        };
+        index += 1;
+        if index >= separator {
+            eprintln!("lattice run: missing option value");
+            return ExitCode::from(2);
+        }
+        *target = Some(args[index].clone());
+        index += 1;
+    }
+    let Some(agent_id) = agent_id else {
+        eprintln!("lattice run: --agent is required");
+        return ExitCode::from(2);
+    };
+    if agent_id.is_empty()
+        || agent_id.len() > 128
+        || !agent_id
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    {
+        eprintln!("lattice run: agent id must be canonical lowercase ASCII");
+        return ExitCode::from(2);
+    }
+    let profile_id = match profile_id.and_then(|value| value.parse::<Uuid>().ok()) {
+        Some(value) => value,
+        None => {
+            eprintln!("lattice run: --profile must be a UUID");
+            return ExitCode::from(2);
+        }
+    };
+    let socket = socket
+        .or_else(|| env::var("LATTICE_SOCKET").ok())
+        .or_else(|| env::var("LATTICE_DAEMON_SOCKET").ok());
+    let token_file = token_file.or_else(|| env::var("LATTICE_SESSION_TOKEN_FILE").ok());
+    let (Some(socket), Some(token_file)) = (socket, token_file) else {
+        eprintln!("lattice run: authenticated latticed socket and session token are required");
+        return ExitCode::from(2);
+    };
+    let result = (|| -> io::Result<std::process::ExitStatus> {
+        let client = Client::connect(socket)?;
+        let mut token = fs::read(token_file)?;
+        while matches!(token.last(), Some(b'\n' | b'\r')) {
+            token.pop();
+        }
+        if token.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "empty session token",
+            ));
+        }
+        client.authenticate(&token)?;
+        let mut nonce = [0u8; 24];
+        rand::rngs::OsRng.fill_bytes(&mut nonce);
+        let namespace_id = format!(
+            "lattice-{}-{}",
+            &profile_id.simple().to_string()[..8],
+            std::process::id()
+        );
+        let issued_at = Utc::now();
+        let payload = AgentLeasePayload {
+            agent_id,
+            profile_id,
+            namespace_id: namespace_id.clone(),
+            issued_at,
+            expires_at: issued_at + Duration::minutes(4),
+            nonce_b64: STANDARD.encode(nonce),
+        };
+        let payload_bytes = serde_json::to_vec(&payload).map_err(io::Error::other)?;
+        let signature = client.sign(&payload_bytes)?;
+        let lease = AgentLease {
+            payload,
+            signature_b64: STANDARD.encode(signature),
+        };
+        let lease_path = env::temp_dir().join(format!("{namespace_id}.lease.json"));
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        {
+            use std::io::Write;
+            let mut file = options.open(&lease_path)?;
+            file.write_all(&serde_json::to_vec(&lease).map_err(io::Error::other)?)?;
+            file.sync_all()?;
+        }
+        let netd = sibling_binary("lattice-netd");
+        let mut command = std::process::Command::new(netd);
+        command
+            .arg("run-agent")
+            .arg("--profile-id")
+            .arg(profile_id.to_string())
+            .arg("--namespace-id")
+            .arg(namespace_id)
+            .arg("--agent-lease")
+            .arg(&lease_path)
+            .arg("--")
+            .args(&args[separator + 1..]);
+        let status = command.status();
+        let _ = fs::remove_file(&lease_path);
+        status
+    })();
+    match result {
+        Ok(status) if status.success() => ExitCode::SUCCESS,
+        Ok(status) => ExitCode::from(status.code().unwrap_or(1).clamp(1, 255) as u8),
+        Err(error) => {
+            eprintln!("lattice run: {error}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn sibling_binary(name: &str) -> std::path::PathBuf {
+    let override_name = format!("{}_BIN", name.replace('-', "_").to_ascii_uppercase());
+    env::var(&override_name)
+        .ok()
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            env::current_exe()
+                .ok()?
+                .parent()
+                .map(|directory| directory.join(name))
+        })
+        .unwrap_or_else(|| name.into())
 }
 
 fn run_load(

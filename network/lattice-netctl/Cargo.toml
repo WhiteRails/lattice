@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+ipnet = "2"
 base64.workspace = true
 chrono.workspace = true
 clap.workspace = true
@@ -18,4 +19,9 @@ rustls-pemfile.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 time.workspace = true
+quinn.workspace = true
+tokio.workspace = true
 x509-parser.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

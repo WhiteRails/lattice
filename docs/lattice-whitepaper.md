@@ -1,5 +1,10 @@
 # Lattice
 
+> **Archived architecture.** This document describes the retired HTTP/WebSocket
+> overlay and `lp://`/`.id` address model. It is preserved for design history
+> only; the supported runtime is LNP/1 in [`lnp-1.md`](lnp-1.md), whose
+> canonical service identity is a key-derived `*.lattice` hostname.
+
 **A Certified Overlay Network for Autonomous AI Agents**
 
 Version: 0.1 Draft  
