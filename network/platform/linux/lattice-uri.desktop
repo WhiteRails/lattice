@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Lattice Network
+Comment=Open authenticated Lattice network services
+Exec=/usr/local/bin/lattice open %u
+Terminal=false
+NoDisplay=true
+MimeType=x-scheme-handler/lattice;
+Categories=Network;
+

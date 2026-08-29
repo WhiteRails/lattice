@@ -1,0 +1,21 @@
+[package]
+name = "lattice-netctl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+base64.workspace = true
+chrono.workspace = true
+clap.workspace = true
+ed25519-dalek.workspace = true
+lattice-net-core = { path = "../lattice-net-core" }
+pkcs8.workspace = true
+rand.workspace = true
+rcgen.workspace = true
+rustls-pemfile.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+time.workspace = true
+x509-parser.workspace = true

@@ -3,6 +3,9 @@ dist/
 artifacts/
 build/
 clients/rust/target/
+network/target/
+# Rust workspace build output. Keep source manifests and Cargo.lock tracked.
+target/
 *.log
 .env
 .env.*

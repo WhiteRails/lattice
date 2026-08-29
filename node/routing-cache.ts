@@ -8,8 +8,9 @@ import { ethers } from 'ethers';
 import { stableStringify } from './message';
 import { loadCA } from './state';
 import { DEFAULT_ROUTING_CACHE_PATH, LatticeNodeYaml } from './node-config';
+import { LATTICE_HPKE_SUITE } from './hpke-envelope';
 
-export const ROUTING_PAYLOAD_VERSION = 2 as const;
+export const ROUTING_PAYLOAD_VERSION = 3 as const;
 export const DEFAULT_ROUTING_CACHE_MAX_ROUTES = 100_000;
 export const DEFAULT_ROUTING_CACHE_MAX_FILE_BYTES = 64 * 1024 * 1024;
 /** A data-plane Relay scores every endpoint; keep that work bounded per route. */
@@ -21,7 +22,14 @@ const MIN_ROUTING_CACHE_MAX_FILE_BYTES = 1 * 1024 * 1024;
 const HARD_MAX_ROUTING_CACHE_MAX_FILE_BYTES = 512 * 1024 * 1024;
 const ROUTING_CACHE_REVALIDATE_MS = 1_000;
 const MAX_RESIDENT_ROUTING_FILES = 4;
-export type RoutingPayloadVersion = 1 | typeof ROUTING_PAYLOAD_VERSION;
+export type RoutingPayloadVersion = 1 | 2 | typeof ROUTING_PAYLOAD_VERSION;
+
+export interface RendezvousDescriptor {
+  nodeLabel: string;
+  endpoint: string;
+  token: string;
+  expiresAt: string;
+}
 
 /** Serialized into chain metadataHash hex (canonical JSON UTF-8, keccak256). */
 export interface RoutingPayload {
@@ -30,6 +38,12 @@ export interface RoutingPayload {
   gatewayNodeLabel?: string;
   gatewayPubKeyB64: string;
   gatewayEndpoints: string[];
+  gatewayEncryptionKeyId?: string;
+  gatewayEncryptionPubKeyB64Url?: string;
+  hpkeSuite?: typeof LATTICE_HPKE_SUITE;
+  delivery?:
+    | { mode: 'public' }
+    | { mode: 'hidden'; rendezvous: RendezvousDescriptor[] };
 }
 
 export interface RoutingBundle {
@@ -49,6 +63,12 @@ export interface RoutingCacheFile {
     string,
     {
       overlayPubKeyB64: string;
+      /** Dedicated Ed25519 node identity (SPKI DER, base64). */
+      identityPubKeyB64?: string;
+      /** Dedicated raw X25519 ntor key (base64url). */
+      onionPubKeyB64Url?: string;
+      /** Governance-assigned operator identifier; distinct operators are required per circuit. */
+      operatorId?: string;
       endpoint?: string;
       roleBitmask?: number;
       tlsFingerprintSha256?: string;
@@ -183,9 +203,62 @@ export function normalizeRoutingPayload(payload: RoutingPayload): RoutingPayload
     gatewayPubKeyB64: payload.gatewayPubKeyB64.trim(),
     gatewayEndpoints,
   };
+  if (payload.version === ROUTING_PAYLOAD_VERSION) {
+    const encryptionKeyId = payload.gatewayEncryptionKeyId?.trim().toLowerCase();
+    const encryptionPublicKey = payload.gatewayEncryptionPubKeyB64Url?.trim();
+    if (encryptionKeyId !== undefined) {
+      if (!/^[a-f0-9]{64}$/.test(encryptionKeyId)) throw new Error('Invalid Gateway encryption key id');
+      normalized.gatewayEncryptionKeyId = encryptionKeyId;
+    }
+    if (encryptionPublicKey !== undefined) {
+      if (!/^[A-Za-z0-9_-]{43}$/.test(encryptionPublicKey)) throw new Error('Invalid Gateway HPKE public key');
+      normalized.gatewayEncryptionPubKeyB64Url = encryptionPublicKey;
+    }
+    if (payload.hpkeSuite !== undefined) {
+      if (payload.hpkeSuite !== LATTICE_HPKE_SUITE) throw new Error('Unsupported Gateway HPKE suite');
+      normalized.hpkeSuite = payload.hpkeSuite;
+    }
+    if (payload.delivery?.mode === 'public') {
+      normalized.delivery = { mode: 'public' };
+    } else if (payload.delivery?.mode === 'hidden') {
+      if (!Array.isArray(payload.delivery.rendezvous) || payload.delivery.rendezvous.length < 1 || payload.delivery.rendezvous.length > 16) {
+        throw new Error('Hidden routes require 1-16 rendezvous descriptors');
+      }
+      normalized.delivery = {
+        mode: 'hidden',
+        rendezvous: payload.delivery.rendezvous.map(normalizeRendezvousDescriptor),
+      };
+    }
+  }
   const label = payload.gatewayNodeLabel?.trim();
   if (label) normalized.gatewayNodeLabel = label;
   return normalized;
+}
+
+export function assertEncryptedRoutingPayload(payload: RoutingPayload): asserts payload is RoutingPayload & Required<Pick<
+  RoutingPayload,
+  'gatewayEncryptionKeyId' | 'gatewayEncryptionPubKeyB64Url' | 'hpkeSuite' | 'delivery'
+>> {
+  if (payload.version !== ROUTING_PAYLOAD_VERSION ||
+      !payload.gatewayEncryptionKeyId || !payload.gatewayEncryptionPubKeyB64Url ||
+      payload.hpkeSuite !== LATTICE_HPKE_SUITE || !payload.delivery) {
+    throw new Error('ROUTE_ENCRYPTION_REQUIRED: distributed mesh requires a complete v3 encrypted route');
+  }
+  if (payload.delivery.mode === 'public' && payload.gatewayEndpoints.length < 1) {
+    throw new Error('ROUTE_ENCRYPTION_REQUIRED: public encrypted route has no Gateway endpoint');
+  }
+}
+
+function normalizeRendezvousDescriptor(value: RendezvousDescriptor): RendezvousDescriptor {
+  const nodeLabel = value.nodeLabel?.trim();
+  if (!/^[a-z0-9._-]{1,64}$/.test(nodeLabel)) throw new Error('Invalid rendezvous node label');
+  const endpoint = new URL(value.endpoint);
+  if (endpoint.protocol !== 'wss:' && endpoint.protocol !== 'ws:') throw new Error('Rendezvous endpoint must use WebSocket');
+  const token = value.token?.trim();
+  if (!/^[A-Za-z0-9_-]{43}$/.test(token)) throw new Error('Invalid rendezvous token');
+  const expiresAt = new Date(value.expiresAt);
+  if (!Number.isFinite(expiresAt.getTime())) throw new Error('Invalid rendezvous expiry');
+  return { nodeLabel, endpoint: endpoint.toString(), token, expiresAt: expiresAt.toISOString() };
 }
 
 export function readRoutingCacheFile(

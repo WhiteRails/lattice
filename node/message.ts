@@ -31,6 +31,8 @@ export interface OverlayMessage {
     body?: string;
     status?: number;
     agent_proof?: AgentProof;
+    /** Opaque Entry/Gateway HPKE envelope. Relays must not inspect its plaintext. */
+    e2e?: unknown;
   };
   trace: string[];
   auth?: {
@@ -82,6 +84,7 @@ const OverlayMessageSchema = z.object({
     body: z.string().max(1_398_104).optional(),
     status: z.number().int().min(100).max(599).optional(),
     agent_proof: AgentProofSchema.optional(),
+    e2e: z.unknown().optional(),
   }).strict(),
   trace: z.array(z.string().min(1).max(128)).max(16),
   auth: z.object({

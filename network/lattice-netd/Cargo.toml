@@ -1,0 +1,24 @@
+[package]
+name = "lattice-netd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+base64.workspace = true
+bytes.workspace = true
+chrono.workspace = true
+clap.workspace = true
+ed25519-dalek.workspace = true
+lattice-net-core = { path = "../lattice-net-core" }
+quinn.workspace = true
+serde_json.workspace = true
+serde.workspace = true
+tokio.workspace = true
+tun-rs.workspace = true
+url.workspace = true
+uuid.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

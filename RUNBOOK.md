@@ -15,21 +15,22 @@
 5. [KMS Plugin Development](#kms-plugin-development)
 6. [Proxy Mode Network Limitation](#proxy-mode-network-limitation)
 7. [F1 Distributed Public Overlay Bring-Up](#f1-distributed-public-overlay-bring-up)
+8. [Lattice Onion v1](docs/lattice-onion-v1.md)
 
 ---
 
 ## F1 Distributed Public Overlay Bring-Up
 
-> **Scope.** F1 proves a real distributed public overlay: Entry on one VPS reaches a Gateway on another VPS through a public Relay over WSS, without sharing `overlaySecret`. F1 is **not** hidden-service mode: gateway endpoints are public route hints. Outbound-only hidden gateways/rendezvous are F3.
+> **Scope.** F1 proves a distributed public Onion v1 overlay: Entry reaches a Gateway through exactly three operator-diverse Relays over pinned WSS, without sharing `overlaySecret`. Hidden mode uses two independent three-hop circuits terminating at an authenticated rendezvous descriptor.
 
 ### Minimum topology
 
 - Chain VPS: Anvil JSON-RPC reachable by operators, e.g. `http://chain.example:8545`.
-- Relay VPS: `relay-1.example.com`, role `relay`, WSS `:8888`.
+- Three Relay VPSes operated independently: `relay-1` (guard), `relay-2` (middle) and `relay-3` (exit), WSS `:8888`.
 - Gateway VPS: `gw-echo.example.com`, role `gateway`, WSS `:8889`, backend on localhost.
 - Entry VPS: `entry-1.example.com`, role `entry`, local HTTP proxy `127.0.0.1:7777`.
 
-For 10 VPS, use the same pattern with 1 Anvil, 3 relays, 3 gateways, and 3 entry/agent nodes. Give every node a stable `nodeId` (`relay-1`, `gateway-echo`, `entry-1`, etc.).
+Production will not build a circuit with fewer than three distinct relay labels and three distinct `operatorId` values. Give every node a stable `nodeId` (`relay-1`, `gateway-echo`, `entry-1`, etc.).
 
 ### TLS / WSS
 
@@ -59,12 +60,13 @@ npm run lattice -- chain cert-type register lattice-node --level 1 --rpc http://
 npm run lattice -- chain issuer register lattice-ops --type lattice-node --pub-key-hash 0x0000000000000000000000000000000000000000000000000000000000000000 --rpc http://127.0.0.1:8545 --contract <contract> --key-file /secure/operator.key
 ```
 
-Register each node identity on-chain from that node after `lattice init`:
+Initialize purpose-separated keys, calculate each TLS certificate's SPKI SHA-256 pin, then register each node identity on the newly deployed Onion v1 contract:
 
 ```bash
-npm run lattice -- node register --label relay-1 --roles relay --rpc http://chain.example:8545 --contract <contract> --key-file /secure/operator.key
-npm run lattice -- node register --label gateway-echo --roles gateway --rpc http://chain.example:8545 --contract <contract> --key-file /secure/operator.key
-npm run lattice -- node register --label entry-1 --roles entry --rpc http://chain.example:8545 --contract <contract> --key-file /secure/operator.key
+npm run lattice -- node keys init
+npm run lattice -- node register --label relay-1 --roles relay --operator operator-a --tls-fingerprint-sha256 <64-hex> --rpc http://chain.example:8545 --contract <contract> --key-file /secure/operator.key
+npm run lattice -- node register --label gateway-echo --roles gateway --operator operator-gateway --tls-fingerprint-sha256 <64-hex> --rpc http://chain.example:8545 --contract <contract> --key-file /secure/operator.key
+npm run lattice -- node register --label entry-1 --roles entry --operator operator-entry --tls-fingerprint-sha256 <64-hex> --rpc http://chain.example:8545 --contract <contract> --key-file /secure/operator.key
 ```
 
 ### Node configs

@@ -22,6 +22,11 @@ import {
   resolveRendezvousRelays,
   resolveHiddenServiceAddress,
   resolveFederationUrls,
+  assertOnionListenerTls,
+  assertOnionWebSocketUrls,
+  assertOnionOverlayRequired,
+  onionOverlayEffective,
+  resolveOnionCircuitConfig,
 } from './node-config';
 import { bindOverlayWebSocketServer, wsTlsClientOptions } from './ws-stack';
 import { validateDistributedPeer } from './peer-identity';
@@ -38,6 +43,13 @@ import { replayStoreFromEnv, type ReplayStore } from './replay-store';
 import { gatewayReplayKey } from './replay-keys';
 import { federationReplicaUrls } from './rendezvous';
 import { serveCellStatus } from './node-metrics';
+import { createNodeCryptoBackend, type NodeCryptoBackend } from './node-crypto';
+import { LATTICE_HPKE_SUITE, parseHpkeEnvelope, sealHpkeJson } from './hpke-envelope';
+import { gatewayResponseSignaturePayload, parseE2eRequest, type E2eResponseUnsigned } from './e2e-message';
+import { GuardSetStore, relayCandidatesFromRoutingCache, selectCircuitPath } from './circuit-selector';
+import { readRoutingCacheFile } from './routing-cache';
+import { OnionCircuitClient } from './onion-network';
+import { createHiddenGatewayOperation } from './hidden-rendezvous';
 
 const ALLOWED_BACKEND_METHODS = new Set(['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS']);
 const HOP_BY_HOP_HEADERS = new Set([
@@ -56,6 +68,14 @@ export interface ServiceGatewayOptions {
   bindHostPort?: string;
   nodeConfig?: LatticeNodeYaml | null;
   replayStore?: ReplayStore;
+}
+
+interface GatewayE2eResponseContext {
+  requestId: string;
+  routeHash: string;
+  responseKeyId: string;
+  responsePublicKey: string;
+  transportDestination: string;
 }
 
 export class ServiceGateway {
@@ -91,6 +111,11 @@ export class ServiceGateway {
   private reconnectTimers: ReturnType<typeof setTimeout>[] = [];
   private announceTimer: ReturnType<typeof setTimeout> | undefined;
   private closed = false;
+  private readonly nodeCrypto: NodeCryptoBackend;
+  private readonly e2eResponseContexts = new Map<string, GatewayE2eResponseContext>();
+  private readonly onionDirectRequests = new Set<string>();
+  private hpkeFailures = 0;
+  private readonly hiddenOnionCircuits: OnionCircuitClient[] = [];
 
   setPASTracker(tracker: PowerAccumulationTracker, threshold = 100): void {
     this.pasTracker = tracker;
@@ -130,8 +155,10 @@ export class ServiceGateway {
 
     const cfgFromDisk = opts.nodeConfig !== undefined ? opts.nodeConfig : loadNodeConfig();
     this.cfg = cfgFromDisk;
+    this.nodeCrypto = createNodeCryptoBackend(cfgFromDisk?.crypto);
     this.issuerGrants = new Map(resolveGatewayIssuerGrants(cfgFromDisk).map(grant => [grant.issuer_id, grant]));
     this.distributedMesh = distributedMeshEffective(cfgFromDisk);
+    assertOnionOverlayRequired(cfgFromDisk, this.distributedMesh);
     this.nodeLabel = requireDistributedNodeId(cfgFromDisk, this.distributedMesh);
     this.chain = resolveNodeChainConfig(cfgFromDisk);
     this.resolver = new LpGatewayResolver(cfgFromDisk ?? null, this.chain);
@@ -146,13 +173,18 @@ export class ServiceGateway {
     if (this.hiddenMode) {
       // Hidden mode: dial outbound to rendezvous relays instead of listening
       const rendezvousRelays = resolveRendezvousRelays(cfgFromDisk);
+      assertOnionWebSocketUrls(cfgFromDisk, rendezvousRelays.map(relay => relay.url));
       const hiddenAddr = resolveHiddenServiceAddress(cfgFromDisk) ?? serviceAddress;
       console.log(
         chalk.green('[Gateway]') +
           ` ${hiddenAddr} starting in HIDDEN mode → rendezvous with ${rendezvousRelays.length} relay(s)`,
       );
-      this.startHiddenMode(rendezvousRelays, hiddenAddr, cfgFromDisk);
-      this.announceFederation(cfgFromDisk, hiddenAddr, []);
+      if (onionOverlayEffective(cfgFromDisk)) {
+        this.startHiddenOnionMode(rendezvousRelays, hiddenAddr);
+      } else {
+        this.startHiddenMode(rendezvousRelays, hiddenAddr, cfgFromDisk);
+      }
+      void this.announceFederation(cfgFromDisk, hiddenAddr, []);
     } else {
       // Public mode: bind inbound WebSocket port
       const defaultPort =
@@ -165,6 +197,7 @@ export class ServiceGateway {
         '127.0.0.1',
         defaultPort,
       );
+      assertOnionListenerTls(cfgFromDisk, bindHost, 'gateway');
 
       const bound = bindOverlayWebSocketServer(
         bindHost,
@@ -176,6 +209,7 @@ export class ServiceGateway {
             ...this.ingress.snapshot(),
             residentPeers: this.rendezvousConnections.length,
             failures: this.failures,
+            hpkeFailures: this.hpkeFailures,
             issuerCertificateCacheEntries: this.issuerCertificateCache.snapshot().entries,
             issuerCertificateCacheHits: this.issuerCertificateCache.snapshot().hits,
             issuerCertificateCacheMisses: this.issuerCertificateCache.snapshot().misses,
@@ -202,7 +236,7 @@ export class ServiceGateway {
         // Announce to federation registries if configured
         const fedUrls = resolveFederationUrls(cfgFromDisk);
         if (fedUrls.length) {
-          this.announceFederation(cfgFromDisk, serviceAddress, [endpoint]);
+          void this.announceFederation(cfgFromDisk, serviceAddress, [endpoint]);
         }
       });
       bound.wss.once('error', e => console.error(chalk.red('[Gateway] listen'), e.message));
@@ -225,12 +259,115 @@ export class ServiceGateway {
       if (ws.readyState === WebSocket.OPEN) ws.close();
     }
     this.rendezvousConnections = [];
+    for (const circuit of this.hiddenOnionCircuits.splice(0)) circuit.destroy();
     this.backendHttpAgent.destroy();
     this.backendHttpsAgent.destroy();
     if (this.ownsReplayStore) (this.replayStore as { close?: () => void }).close?.();
   }
 
   // ─── Hidden-mode internals ────────────────────────────────────────────────
+
+  private startHiddenOnionMode(relayTargets: UpstreamRelay[], serviceAddress: string): void {
+    for (const target of relayTargets) {
+      if (!target.label) throw new Error('Onion hidden Gateway requires labeled rendezvous relays');
+      void this.runHiddenOnionWorker(target, serviceAddress, 0);
+    }
+  }
+
+  private async runHiddenOnionWorker(
+    target: UpstreamRelay,
+    serviceAddress: string,
+    attempt: number,
+  ): Promise<void> {
+    if (this.closed || !target.label) return;
+    let circuit: OnionCircuitClient | undefined;
+    try {
+      const directory = readRoutingCacheFile(this.cfg, { requireLocalSig: true });
+      if (!directory) throw new Error('Authenticated relay directory is missing');
+      const candidates = relayCandidatesFromRoutingCache(directory);
+      const targetCandidate = candidates.find(candidate => candidate.label === target.label);
+      if (!targetCandidate || new URL(targetCandidate.endpoint).toString() !== new URL(target.url).toString()) {
+        throw new Error('Rendezvous endpoint is not directory-authenticated');
+      }
+      const limits = resolveOnionCircuitConfig(this.cfg);
+      const guards = new GuardSetStore(undefined, limits.guardLifetimeDays * 24 * 60 * 60_000)
+        .loadOrSelect(candidates);
+      const circuitPath = selectCircuitPath(candidates, {
+        terminalLabel: target.label,
+        guardLabels: guards,
+        allowSingleOperatorLoopbackTests: limits.allowSingleOperatorLoopbackTests,
+      });
+      circuit = new OnionCircuitClient(
+        circuitPath, this.nodeLabel!, 'gateway', this.cfg, this.nodeCrypto, limits,
+      );
+      await circuit.build();
+      this.hiddenOnionCircuits.push(circuit);
+      const fqdn = serviceAddress.replace(/^lp:\/\//, '').split('/')[0] ?? '';
+      const encryptionKey = await this.nodeCrypto.currentKey('gateway-encryption');
+      const token = hiddenRendezvousToken(encryptionKey.keyId, target.label, fqdn);
+      await this.pollHiddenOnion(circuit, target, serviceAddress, token);
+      if (!circuit.state.shouldRebuild()) return;
+      throw new Error('Hidden Gateway circuit reached its reuse limit');
+    } catch {
+      circuit?.destroy('peer_failure');
+      const index = circuit ? this.hiddenOnionCircuits.indexOf(circuit) : -1;
+      if (index >= 0) this.hiddenOnionCircuits.splice(index, 1);
+      if (this.closed) return;
+      const delay = Math.min(30_000, 1_000 * Math.pow(2, Math.min(attempt, 5)));
+      let retry: ReturnType<typeof setTimeout>;
+      retry = setTimeout(() => {
+        this.reconnectTimers = this.reconnectTimers.filter(timer => timer !== retry);
+        void this.runHiddenOnionWorker(target, serviceAddress, attempt + 1);
+      }, delay);
+      retry.unref?.();
+      this.reconnectTimers.push(retry);
+    }
+  }
+
+  private async pollHiddenOnion(
+    circuit: OnionCircuitClient,
+    target: UpstreamRelay,
+    serviceAddress: string,
+    token: string,
+  ): Promise<void> {
+    if (this.closed || circuit.state.shouldRebuild()) return;
+    const identity = await this.nodeCrypto.currentKey('identity');
+    const poll = await createHiddenGatewayOperation(
+      'hidden-poll', token, this.nodeLabel!, identity, this.nodeCrypto,
+    );
+    const raw = await circuit.request(Buffer.from(JSON.stringify(poll), 'utf8'));
+    const result = JSON.parse(raw.toString('utf8')) as { request?: unknown };
+    if (result.request) {
+      const request = parseOverlayMessage(JSON.stringify(result.request));
+      if (!request || request.type !== 'request' || !request.payload.e2e) throw new Error('Invalid rendezvous request');
+      const response = await this.handleOnionDirectRequest(request);
+      const responseOperation = await createHiddenGatewayOperation(
+        'hidden-response',
+        token,
+        this.nodeLabel!,
+        await this.nodeCrypto.currentKey('identity'),
+        this.nodeCrypto,
+        {
+          request_id: request.id,
+          response: {
+            id: response.id,
+            type: response.type,
+            source: this.nodeLabel!,
+            destination: 'rendezvous',
+            payload: { e2e: response.payload.e2e },
+            trace: [],
+          },
+        },
+      );
+      await circuit.request(Buffer.from(JSON.stringify(responseOperation), 'utf8'));
+    }
+    if (this.closed || circuit.state.shouldRebuild()) return;
+    await new Promise<void>(resolve => {
+      const timer = setTimeout(resolve, 250);
+      timer.unref?.();
+    });
+    return this.pollHiddenOnion(circuit, target, serviceAddress, token);
+  }
 
   private startHiddenMode(
     relayTargets: UpstreamRelay[],
@@ -349,11 +486,11 @@ export class ServiceGateway {
   }
 
   /** Announce this gateway's lp:// address + endpoints to all configured federation registries. */
-  private announceFederation(
+  private async announceFederation(
     cfg: LatticeNodeYaml | null,
     serviceAddress: string,
     gatewayEndpoints: string[],
-  ): void {
+  ): Promise<void> {
     if (this.closed) return;
     const fedUrls = resolveFederationUrls(cfg);
     if (!fedUrls.length) return;
@@ -361,6 +498,19 @@ export class ServiceGateway {
     if (!fqdn.endsWith('.lattice') && !fqdn.endsWith('.id')) return;
     const ttl = cfg?.gateway?.announceTtlSeconds ?? 300;
     const overlaySecret = loadCA().overlaySecret;
+    const encryptionKey = await this.nodeCrypto.currentKey('gateway-encryption');
+    const delivery = this.hiddenMode
+      ? {
+          mode: 'hidden' as const,
+          rendezvous: resolveRendezvousRelays(cfg).map((relay) => ({
+            nodeLabel: relay.label ?? '',
+            endpoint: relay.url,
+            token: hiddenRendezvousToken(encryptionKey.keyId, relay.label ?? relay.url, fqdn),
+            expiresAt: new Date(Date.now() + ttl * 1000).toISOString(),
+          })),
+        }
+      : { mode: 'public' as const };
+    if (delivery.mode === 'hidden' && delivery.rendezvous.some(item => !item.nodeLabel)) return;
     // FQDNs to announce: the named .lattice address + the self-auth .id address
     const selfAuthFqdn = deriveSelfAuthAddress(this.myPublicKey);
     const fqdnsToAnnounce = fqdn.endsWith('.lattice')
@@ -371,11 +521,15 @@ export class ServiceGateway {
         postFederationAnnounce(
           replicaUrl,
           {
-            version: 2,
+            version: 3,
             fqdn: announceFqdn,
             gatewayPubKeyB64: this.myPublicKey,
             gatewayEndpoints,
             gatewayNodeLabel: this.nodeLabel,
+            gatewayEncryptionKeyId: encryptionKey.keyId,
+            gatewayEncryptionPubKeyB64Url: encryptionKey.publicKey,
+            hpkeSuite: LATTICE_HPKE_SUITE,
+            delivery,
           },
           { ttlSeconds: ttl, announcerPubKey: this.myPublicKey, overlaySecret },
         ).catch(() => {});
@@ -383,7 +537,7 @@ export class ServiceGateway {
     }
     // Re-announce at half the TTL
     this.announceTimer = setTimeout(
-      () => this.announceFederation(cfg, serviceAddress, gatewayEndpoints),
+      () => { void this.announceFederation(cfg, serviceAddress, gatewayEndpoints); },
       (ttl / 2) * 1000,
     );
     this.announceTimer.unref?.();
@@ -397,56 +551,101 @@ export class ServiceGateway {
 
   private handleMessage(ws: WebSocket, data: string) {
     const frameBytes = Math.max(1, Buffer.byteLength(data, 'utf8'));
+    const requestId = parseOverlayMessage(data)?.id;
     if (!this.ingress.tryAcquire(ws, frameBytes)) {
       ws.close(1013, 'overlay backpressure');
       return;
     }
     void this.handleMessageAsync(ws, data).catch(() => {
       this.failures++;
-    }).finally(() => this.ingress.release(ws, frameBytes));
+    }).finally(() => {
+      if (requestId) this.e2eResponseContexts.delete(requestId);
+      this.ingress.release(ws, frameBytes);
+    });
   }
 
-  private async handleMessageAsync(ws: WebSocket, data: string) {
-    const msg = parseOverlayMessage(data);
+  private async handleMessageAsync(ws: WebSocket, data: string, onionDirect = false) {
+    let msg = parseOverlayMessage(data);
     if (!msg || msg.type !== 'request') return;
 
-    const relayIdentity = await validateDistributedPeer({
-      distributedMesh: this.distributedMesh,
-      cfg: this.cfg,
-      chain: this.chain,
-      msg,
-      expectedRole: 'relay',
-    });
-    if (!relayIdentity.ok) {
-      // Do not derive a reply key from an unauthenticated peer's claimed key.
-      // In mesh mode a negative identity result is silent by design.
-      if (!this.distributedMesh) this.sendResponse(ws, msg, 401, { error: relayIdentity.error });
-      return;
+    let relayPub: string | undefined;
+    if (!onionDirect) {
+      const relayIdentity = await validateDistributedPeer({
+        distributedMesh: this.distributedMesh,
+        cfg: this.cfg,
+        chain: this.chain,
+        msg,
+        expectedRole: 'relay',
+      });
+      if (!relayIdentity.ok) {
+        // Do not derive a reply key from an unauthenticated peer's claimed key.
+        // In mesh mode a negative identity result is silent by design.
+        if (!this.distributedMesh) await this.sendResponse(ws, msg, 401, { error: relayIdentity.error });
+        return;
+      }
+      relayPub = relayIdentity.pubkey;
+      const ok = verifyIncomingOverlayFromPeer({
+        distributedMesh: this.distributedMesh,
+        mgr: this.sessionMgr,
+        overlaySecret: loadCA().overlaySecret,
+        expectedPeerPubKeyB64: relayPub,
+        msg,
+      });
+      if (!ok) {
+        await this.sendResponse(ws, msg, 401, { error: 'Unauthenticated overlay request' }, relayPub);
+        return;
+      }
     }
 
-    const ok = verifyIncomingOverlayFromPeer({
-      distributedMesh: this.distributedMesh,
-      mgr: this.sessionMgr,
-      overlaySecret: loadCA().overlaySecret,
-      expectedPeerPubKeyB64: relayIdentity.pubkey,
-      msg,
-    });
-    if (!ok) {
-      this.sendResponse(ws, msg, 401, { error: 'Unauthenticated overlay request' }, relayIdentity.pubkey);
-      return;
+    if (this.distributedMesh) {
+      const envelope = parseHpkeEnvelope(msg.payload.e2e);
+      if (!envelope || envelope.direction !== 'request' || envelope.request_id !== msg.id) {
+        this.failures++;
+        return;
+      }
+      try {
+        const inner = parseE2eRequest(await this.nodeCrypto.hpkeOpen<unknown>(envelope.key_id, envelope));
+        if (inner.request_id !== msg.id || inner.route_hash !== envelope.route_hash ||
+            inner.destination !== this.serviceAddress) {
+          throw new Error('E2E request binding mismatch');
+        }
+        this.e2eResponseContexts.set(msg.id, {
+          requestId: msg.id,
+          routeHash: inner.route_hash,
+          responseKeyId: inner.response_key_id,
+          responsePublicKey: inner.response_public_key,
+          transportDestination: msg.source,
+        });
+        msg = {
+          ...msg,
+          source: inner.source,
+          destination: inner.destination,
+          payload: {
+            method: inner.method,
+            url: inner.url,
+            headers: inner.headers,
+            body: inner.body,
+            agent_proof: inner.agent_proof,
+          },
+        };
+      } catch {
+        this.hpkeFailures++;
+        this.failures++;
+        return;
+      }
     }
 
     msg.trace.push('gateway');
     const proofResult = await this.verifyAgentProof(msg);
     if (!proofResult.ok) {
-      this.sendResponse(ws, msg, proofResult.status ?? 401, { error: proofResult.error }, relayIdentity.pubkey);
+      await this.sendResponse(ws, msg, proofResult.status ?? 401, { error: proofResult.error }, relayPub);
       return;
     }
     const agent = proofResult.agent;
 
     if (isRevoked(agent)) {
-      if (!await this.audit(agent, 'request', 'deny', 'AGENT_REVOKED', ws, msg, relayIdentity.pubkey)) return;
-      this.sendResponse(ws, msg, 403, { error: 'AGENT_REVOKED' }, relayIdentity.pubkey);
+      if (!await this.audit(agent, 'request', 'deny', 'AGENT_REVOKED', ws, msg, relayPub)) return;
+      await this.sendResponse(ws, msg, 403, { error: 'AGENT_REVOKED' }, relayPub);
       return;
     }
 
@@ -455,22 +654,43 @@ export class ServiceGateway {
     const check = proofResult.issuerCheck ?? this.policy.check(agent, this.serviceAddress, action);
 
     if (!check.allowed) {
-      if (!await this.audit(agent, action, 'deny', check.reason, ws, msg, relayIdentity.pubkey)) return;
-      this.sendResponse(ws, msg, 403, { error: 'Forbidden by Gateway Policy', reason: check.reason }, relayIdentity.pubkey);
+      if (!await this.audit(agent, action, 'deny', check.reason, ws, msg, relayPub)) return;
+      await this.sendResponse(ws, msg, 403, { error: 'Forbidden by Gateway Policy', reason: check.reason }, relayPub);
       return;
     }
 
     if (check.requires_approval) {
-      if (!await this.audit(agent, action, 'require_human_approval', check.reason, ws, msg, relayIdentity.pubkey)) return;
-      this.sendResponse(ws, msg, 202, { status: 'pending_approval' }, relayIdentity.pubkey);
+      if (!await this.audit(agent, action, 'require_human_approval', check.reason, ws, msg, relayPub)) return;
+      await this.sendResponse(ws, msg, 202, { status: 'pending_approval' }, relayPub);
       return;
     }
 
     const action_id = actionIdForProof(msg.payload.agent_proof!);
-    if (!await this.audit(agent, action, 'allow', check.reason, ws, msg, relayIdentity.pubkey, { action_id })) return;
+    if (!await this.audit(agent, action, 'allow', check.reason, ws, msg, relayPub, { action_id })) return;
     this.checkPASAndMaybePause(agent);
 
-    await this.forwardHttp(msg, ws, relayIdentity.pubkey, action_id);
+    await this.forwardHttp(msg, ws, relayPub, action_id);
+  }
+
+  private async handleOnionDirectRequest(request: OverlayMessage): Promise<OverlayMessage> {
+    let responseRaw: string | undefined;
+    const collector = {
+      readyState: WebSocket.OPEN,
+      send: (value: string | Buffer) => { responseRaw = value.toString(); },
+      close: () => {},
+    } as unknown as WebSocket;
+    this.onionDirectRequests.add(request.id);
+    try {
+      await this.handleMessageAsync(collector, JSON.stringify(request), true);
+      const response = responseRaw ? parseOverlayMessage(responseRaw) : null;
+      if (!response || response.type !== 'response' || response.id !== request.id || !response.payload.e2e) {
+        throw new Error('Gateway did not produce an encrypted rendezvous response');
+      }
+      return response;
+    } finally {
+      this.onionDirectRequests.delete(request.id);
+      this.e2eResponseContexts.delete(request.id);
+    }
   }
 
   private forwardHttp(
@@ -481,7 +701,7 @@ export class ServiceGateway {
   ): Promise<void> {
     const backend = this.buildBackendRequest(msg, actionId);
     if (!backend) {
-      this.sendResponse(ws, msg, 400, { error: 'Invalid backend request' }, relayPub);
+      void this.sendResponse(ws, msg, 400, { error: 'Invalid backend request' }, relayPub);
       return Promise.resolve();
     }
     return new Promise(resolve => {
@@ -495,7 +715,7 @@ export class ServiceGateway {
       const failBackend = (error: Error) => {
         if (!finish()) return;
         this.failures++;
-        this.sendResponse(ws, msg, 502, { error: 'Backend error', detail: error.message }, relayPub);
+        void this.sendResponse(ws, msg, 502, { error: 'Backend error', detail: error.message }, relayPub);
       };
       try {
         const client = backend.options.protocol === 'https:' ? https : http;
@@ -520,27 +740,20 @@ export class ServiceGateway {
           });
           res.on('end', () => {
             if (settled) return;
-            try {
+            void (async () => {
               const bodyStr = Buffer.concat(chunks).toString('base64');
-              const outMsg = signOverlayMessage(
-                {
-                  id: msg.id,
-                  type: 'response',
-                  source: this.serviceAddress,
-                  destination: msg.source,
-                  payload: { status: res.statusCode, headers: responseHeaders(res.headers), body: bodyStr },
-                  trace: msg.trace,
-                  source_pubkey: this.myPublicKey,
-                  source_node_label: this.nodeLabel,
-                  source_node_role: 'gateway',
-                },
-                this.relaySignMaterial(relayPub),
+              await this.sendHttpResponse(
+                ws,
+                msg,
+                res.statusCode ?? 502,
+                responseHeaders(res.headers),
+                bodyStr,
+                relayPub,
               );
-              if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(outMsg));
               finish();
-            } catch (error) {
+            })().catch(error => {
               failBackend(error instanceof Error ? error : new Error(String(error)));
-            }
+            });
           });
           res.on('aborted', () => failBackend(new Error('Backend response aborted')));
           res.on('error', error => failBackend(error instanceof Error ? error : new Error(String(error))));
@@ -702,41 +915,100 @@ export class ServiceGateway {
       return true;
     } catch {
       this.failures++;
-      this.sendResponse(ws, req, 503, { error: 'AUDIT_UNAVAILABLE' }, trustedRelayPub);
+      await this.sendResponse(ws, req, 503, { error: 'AUDIT_UNAVAILABLE' }, trustedRelayPub);
       return false;
     }
   }
 
-  private sendResponse(
+  private async sendResponse(
     ws: WebSocket,
     req: OverlayMessage,
     status: number,
     bodyObj: object,
     trustedRelayPub?: string,
-  ) {
+  ): Promise<void> {
+    await this.sendHttpResponse(
+      ws,
+      req,
+      status,
+      { 'content-type': 'application/json' },
+      Buffer.from(JSON.stringify(bodyObj)).toString('base64'),
+      trustedRelayPub,
+    );
+  }
+
+  private async sendHttpResponse(
+    ws: WebSocket,
+    req: OverlayMessage,
+    status: number,
+    headers: Record<string, string | string[] | number>,
+    body: string,
+    trustedRelayPub?: string,
+  ): Promise<void> {
     const relayPub = trustedRelayPub ?? req.source_pubkey;
+    const e2eContext = this.e2eResponseContexts.get(req.id);
+    let payload: OverlayMessage['payload'] = { status, headers, body };
+    let source = this.serviceAddress;
+    let destination = req.source;
+    let trace = req.trace;
+    if (e2eContext) {
+      const identity = await this.nodeCrypto.currentKey('identity');
+      const unsigned: E2eResponseUnsigned = {
+        version: 1,
+        request_id: e2eContext.requestId,
+        route_hash: e2eContext.routeHash,
+        status,
+        headers,
+        body,
+        gateway_identity_key_id: identity.keyId,
+        gateway_identity_public_key: identity.publicKey,
+      };
+      const signature = await this.nodeCrypto.signEd25519(
+        identity.keyId,
+        gatewayResponseSignaturePayload(unsigned),
+      );
+      const envelopeNow = Date.now();
+      const createdAt = new Date(envelopeNow).toISOString();
+      const e2e = await sealHpkeJson(
+        e2eContext.responsePublicKey,
+        {
+          direction: 'response',
+          keyId: e2eContext.responseKeyId,
+          requestId: e2eContext.requestId,
+          routeHash: e2eContext.routeHash,
+          createdAt,
+          expiresAt: new Date(envelopeNow + 5 * 60_000).toISOString(),
+        },
+        { ...unsigned, signature: signature.toString('base64url') },
+      );
+      payload = { e2e };
+      source = this.nodeLabel ?? 'gateway';
+      destination = e2eContext.transportDestination;
+      trace = [];
+      this.e2eResponseContexts.delete(req.id);
+    }
     const unsigned: OverlayMessage = {
       id: req.id,
       type: 'response',
-      source: this.serviceAddress,
-      destination: req.source,
-      payload: {
-        status,
-        headers: { 'content-type': 'application/json' },
-        body: Buffer.from(JSON.stringify(bodyObj)).toString('base64'),
-      },
-      trace: req.trace,
+      source,
+      destination,
+      payload,
+      trace,
       source_pubkey: this.myPublicKey,
       source_node_label: this.nodeLabel,
       source_node_role: 'gateway',
     };
+    if (this.onionDirectRequests.has(req.id)) {
+      if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(unsigned));
+      return;
+    }
     let res: OverlayMessage;
     try {
       res = signOverlayMessage(unsigned, this.relaySignMaterial(relayPub));
     } catch {
       return;
     }
-    ws.send(JSON.stringify(res));
+    if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(res));
   }
 }
 
@@ -809,4 +1081,10 @@ export function backendMaxSocketsFromEnv(env: NodeJS.ProcessEnv = process.env): 
     throw new Error('LATTICE_BACKEND_MAX_SOCKETS must be between 32 and 65536');
   }
   return parsed;
+}
+
+function hiddenRendezvousToken(encryptionKeyId: string, relayLabel: string, fqdn: string): string {
+  return crypto.createHmac('sha256', encryptionKeyId)
+    .update(`${relayLabel}\0${fqdn}`, 'utf8')
+    .digest('base64url');
 }

@@ -19,6 +19,7 @@ import {
   normalizeRoutingPayload,
   lpFromFqdn,
   ROUTING_PAYLOAD_VERSION,
+  assertEncryptedRoutingPayload,
   type RoutingPayload,
 } from './routing-cache';
 import { LOCAL_FALLBACK_WS_REGISTRY } from './local-relay-registry';
@@ -43,6 +44,10 @@ export interface ResolvedGatewayRoute {
   gatewayEndpoints: string[];
   metadataHash: string;
   serviceCertHash: string;
+  gatewayEncryptionKeyId?: string;
+  gatewayEncryptionPubKeyB64Url?: string;
+  hpkeSuite?: string;
+  delivery?: RoutingPayload['delivery'];
 }
 
 interface ChainNamespaceRecord {
@@ -139,7 +144,7 @@ export class LpGatewayResolver {
       if (!entry) continue;
       // Skip expired entries
       if (new Date(entry.expiresAt).getTime() < now) continue;
-      if (!entry.payload.gatewayEndpoints.length) continue;
+      if (!routingPayloadDeliverable(entry.payload)) continue;
       const payload = normalizeRoutingPayload(entry.payload);
       if (payload.fqdn !== fqdn) continue;
       const expiresAtMs = new Date(entry.expiresAt).getTime();
@@ -187,7 +192,7 @@ export class LpGatewayResolver {
     // Only an operator-authenticated local route may name where to dial.
     const payload = lookupRoutingPayload(this.cfg, fqdn, { requireLocalSig: true });
 
-    if (!payload || !payload.gatewayEndpoints.length) {
+    if (!payload || !routingPayloadDeliverable(payload)) {
       throw new LpRoutingNotFoundError(
         `No routing found for self-auth address ${fqdn}. ` +
         `The gateway must announce lp://${fqdn} to federation or routing-cache.`,
@@ -201,6 +206,7 @@ export class LpGatewayResolver {
         `routing entry pubkey does not match address. Possible hijack attempt.`,
       );
     }
+    if (distributedMeshEffective(this.cfg)) assertEncryptedRoutingPayload(payload);
 
     return {
       fqdn,
@@ -210,6 +216,10 @@ export class LpGatewayResolver {
       gatewayEndpoints: [...payload.gatewayEndpoints],
       metadataHash: routingCommitmentHex(payload),
       serviceCertHash: '',
+      gatewayEncryptionKeyId: payload.gatewayEncryptionKeyId,
+      gatewayEncryptionPubKeyB64Url: payload.gatewayEncryptionPubKeyB64Url,
+      hpkeSuite: payload.hpkeSuite,
+      delivery: payload.delivery,
     };
   }
 
@@ -230,7 +240,7 @@ export class LpGatewayResolver {
       // Step 2: Federation registries — but ONLY allowed without chain in non-mesh mode.
       // In distributed mesh, signed routing-cache is the trust anchor; federation without
       // on-chain namespace verification can be hijacked by any authenticated node.
-      if (!payload || !payload.gatewayEndpoints.length) {
+      if (!payload || !routingPayloadDeliverable(payload)) {
         if (mesh) {
           throw new LpRoutingNotFoundError(
             `Distributed mesh requires a signed routing-cache entry or chain config for ${fqdn}. ` +
@@ -243,7 +253,7 @@ export class LpGatewayResolver {
       }
 
       // Step 3: LOCAL_FALLBACK for single-machine dev (no mesh, no federation)
-      if ((!payload || !payload.gatewayEndpoints.length) && !mesh) {
+      if ((!payload || !routingPayloadDeliverable(payload)) && !mesh) {
         const canon = lpFromFqdn(fqdn);
         const ws = LOCAL_FALLBACK_WS_REGISTRY[canon];
         if (ws) {
@@ -262,16 +272,21 @@ export class LpGatewayResolver {
             gatewayEndpoints: [ws],
             metadataHash: routingCommitmentHex(metaHint),
             serviceCertHash: '',
+            gatewayEncryptionKeyId: metaHint.gatewayEncryptionKeyId,
+            gatewayEncryptionPubKeyB64Url: metaHint.gatewayEncryptionPubKeyB64Url,
+            hpkeSuite: metaHint.hpkeSuite,
+            delivery: metaHint.delivery,
           };
         }
       }
-      if (!payload || !payload.gatewayEndpoints.length) {
+      if (!payload || !routingPayloadDeliverable(payload)) {
         throw new LpRoutingNotFoundError(
           `No chain config and no routing cache row for ${fqdn}. ` +
           `Configure registry.federationUrls in node.yaml, populate ~/.lattice/routing-cache.json, or disable distributedMesh.`,
         );
       }
       const metaHex = routingCommitmentHex(payload);
+      if (mesh) assertEncryptedRoutingPayload(payload);
       return {
         fqdn,
         lpDestination: lpDestination.includes('lp://') ? lpDestination : `lp://${fqdn}`,
@@ -280,6 +295,10 @@ export class LpGatewayResolver {
         gatewayEndpoints: [...payload.gatewayEndpoints],
         metadataHash: metaHex,
         serviceCertHash: '',
+        gatewayEncryptionKeyId: payload.gatewayEncryptionKeyId,
+        gatewayEncryptionPubKeyB64Url: payload.gatewayEncryptionPubKeyB64Url,
+        hpkeSuite: payload.hpkeSuite,
+        delivery: payload.delivery,
       };
     }
 
@@ -312,8 +331,11 @@ export class LpGatewayResolver {
     }
 
     if (!payload || payload.gatewayEndpoints.length === 0) {
-      throw new LpRoutingNotFoundError(`No gateway endpoints cached for ${fqdn}`);
+      if (payload?.delivery?.mode !== 'hidden') {
+        throw new LpRoutingNotFoundError(`No gateway endpoints cached for ${fqdn}`);
+      }
     }
+    if (mesh) assertEncryptedRoutingPayload(payload);
 
     const metaHex = routingCommitmentHex(payload);
     return {
@@ -324,6 +346,15 @@ export class LpGatewayResolver {
       gatewayEndpoints: [...payload.gatewayEndpoints],
       metadataHash: metaHex,
       serviceCertHash: svc,
+      gatewayEncryptionKeyId: payload.gatewayEncryptionKeyId,
+      gatewayEncryptionPubKeyB64Url: payload.gatewayEncryptionPubKeyB64Url,
+      hpkeSuite: payload.hpkeSuite,
+      delivery: payload.delivery,
     };
   }
+}
+
+function routingPayloadDeliverable(payload: RoutingPayload): boolean {
+  return payload.gatewayEndpoints.length > 0 ||
+    (payload.delivery?.mode === 'hidden' && payload.delivery.rendezvous.length > 0);
 }

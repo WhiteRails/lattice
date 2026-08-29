@@ -23,7 +23,7 @@ export const LATTICE_DIR =
     path.resolve(process.env.LATTICE_HOME.trim())
   : path.join(os.homedir(), '.lattice');
 
-const dirs = ['ca', 'agents', 'policies', 'services', 'logs', 'revocations', 'evidence'];
+const dirs = ['ca', 'agents', 'policies', 'services', 'logs', 'revocations', 'evidence', 'keys'];
 const PRIVATE_FILE_MODE = 0o600;
 const PRIVATE_DIR_MODE = 0o700;
 const DEFAULT_LOCAL_REVOCATION_MAX_ENTRIES = 100_000;

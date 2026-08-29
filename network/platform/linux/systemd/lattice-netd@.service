@@ -1,0 +1,33 @@
+[Unit]
+Description=Lattice LNP/1 VPN profile %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=lattice
+EnvironmentFile=/etc/lattice/profiles/%i.env
+LoadCredentialEncrypted=client-key:/etc/credstore.encrypted/lattice-client-key-%i
+ExecStart=/usr/local/bin/lattice-netd profile-connect --profile-id %i --state-dir /var/lib/lattice/profiles --client-key-ref %d/client-key
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=15
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+CapabilityBoundingSet=CAP_NET_ADMIN
+AmbientCapabilities=CAP_NET_ADMIN
+DeviceAllow=/dev/net/tun rw
+ReadWritePaths=/var/lib/lattice /run/lattice
+
+[Install]
+WantedBy=multi-user.target
+

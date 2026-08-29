@@ -22,6 +22,7 @@ fi
 cmake -S "$release_root/daemon" -B "$release_root/build/release-daemon" -DCMAKE_BUILD_TYPE=Release
 cmake --build "$release_root/build/release-daemon" --config Release
 cargo build --manifest-path "$release_root/clients/rust/Cargo.toml" --release
+cargo build --manifest-path "$release_root/network/Cargo.toml" --workspace --release
 
 llama_root="$release_root/build/llama.cpp"
 if [ ! -d "$llama_root/.git" ]; then
@@ -56,14 +57,25 @@ if [ "$model_actual_sha256" != "$model_sha256" ]; then
   exit 1
 fi
 
-mkdir -p "$release_dir/bin" "$release_dir/models" "$release_dir/etc/lattice" "$release_dir/lib/systemd/system" "$release_dir/THIRD_PARTY_LICENSES"
+mkdir -p "$release_dir/bin" "$release_dir/models" "$release_dir/etc/lattice" "$release_dir/lib/systemd/system" "$release_dir/share/applications" "$release_dir/THIRD_PARTY_LICENSES"
 install -m 0755 "$release_root/build/release-daemon/latticed" "$release_dir/bin/latticed"
 install -m 0755 "$release_root/clients/rust/target/release/lattice" "$release_dir/bin/lattice"
 install -m 0755 "$release_root/clients/rust/target/release/lt" "$release_dir/bin/lt"
+install -m 0755 "$release_root/network/target/release/lattice-netd" "$release_dir/bin/lattice-netd"
+install -m 0755 "$release_root/network/target/release/lattice-gatewayd" "$release_dir/bin/lattice-gatewayd"
+install -m 0755 "$release_root/network/target/release/lattice-resolver" "$release_dir/bin/lattice-resolver"
+install -m 0755 "$release_root/network/target/release/lattice-netctl" "$release_dir/bin/lattice-netctl"
 install -m 0755 "$release_root/build/llama.cpp-release/bin/llama-completion" "$release_dir/bin/lt-llm"
 install -m 0644 "$model_cache" "$release_dir/models/$model_name"
 install -m 0644 "$release_root/daemon/latticed.conf.example" "$release_dir/etc/lattice/latticed.conf.example"
 install -m 0644 "$release_root/daemon/systemd/latticed.service" "$release_dir/lib/systemd/system/latticed.service"
+if [ "$release_os" = "linux" ]; then
+  install -m 0644 "$release_root/network/platform/linux/systemd/lattice-netd@.service" "$release_dir/lib/systemd/system/lattice-netd@.service"
+  install -m 0644 "$release_root/network/platform/linux/systemd/lattice-resolver@.service" "$release_dir/lib/systemd/system/lattice-resolver@.service"
+  install -m 0644 "$release_root/network/platform/linux/systemd/lattice-gatewayd.service" "$release_dir/lib/systemd/system/lattice-gatewayd.service"
+  install -m 0644 "$release_root/network/platform/linux/lattice-uri.desktop" "$release_dir/share/applications/lattice-uri.desktop"
+  install -m 0755 "$release_root/network/platform/linux/install.sh" "$release_dir/install-network.sh"
+fi
 install -m 0644 "$release_root/README.md" "$release_dir/README.md"
 install -m 0644 "$llama_root/LICENSE" "$release_dir/THIRD_PARTY_LICENSES/llama.cpp-MIT.txt"
 install -m 0644 "$release_root/docs/third-party-notices.md" "$release_dir/THIRD_PARTY_NOTICES.md"

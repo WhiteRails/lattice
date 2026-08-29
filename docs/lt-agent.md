@@ -4,6 +4,17 @@
 
 El bundle de release contiene el binario Rust `lt`, `llama.cpp` como `lt-llm` (revisión `c1d0e7a004015f23bc0233470b747b596f29b264`) y SmolLM2-135M-Instruct Q4_K_M (105,454,432 bytes, Apache-2.0). El script fija y verifica el commit de `llama.cpp` y el SHA-256 del modelo antes de empaquetar. `lt` ejecuta sólo ese binario hermano con sólo ese modelo hermano; no acepta endpoint, servidor, URL ni ruta de modelo proporcionados por el usuario.
 
+## CLI nativa completa
+
+`lt` reexpone como comandos explícitos todos los comandos del binario nativo `lattice`, conservando sus argumentos y su código de salida:
+
+- `lt [--socket <path>] status` (incluye el alias `stats`)
+- `lt [--socket <path>] ping [payload]`
+- `lt [--socket <path>] --session-token-file <path> sign <payload>`
+- `lt [--socket <path>] load [--requests <n>] [--concurrency <n>] [--payload-bytes <n>]`
+
+Esos comandos son solicitudes directas del operador y se ejecutan sólo contra el binario `lattice` hermano del bundle, sin shell ni resolución por `PATH`. En cambio, `lt ask <prompt>` y el modo interactivo usan el modelo local.
+
 ## Frontera del harness
 
 El modelo recibe un contrato JSON y sólo puede proponer:

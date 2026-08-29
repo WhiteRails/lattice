@@ -29,7 +29,7 @@ export function overlayPubkeysEqual(a?: string, b?: string): boolean {
   }
 }
 
-async function resolveNodeRecord(
+export async function resolveRegisteredNode(
   cfg: LatticeNodeYaml | null,
   chain: NodeChainConfig | null,
   label: string,
@@ -39,7 +39,10 @@ async function resolveNodeRecord(
   if (!row) return null;
   return {
     overlayPubKeyB64: row.overlayPubKeyB64,
+    identityPubKeyB64: row.identityPubKeyB64 ?? '',
+    onionPubKeyB64Url: row.onionPubKeyB64Url ?? '',
     tlsFingerprintSha256: row.tlsFingerprintSha256 ?? '',
+    operatorId: row.operatorId ?? '',
     roleBitmask: row.roleBitmask ?? 0,
     active: true,
   };
@@ -53,7 +56,15 @@ export async function validateDistributedPeer(opts: {
   expectedRole: LatticeNodeRole;
   expectedLabel?: string;
   expectedPubKeyB64?: string;
-}): Promise<{ ok: true; label?: string; pubkey?: string } | { ok: false; error: string }> {
+}): Promise<{
+  ok: true;
+  label?: string;
+  pubkey?: string;
+  identityPubKeyB64?: string;
+  onionPubKeyB64Url?: string;
+  operatorId?: string;
+  tlsFingerprintSha256?: string;
+} | { ok: false; error: string }> {
   if (!opts.distributedMesh) return { ok: true };
 
   const label = opts.msg.source_node_label?.trim();
@@ -73,7 +84,7 @@ export async function validateDistributedPeer(opts: {
 
   let rec: ChainLatticeNodeRecord | null;
   try {
-    rec = await resolveNodeRecord(opts.cfg, opts.chain, label);
+    rec = await resolveRegisteredNode(opts.cfg, opts.chain, label);
   } catch {
     return { ok: false, error: `Unable to resolve lattice node: ${label}` };
   }
@@ -86,5 +97,13 @@ export async function validateDistributedPeer(opts: {
     return { ok: false, error: `Registered pubkey mismatch for ${label}` };
   }
 
-  return { ok: true, label, pubkey };
+  return {
+    ok: true,
+    label,
+    pubkey,
+    identityPubKeyB64: rec.identityPubKeyB64,
+    onionPubKeyB64Url: rec.onionPubKeyB64Url,
+    operatorId: rec.operatorId,
+    tlsFingerprintSha256: rec.tlsFingerprintSha256,
+  };
 }

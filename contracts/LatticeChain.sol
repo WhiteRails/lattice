@@ -73,10 +73,13 @@ contract LatticeChain {
 
     /// @notice Public overlay identities for Lattice nodes (Entry / Relay / Gateway). Governance-only writes.
     /// @dev `overlayPubKey` is opaque X25519 SPKI DER (base64-encoded off-chain becomes raw bytes here).
-    ///      `tlsFingerprintSha256` is optional pin (zeros = TLS chain validation only).
+    ///      `tlsFingerprintSha256` is mandatory for Onion v1 link pinning.
     struct LatticeNode {
         bytes overlayPubKey;
+        bytes identityPubKey;
+        bytes onionPubKey;
         bytes32 tlsFingerprintSha256;
+        bytes32 operatorId;
         uint8 roleBitmask; // 1 = ENTRY | 2 = RELAY | 4 = GATEWAY (OR allowed)
         bool active;
     }
@@ -314,14 +317,29 @@ contract LatticeChain {
     function registerLatticeNode(
         string calldata nodeLabel,
         bytes calldata overlayPubKey,
+        bytes calldata identityPubKey,
+        bytes calldata onionPubKey,
         bytes32 tlsFingerprintSha256,
+        bytes32 operatorId,
         uint8 roleBitmask
     ) external onlyOwner {
         require(bytes(nodeLabel).length != 0, "Empty nodeLabel");
         require(roleBitmask != 0, "No role flags");
         require(overlayPubKey.length > 0, "Missing overlay pubkey");
+        require(identityPubKey.length > 0, "Missing identity pubkey");
+        require(onionPubKey.length == 32, "Invalid onion pubkey");
+        require(tlsFingerprintSha256 != bytes32(0), "Missing TLS SPKI pin");
+        require(operatorId != bytes32(0), "Missing operator id");
         bytes32 id = keccak256(bytes(nodeLabel));
-        latticeNodes[id] = LatticeNode(overlayPubKey, tlsFingerprintSha256, roleBitmask, true);
+        latticeNodes[id] = LatticeNode(
+            overlayPubKey,
+            identityPubKey,
+            onionPubKey,
+            tlsFingerprintSha256,
+            operatorId,
+            roleBitmask,
+            true
+        );
         emit LatticeNodeRegistered(id, nodeLabel);
     }
 

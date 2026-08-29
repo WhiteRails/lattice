@@ -6,7 +6,7 @@
   <em>Route agent actions through explicit identity, policy, and audit controls.</em>
 </p>
 
-Lattice routes autonomous-agent actions through named `lp://` services, capability policy, cryptographic identities and an append-only audit trail. It is an overlay and control plane, not an anonymity network and not a complete host-network isolation boundary by itself.
+Lattice routes autonomous-agent actions through named `lp://` services, capability policy, cryptographic identities and an append-only audit trail. The default control plane is an overlay, not a complete host-network isolation boundary by itself. Its opt-in `onion-v1` mesh adds three-hop, encrypted relay routing; it still does not claim traffic-analysis resistance or post-quantum security.
 
 The local cryptographic runtime is `latticed`, written in C. Agents and SDKs use the Rust `lattice` client over the versioned LTP/1 Unix-socket protocol. TypeScript remains the current Entry/Relay/Gateway control-plane implementation; its operator CLI is named `latticectl` when installed globally.
 
@@ -34,6 +34,14 @@ The production multi-cell soak and failover criteria are in [the multi-cell soak
 The repository CI verifies TypeScript, dependency audit, the C daemon/Rust client interoperability suite, and Rust formatting on every pull request and push to `main`.
 
 The reconciliation of the August 2026 security scan, its regression coverage, and remaining verification boundary is in [the security remediation matrix](docs/security-remediation-2026-08-24.md).
+
+## Current implementation status
+
+- **Control plane:** TypeScript Entry, Relay, Gateway, policy, service registry, and SAAE audit logging are the primary implementation.
+- **Onion v1 mesh:** `distributedMesh: true` requires a fail-closed, operator-diverse three-relay circuit using fixed-size authenticated cells, ntor link authentication, HPKE request/response envelopes, and pinned WSS peers. See [the Onion v1 specification](docs/lattice-onion-v1.md). Loopback tests are not a production deployment claim.
+- **LNP/1 host networking:** `network/` is a separate Rust workspace for the Linux-first QUIC/TUN, DNS, resolver, gateway, and control tooling. It is under active development and is not yet a complete VPN or a replacement for privileged Linux end-to-end validation.
+
+Before exposing a public deployment, validate real TLS certificates and pins, deploy the compatible directory contract, run privileged Linux networking end-to-end tests, and commission an independent security review.
 
 ---
 
@@ -76,6 +84,7 @@ Agents operate under YAML capability policies. If an agent tries to reach a reso
 - Node.js 20+
 - CMake, a C compiler, and OpenSSL 3 development headers (for `latticed`)
 - Rust stable toolchain and Cargo (for `lattice` and `lt`)
+- For the experimental LNP/1 workspace: Linux with TUN, routing, firewall, and DNS administration privileges
 - Docker (recommended for network namespace isolation)
 - For distributed deployment: VPS(s) + TLS (Let's Encrypt) + an EVM-compatible chain
 
@@ -96,7 +105,7 @@ that use it:
 | --- | --- |
 | `latticed` | Native C daemon; starts from flags or a declarative configuration file. |
 | `lattice` | Rust client for daemon `status`, `ping`, `sign`, and local load checks. |
-| `lt` | Local-model Lattice agent; it can only inspect connectivity through `status` and `ping`. |
+| `lt` | CLI nativa de Lattice y agente local: reexpone `status`, `ping`, `sign` y `load`; el modelo sólo puede inspeccionar conectividad. |
 | `latticectl` | Node-based operator control plane for identities, policies, Entry, Relay, and Gateway. |
 
 Build a same-platform release bundle. It contains `latticed`, `lattice`, `lt`,
@@ -126,6 +135,8 @@ latticed --config /etc/lattice/latticed.conf --verify-config
 latticed --config /etc/lattice/latticed.conf
 lattice --socket /run/lattice/latticed.sock status
 lattice --socket /run/lattice/latticed.sock ping hello
+lt --socket /run/lattice/latticed.sock status
+lt --socket /run/lattice/latticed.sock load --requests 1000 --concurrency 64
 ```
 
 `lt` follows the compact Unix agent experience popularized by `fx`, but its
@@ -134,6 +145,9 @@ harness is intentionally not a general coding agent. The release bundle embeds
 MB), so it needs neither Ollama nor a network model server at runtime. It exposes only
 `lattice_status` and `lattice_ping` to that model. It cannot execute a shell,
 read or write files, browse, use MCP, alter policy, manage keys, or sign data.
+For explicit operator use, `lt` is also a drop-in entrypoint for every native
+`lattice` command: `status`, `ping`, `sign`, and `load` retain their original
+arguments and exit status.
 
 ```bash
 lt --socket /run/lattice/latticed.sock ask "¿Lattice está disponible?"
@@ -387,6 +401,7 @@ clients/rust/ Rust lattice SDK and CLI (`lattice` and the restricted `lt` agent)
 contracts/  LatticeChain.sol
 core/       Types, PKI, policy helpers
 daemon/     latticed C daemon, config template, and systemd unit
+network/    Experimental LNP/1 Rust workspace (Linux-first host networking)
 docs/       Architecture decisions and specs
 node/       Current Entry / Relay / Gateway control plane + resolver + routing-cache
 services/   Example backends (echo, proxies)

@@ -68,6 +68,7 @@ import {
   routingCommitmentHex,
   ROUTING_PAYLOAD_VERSION,
   upsertLatticeNodeLocalRecord,
+  readRoutingCacheFile,
   type RoutingPayload,
   type RoutingBundle,
 } from '../node/routing-cache';
@@ -79,6 +80,9 @@ import { generateKeyPair, hashRequestBody, requestSignaturePayload, signData } f
 import * as crypto from 'crypto';
 import { ethers } from 'ethers';
 import { runBoundedLoad } from '../node/bounded-load';
+import { createNodeCryptoBackend } from '../node/node-crypto';
+import { LATTICE_HPKE_SUITE } from '../node/hpke-envelope';
+import { relayCandidatesFromRoutingCache } from '../node/circuit-selector';
 
 const program = new Command();
 program.name('lattice').description('Certified overlay network for autonomous AI agents').version('0.1.0');
@@ -160,6 +164,8 @@ async function announceRouting(opts: {
   const eps = csvValues(opts.endpoints);
   if (!eps.length) err('Provide comma-separated gateways via --endpoints or --endpoint');
   const cfg = loadNodeConfig();
+  const cryptoBackend = createNodeCryptoBackend(cfg?.crypto);
+  const gatewayEncryptionKey = await cryptoBackend.currentKey('gateway-encryption');
 
   const payload: RoutingPayload = {
     version: ROUTING_PAYLOAD_VERSION,
@@ -167,6 +173,10 @@ async function announceRouting(opts: {
     gatewayNodeLabel: opts.gatewayNodeLabel?.trim() || cfg?.nodeId?.trim() || undefined,
     gatewayPubKeyB64: opts.gatewayPubkeyBase64?.trim() ?? getOrCreateOverlayKeyPair().publicKey.trim(),
     gatewayEndpoints: eps,
+    gatewayEncryptionKeyId: gatewayEncryptionKey.keyId,
+    gatewayEncryptionPubKeyB64Url: gatewayEncryptionKey.publicKey,
+    hpkeSuite: LATTICE_HPKE_SUITE,
+    delivery: { mode: 'public' },
   };
   if (cfg?.distributedMesh && !payload.gatewayNodeLabel) {
     err('distributedMesh routing announce requires --gateway-node-label or nodeId in node.yaml');
@@ -204,17 +214,38 @@ function addPeerCacheRow(opts: {
   roles?: string;
   endpoint?: string;
   tlsFingerprintSha256?: string;
+  identityPubkeyBase64?: string;
+  onionPubkeyBase64url?: string;
+  operatorId?: string;
 }): void {
+  const cfg = loadNodeConfig();
   const label = opts.label?.trim();
   if (!label) err('Provide --label <label>');
   const overlayPubkeyBase64 = opts.overlayPubkeyBase64?.trim() || opts.pubkey?.trim();
   if (!overlayPubkeyBase64) err('Provide --pubkey <base64> or --overlay-pubkey-base64 <base64>');
   const roleBitmask = opts.roles?.trim() ? roleBitmaskFromRoles(parseNodeRoles(opts.roles, [])).valueOf() : undefined;
-  upsertLatticeNodeLocalRecord(loadNodeConfig(), label, {
+  const tlsPin = opts.tlsFingerprintSha256?.trim().toLowerCase().replace(/^0x/, '');
+  const operatorId = opts.operatorId?.trim().replace(/^0x/, '').toLowerCase();
+  if (cfg?.distributedMesh && cfg.overlayProtocol === 'onion-v1') {
+    if (!roleBitmask || !opts.endpoint?.trim() || !opts.identityPubkeyBase64?.trim() ||
+        !opts.onionPubkeyBase64url?.trim() || !operatorId) {
+      err('Onion v1 peer add requires --roles, --endpoint, --identity-pubkey-base64, --onion-pubkey-base64url and --operator-id');
+    }
+    const endpoint = new URL(opts.endpoint.trim());
+    const loopback = ['127.0.0.1', '::1', 'localhost'].includes(endpoint.hostname.replace(/^\[|]$/g, '').toLowerCase());
+    const insecureTest = cfg.circuit?.allowInsecureLoopbackTests && endpoint.protocol === 'ws:' && loopback;
+    if (endpoint.protocol !== 'wss:' && !insecureTest) err('Onion v1 peer endpoint must use wss://');
+    if (endpoint.protocol === 'wss:' && !/^[a-f0-9]{64}$/.test(tlsPin ?? '')) err('Onion v1 WSS peer requires a 64-hex TLS SPKI pin');
+    if (!/^[a-f0-9]{64}$/.test(operatorId)) err('Onion v1 peer requires a bytes32 operator id');
+  }
+  upsertLatticeNodeLocalRecord(cfg, label, {
     overlayPubKeyB64: overlayPubkeyBase64,
     endpoint: opts.endpoint?.trim(),
     roleBitmask,
-    tlsFingerprintSha256: opts.tlsFingerprintSha256?.trim(),
+    tlsFingerprintSha256: tlsPin,
+    identityPubKeyB64: opts.identityPubkeyBase64?.trim(),
+    onionPubKeyB64Url: opts.onionPubkeyBase64url?.trim(),
+    operatorId,
   });
   ok(`Inserted latticePeers cache bootstrap for '${label}'`);
 }
@@ -511,6 +542,14 @@ nodeCmd
       nodeId: opts.nodeId?.trim() || undefined,
       roles,
       distributedMesh: distributed,
+      overlayProtocol: distributed ? 'onion-v1' : undefined,
+      crypto: { backend: 'local' },
+      circuit: distributed ? {
+        maxAgeSeconds: 600,
+        maxStreams: 100,
+        maxConcurrentStreams: 32,
+        guardLifetimeDays: 30,
+      } : undefined,
       bind: {
         entry: opts.entryBind?.trim() || '127.0.0.1:7777',
         relay: opts.relayBind?.trim() || (distributed ? '0.0.0.0:8888' : '127.0.0.1:8888'),
@@ -542,8 +581,29 @@ nodeCmd
 
     ok(`Sample node YAML → ${chalk.cyan(nodeConfigPath())}`);
     console.log(
-      chalk.dim('Add registry.chain { rpcUrl, contractAddress } to enable hybrid resolution + ECDH relays.'),
+      chalk.dim('Add registry.chain { rpcUrl, contractAddress } and three operator-diverse relays for Onion v1.'),
     );
+  });
+
+const nodeKeysCmd = nodeCmd.command('keys').description('Manage purpose-separated node cryptographic keys');
+
+nodeKeysCmd.command('init').description('Create missing identity, onion and Gateway encryption keys').action(async () => {
+  requireInit();
+  const backend = createNodeCryptoBackend(loadNodeConfig()?.crypto);
+  const keys = await backend.ensureKeys(['identity', 'onion', 'gateway-encryption']);
+  for (const key of keys) ok(`${key.purpose}: ${key.keyId}`);
+});
+
+nodeKeysCmd.command('rotate')
+  .description('Rotate one node key with a one-hour overlap')
+  .requiredOption('--purpose <purpose>', 'identity|onion|gateway-encryption')
+  .action(async opts => {
+    requireInit();
+    const purpose = String(opts.purpose) as import('../node/node-crypto').NodeKeyPurpose;
+    if (!['identity', 'onion', 'gateway-encryption'].includes(purpose)) err('Invalid key purpose');
+    const key = await createNodeCryptoBackend(loadNodeConfig()?.crypto).rotate(purpose);
+    ok(`Rotated ${purpose} → ${key.keyId}`);
+    console.log(chalk.yellow('Publish the new node registration or routing commitment before accepting new traffic.'));
   });
 
 nodeCmd
@@ -551,11 +611,12 @@ nodeCmd
   .description('Chain owner publishes this host overlay pubkey (registerLatticeNode)')
   .requiredOption('--label <label>', 'Stable node label')
   .requiredOption('--roles <roles>', 'Comma-separated entry,relay,gateway flags')
+  .requiredOption('--operator <slug>', 'Governance-assigned operator identifier')
   .requiredOption('--rpc <url>', 'JSON-RPC')
   .requiredOption('--contract <address>', 'LatticeChain contract')
   .option('--key <hex>')
   .option('--key-file <path>')
-  .option('--tls-fingerprint-sha256 <hex>', 'Optional pinning hash (hex bytes32)')
+  .requiredOption('--tls-fingerprint-sha256 <hex>', 'TLS certificate SPKI SHA-256 pin (hex bytes32)')
   .action(async opts => {
     requireInit();
     const pkSigner = requireChainPk(opts);
@@ -563,19 +624,29 @@ nodeCmd
     if (!bitmask) err('Provide at least one role flag');
 
     const overlayPk = getOrCreateOverlayKeyPair().publicKey.trim();
-    const fp = opts.tlsFingerprintSha256?.trim();
+    const nodeCrypto = createNodeCryptoBackend(loadNodeConfig()?.crypto);
+    const [identityKey, onionKey] = await nodeCrypto.ensureKeys(['identity', 'onion']);
+    const operatorId = ethers.keccak256(ethers.toUtf8Bytes(String(opts.operator).trim().toLowerCase()));
+    const fp = opts.tlsFingerprintSha256.trim().toLowerCase().replace(/^0x/, '');
+    if (!/^[a-f0-9]{64}$/.test(fp) || /^0{64}$/.test(fp)) err('Invalid TLS SPKI SHA-256 pin');
     const tx = await chainRegisterLatticeNode(
       opts.rpc.trim(),
       pkSigner,
       opts.contract.trim(),
       opts.label.trim(),
       overlayPk,
-      fp && fp.length ? fp : undefined,
+      identityKey.publicKey,
+      onionKey.publicKey,
+      `0x${fp}`,
+      operatorId,
       bitmask,
     );
     ok(`registerLatticeNode tx=${chalk.green(tx)}`);
     upsertLatticeNodeLocalRecord(loadNodeConfig(), opts.label.trim(), {
       overlayPubKeyB64: overlayPk,
+      identityPubKeyB64: identityKey.publicKey,
+      onionPubKeyB64Url: onionKey.publicKey,
+      operatorId: operatorId.slice(2),
       roleBitmask: bitmask,
       tlsFingerprintSha256: fp,
     });
@@ -719,12 +790,31 @@ peerCli
   .option('--roles <roles>', 'Comma-separated entry,relay,gateway roles for local bootstrap validation')
   .option('--endpoint <url>', 'Optional relay/gateway websocket URL shortcut')
   .option('--tls-fingerprint-sha256 <hex>', 'Optional TLS pinning hash recorded locally')
+  .option('--identity-pubkey-base64 <base64>', 'Ed25519 node identity SPKI DER')
+  .option('--onion-pubkey-base64url <base64url>', 'Raw X25519 ntor public key')
+  .option('--operator-id <hex>', 'Governance-assigned operator id (bytes32)')
   .action(opts => {
     requireInit();
     addPeerCacheRow(opts);
   });
 
 const meshCli = program.command('mesh').description('Distributed mesh operations');
+
+const circuitCli = program.command('circuit').description('Inspect Onion v1 circuit readiness');
+
+circuitCli.command('status').description('Show local relay-directory readiness without exposing principals').action(() => {
+  requireInit();
+  const cfg = loadNodeConfig();
+  const file = readRoutingCacheFile(cfg, { requireLocalSig: true });
+  const relays = file ? relayCandidatesFromRoutingCache(file) : [];
+  const operators = new Set(relays.map(relay => relay.operatorId));
+  console.log(JSON.stringify({
+    overlayProtocol: cfg?.overlayProtocol ?? 'local-json',
+    relayCandidates: relays.length,
+    distinctOperators: operators.size,
+    ready: cfg?.overlayProtocol === 'onion-v1' && relays.length >= 3 && operators.size >= 3,
+  }, null, 2));
+});
 
 meshCli
   .command('smoke')
@@ -1608,12 +1698,18 @@ registryCli
     const registryUrl = opts.registry ?? 'http://127.0.0.1:9000';
     const ttl = parseInt(opts.ttl ?? String(FEDERATION_DEFAULT_TTL_SECONDS), 10);
     if (!Number.isFinite(ttl) || ttl < 30) err('--ttl must be >= 30');
+    const cfg = loadNodeConfig();
+    const gatewayEncryptionKey = await createNodeCryptoBackend(cfg?.crypto).currentKey('gateway-encryption');
     const payload: RoutingPayload = {
       version: ROUTING_PAYLOAD_VERSION,
       fqdn,
       gatewayPubKeyB64: pubkey,
       gatewayEndpoints: [opts.endpoint.trim()],
       gatewayNodeLabel: opts.nodeLabel?.trim() || undefined,
+      gatewayEncryptionKeyId: gatewayEncryptionKey.keyId,
+      gatewayEncryptionPubKeyB64Url: gatewayEncryptionKey.publicKey,
+      hpkeSuite: LATTICE_HPKE_SUITE,
+      delivery: { mode: 'public' },
     };
     ok(`Announcing ${opts.service} → ${opts.endpoint} to ${registryUrl}`);
     const success = await postFederationAnnounce(registryUrl, payload, {

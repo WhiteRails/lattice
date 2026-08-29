@@ -12,16 +12,27 @@ import {
   parseBindHostPort,
   requireDistributedNodeId,
   resolveNodeChainConfig,
+  assertOnionListenerTls,
+  assertOnionOverlayRequired,
+  onionOverlayEffective,
+  resolveOnionCircuitConfig,
 } from './node-config';
 import { LpGatewayResolver, LpRoutingNotFoundError } from './lp-resolver';
 import { bindOverlayWebSocketServer, wsTlsClientOptions } from './ws-stack';
-import { overlayPubkeysEqual, validateDistributedPeer } from './peer-identity';
+import { overlayPubkeysEqual, resolveRegisteredNode, validateDistributedPeer } from './peer-identity';
 import { fqdnFromLpAddress } from './routing-cache';
-import { OverlayRpcPool, overlayRpcPoolOptionsFromEnv } from './overlay-rpc';
+import { OverlayRpcClient, OverlayRpcPool, overlayRpcPoolOptionsFromEnv } from './overlay-rpc';
 import { OverlayIngressLimiter, overlayIngressLimitsFromEnv } from './overlay-ingress';
 import { rendezvousOrder } from './rendezvous';
 import { serveCellStatus } from './node-metrics';
 import { OverlayResponseMultiplexer } from './overlay-response-multiplexer';
+import { createNodeCryptoBackend } from './node-crypto';
+import { OnionRelayRuntime } from './onion-network';
+import {
+  HiddenRendezvousOperationSchema,
+  verifyHiddenGatewayOperation,
+} from './hidden-rendezvous';
+import type { NodeKeyDescriptor } from './node-crypto';
 
 export const DEFAULT_RELAY_PORT = 8888;
 
@@ -36,6 +47,15 @@ interface HiddenGatewayConnection {
   pubkey: string;
   nodeLabel?: string;
   responses: OverlayResponseMultiplexer;
+}
+
+interface HiddenOnionBrokerState {
+  gatewayLabel: string;
+  requests: OverlayMessage[];
+  awaiting: Set<string>;
+  responses: Map<string, OverlayMessage>;
+  waiters: Map<string, Array<(response?: OverlayMessage) => void>>;
+  touchedAt: number;
 }
 
 export class RelayNode {
@@ -59,11 +79,15 @@ export class RelayNode {
    * Value: the outbound WebSocket the gateway dialled into us.
    */
   private hiddenGateways: Map<string, HiddenGatewayConnection> = new Map();
+  private readonly onionRuntime?: OnionRelayRuntime;
+  private readonly hiddenOnionBroker = new Map<string, HiddenOnionBrokerState>();
+  private readonly hiddenProofNonces = new Map<string, number>();
 
   constructor(opts: RelayNodeOptions = {}) {
     const cfgFromDisk = opts.nodeConfig !== undefined ? opts.nodeConfig : loadNodeConfig();
     this.cfg = cfgFromDisk;
     this.distributedMesh = distributedMeshEffective(cfgFromDisk);
+    assertOnionOverlayRequired(cfgFromDisk, this.distributedMesh);
     this.nodeLabel = requireDistributedNodeId(cfgFromDisk, this.distributedMesh);
 
     const relayKeyPair = getOrCreateOverlayKeyPair();
@@ -81,10 +105,19 @@ export class RelayNode {
       '127.0.0.1',
       defaultPort,
     );
+    assertOnionListenerTls(cfgFromDisk, bindHost, 'relay');
 
     this.chain = resolveNodeChainConfig(cfgFromDisk);
     this.resolver = new LpGatewayResolver(cfgFromDisk ?? null, this.chain);
     this.gatewayPool = new OverlayRpcPool({ ...overlayRpcPoolOptionsFromEnv(), wsOptions: wsTlsClientOptions(cfgFromDisk) });
+    if (onionOverlayEffective(cfgFromDisk)) {
+      this.onionRuntime = new OnionRelayRuntime(
+        this.nodeLabel!,
+        cfgFromDisk,
+        createNodeCryptoBackend(cfgFromDisk?.crypto),
+        payload => this.forwardOnionExit(payload),
+      );
+    }
 
     const bound = bindOverlayWebSocketServer(
       bindHost,
@@ -93,6 +126,13 @@ export class RelayNode {
       undefined,
       (req, res) => {
         if (serveCellStatus(req, res, 'relay', () => ({
+          onionCircuitsActive: this.onionRuntime?.snapshot().active,
+          onionCircuitsBuilt: this.onionRuntime?.snapshot().built,
+          onionCircuitsDestroyed: this.onionRuntime?.snapshot().destroyed,
+          onionNtorFailures: this.onionRuntime?.snapshot().ntorFailures,
+          onionReplayFailures: this.onionRuntime?.snapshot().replayFailures,
+          onionInvalidTags: this.onionRuntime?.snapshot().invalidTags,
+          onionPaddingBytes: this.onionRuntime?.snapshot().paddingBytes,
           ...this.ingress.snapshot(),
           outboundInFlight: this.gatewayPool.inFlight(),
           residentPeers: this.hiddenGateways.size,
@@ -106,7 +146,11 @@ export class RelayNode {
     this.closeStack = bound.close;
 
     this.wss.on('connection', (ws) => {
-      ws.on('message', (data) => {
+      ws.on('message', (data, isBinary) => {
+        if (this.onionRuntime?.handles(data, isBinary)) {
+          this.onionRuntime.handle(ws, data, isBinary);
+          return;
+        }
         const raw = data.toString();
         const frameBytes = Math.max(1, Buffer.byteLength(raw, 'utf8'));
         if (!this.ingress.tryAcquire(ws, frameBytes)) {
@@ -243,6 +287,12 @@ export class RelayNode {
 
     // Keepalive heartbeats from hidden gateways — no response needed
     if (msg.type !== 'request') return;
+    // Onion v1 Entry traffic is binary-only. Text requests remain available
+    // solely for local JSON/HMAC mode and hidden Gateway registration traffic.
+    if (onionOverlayEffective(this.cfg) && msg.source_node_role === 'entry') {
+      clientWs.close(1003, 'onion-v1 requires binary cells');
+      return;
+    }
 
     const entryIdentity = await validateDistributedPeer({
       distributedMesh: this.distributedMesh,
@@ -504,4 +554,225 @@ export class RelayNode {
     );
     if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(res));
   }
+
+  private async forwardOnionExit(payload: Buffer): Promise<Buffer> {
+    if (payload.length > 1024 * 1024) throw new Error('Onion exit payload too large');
+    let input: {
+      version?: unknown;
+      gateway_endpoint?: unknown;
+      gateway_node_label?: unknown;
+      gateway_overlay_public_key?: unknown;
+      request?: unknown;
+    };
+    try {
+      input = JSON.parse(payload.toString('utf8'));
+    } catch {
+      throw new Error('Invalid onion exit JSON');
+    }
+    if (typeof input === 'object' && input !== null &&
+        typeof (input as { mode?: unknown }).mode === 'string' &&
+        String((input as { mode: string }).mode).startsWith('hidden-')) {
+      return this.handleHiddenOnionRendezvous(input);
+    }
+    if (input.version !== 1 || typeof input.gateway_endpoint !== 'string' ||
+        typeof input.gateway_node_label !== 'string' || typeof input.gateway_overlay_public_key !== 'string') {
+      throw new Error('Invalid onion exit descriptor');
+    }
+    const request = parseOverlayMessage(JSON.stringify(input.request));
+    if (!request || request.type !== 'request' || !request.payload.e2e ||
+        Object.keys(request.payload).some(key => key !== 'e2e')) {
+      throw new Error('Onion exit accepts only opaque HPKE requests');
+    }
+    const gateway = await resolveRegisteredNode(this.cfg, this.chain, input.gateway_node_label);
+    if (!gateway?.active || (gateway.roleBitmask & 4) === 0 ||
+        !overlayPubkeysEqual(gateway.overlayPubKeyB64, input.gateway_overlay_public_key)) {
+      throw new Error('Onion exit Gateway registry mismatch');
+    }
+    const url = new URL(input.gateway_endpoint);
+    const allowLoopback = resolveOnionCircuitConfig(this.cfg).allowInsecureLoopbackTests;
+    const loopback = ['127.0.0.1', '::1', 'localhost'].includes(url.hostname.replace(/^\[|]$/g, '').toLowerCase());
+    if (url.protocol !== 'wss:' && !(url.protocol === 'ws:' && allowLoopback && loopback)) {
+      throw new Error('ONION_WSS_REQUIRED: Gateway delivery endpoint must use WSS');
+    }
+    const gatewayPin = gateway.tlsFingerprintSha256?.toLowerCase().replace(/^0x/, '');
+    if (url.protocol === 'wss:' && !/^[a-f0-9]{64}$/.test(gatewayPin ?? '')) {
+      throw new Error('ONION_TLS_PIN_REQUIRED: Gateway SPKI pin is not registered');
+    }
+    const relaySignKey = chooseOverlaySignKey(
+      this.downstreamMgr,
+      true,
+      loadCA().overlaySecret,
+      gateway.overlayPubKeyB64,
+    );
+    const downstream = signOverlayMessage({
+      ...request,
+      auth: undefined,
+      source: this.nodeLabel!,
+      destination: input.gateway_node_label,
+      trace: [],
+      source_pubkey: this.myPublicKey,
+      source_node_label: this.nodeLabel,
+      source_node_role: 'relay',
+    }, relaySignKey);
+    const client = new OverlayRpcClient(url.toString(), {
+      ...overlayRpcPoolOptionsFromEnv(),
+      wsOptions: wsTlsClientOptions(this.cfg, gatewayPin),
+    });
+    let response: OverlayMessage;
+    try {
+      response = await client.request(downstream);
+    } finally {
+      client.close();
+    }
+    const gatewayIdentity = await validateDistributedPeer({
+      distributedMesh: true,
+      cfg: this.cfg,
+      chain: this.chain,
+      msg: response,
+      expectedRole: 'gateway',
+      expectedLabel: input.gateway_node_label,
+      expectedPubKeyB64: gateway.overlayPubKeyB64,
+    });
+    if (!gatewayIdentity.ok || !verifyIncomingOverlayFromPeer({
+      distributedMesh: true,
+      mgr: this.downstreamMgr,
+      overlaySecret: loadCA().overlaySecret,
+      expectedPeerPubKeyB64: gatewayIdentity.pubkey,
+      msg: response,
+    }) || !response.payload.e2e || Object.keys(response.payload).some(key => key !== 'e2e')) {
+      throw new Error('Invalid encrypted Gateway response');
+    }
+    const upstream: OverlayMessage = {
+      id: request.id,
+      type: 'response',
+      source: this.nodeLabel!,
+      destination: request.source,
+      payload: { e2e: response.payload.e2e },
+      trace: [],
+      source_node_label: this.nodeLabel,
+      source_node_role: 'relay',
+    };
+    return Buffer.from(JSON.stringify(upstream), 'utf8');
+  }
+
+  private async handleHiddenOnionRendezvous(input: unknown): Promise<Buffer> {
+    this.cleanupHiddenBroker();
+    const operation = HiddenRendezvousOperationSchema.parse(input);
+    let broker = this.hiddenOnionBroker.get(operation.token);
+    if (operation.mode === 'hidden-submit') {
+      const request = parseOverlayMessage(JSON.stringify(operation.request));
+      if (!request || request.type !== 'request' || !request.payload.e2e ||
+          Object.keys(request.payload).some(key => key !== 'e2e')) {
+        throw new Error('Hidden rendezvous accepts only opaque HPKE requests');
+      }
+      if (!broker) {
+        if (this.hiddenOnionBroker.size >= 10_000) throw new Error('Hidden rendezvous capacity reached');
+        broker = {
+          gatewayLabel: operation.gateway_label,
+          requests: [], awaiting: new Set(), responses: new Map(), waiters: new Map(), touchedAt: Date.now(),
+        };
+        this.hiddenOnionBroker.set(operation.token, broker);
+      }
+      if (broker.gatewayLabel !== operation.gateway_label) throw new Error('Hidden rendezvous Gateway mismatch');
+      if (broker.requests.length >= 128 || broker.awaiting.has(request.id) || broker.responses.has(request.id)) {
+        throw new Error('Hidden rendezvous request capacity or duplicate id');
+      }
+      broker.requests.push(request);
+      broker.awaiting.add(request.id);
+      broker.touchedAt = Date.now();
+      return Buffer.from(JSON.stringify({ version: 1, accepted: true, request_id: request.id }), 'utf8');
+    }
+    if (operation.mode === 'hidden-wait') {
+      const response = broker?.responses.get(operation.request_id);
+      if (response) {
+        broker!.responses.delete(operation.request_id);
+        broker!.awaiting.delete(operation.request_id);
+        broker!.touchedAt = Date.now();
+        return Buffer.from(JSON.stringify({ version: 1, response }), 'utf8');
+      }
+      if (!broker || !broker.awaiting.has(operation.request_id)) {
+        return Buffer.from(JSON.stringify({ version: 1, empty: true }), 'utf8');
+      }
+      const waited = await new Promise<OverlayMessage | undefined>(resolve => {
+        const waiters = broker!.waiters.get(operation.request_id) ?? [];
+        let timer: ReturnType<typeof setTimeout>;
+        const complete = (response?: OverlayMessage) => {
+          clearTimeout(timer);
+          resolve(response);
+        };
+        waiters.push(complete);
+        broker!.waiters.set(operation.request_id, waiters);
+        timer = setTimeout(() => {
+          const remaining = (broker!.waiters.get(operation.request_id) ?? []).filter(waiter => waiter !== complete);
+          if (remaining.length) broker!.waiters.set(operation.request_id, remaining);
+          else broker!.waiters.delete(operation.request_id);
+          resolve(undefined);
+        }, 30_000);
+        timer.unref?.();
+      });
+      return Buffer.from(JSON.stringify(waited ? { version: 1, response: waited } : { version: 1, empty: true }), 'utf8');
+    }
+
+    const registeredGateway = await resolveRegisteredNode(this.cfg, this.chain, operation.gateway_label);
+    if (!registeredGateway?.active || (registeredGateway.roleBitmask & 4) === 0 || !registeredGateway.identityPubKeyB64) {
+      throw new Error('Unregistered hidden Gateway');
+    }
+    const authenticated = verifyHiddenGatewayOperation(
+      operation,
+      relayIdentityDescriptor(registeredGateway.identityPubKeyB64),
+    );
+    this.claimHiddenProofNonce(authenticated.gateway_label, authenticated.nonce);
+    if (!broker || broker.gatewayLabel !== authenticated.gateway_label) {
+      return Buffer.from(JSON.stringify({ version: 1, empty: true }), 'utf8');
+    }
+    broker.touchedAt = Date.now();
+    if (authenticated.mode === 'hidden-poll') {
+      const request = broker.requests.shift();
+      return Buffer.from(JSON.stringify(request ? { version: 1, request } : { version: 1, empty: true }), 'utf8');
+    }
+    const response = parseOverlayMessage(JSON.stringify(authenticated.response));
+    if (!response || response.type !== 'response' || response.id !== authenticated.request_id ||
+        !response.payload.e2e || Object.keys(response.payload).some(key => key !== 'e2e') ||
+        !broker.awaiting.has(response.id)) {
+      throw new Error('Invalid hidden Gateway response');
+    }
+    const waiter = broker.waiters.get(response.id)?.shift();
+    if (waiter) {
+      if (!broker.waiters.get(response.id)?.length) broker.waiters.delete(response.id);
+      broker.awaiting.delete(response.id);
+      waiter(response);
+    } else {
+      broker.responses.set(response.id, response);
+    }
+    return Buffer.from(JSON.stringify({ version: 1, accepted: true, request_id: response.id }), 'utf8');
+  }
+
+  private cleanupHiddenBroker(now = Date.now()): void {
+    for (const [token, broker] of this.hiddenOnionBroker) {
+      if (now - broker.touchedAt > 5 * 60_000) {
+        for (const waiters of broker.waiters.values()) waiters.forEach(waiter => waiter(undefined));
+        this.hiddenOnionBroker.delete(token);
+      }
+    }
+    for (const [nonce, expires] of this.hiddenProofNonces) {
+      if (expires <= now) this.hiddenProofNonces.delete(nonce);
+    }
+  }
+
+  private claimHiddenProofNonce(label: string, nonce: string, now = Date.now()): void {
+    const key = `${label}\0${nonce}`;
+    if (this.hiddenProofNonces.has(key)) throw new Error('Replayed hidden Gateway proof');
+    if (this.hiddenProofNonces.size >= 100_000) throw new Error('Hidden proof replay cache capacity reached');
+    this.hiddenProofNonces.set(key, now + 30_000);
+  }
+}
+
+function relayIdentityDescriptor(publicKey: string): NodeKeyDescriptor {
+  const der = Buffer.from(publicKey, 'base64');
+  return {
+    version: 1,
+    keyId: crypto.createHash('sha256').update(der).digest('hex'),
+    purpose: 'identity', algorithm: 'ed25519', publicKey,
+    createdAt: new Date(0).toISOString(), status: 'active',
+  };
 }

@@ -394,6 +394,7 @@ describe('LpGatewayResolver — federation resolution', () => {
         federationUrls: [`http://127.0.0.1:${fedPort}`],
       },
       distributedMesh: true,
+      overlayProtocol: 'onion-v1',
     } as any;
     const resolver = new LpGatewayResolver(cfg, null);
     await expect(resolver.resolveDestination('lp://notfound.lattice')).rejects.toBeInstanceOf(
@@ -483,6 +484,7 @@ describe('node-config schema — new fields', () => {
       yaml.dump({
         nodeId: 'test-node',
         distributedMesh: true,
+        overlayProtocol: 'onion-v1',
         registry: {
           federationUrls: ['http://registry.example.com:9000'],
         },

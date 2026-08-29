@@ -33,12 +33,53 @@ enum AgentReply {
 
 fn usage() {
     eprintln!(
-        "Usage: lt [--socket <path>] [ask <prompt>]\n\n\
-lt is a local Lattice agent. With no command it reads prompts interactively.\n\
+        "Usage: lt [lattice options] <status|ping|sign|load> [arguments]\n\
+       lt [--socket <path>] ask <prompt>\n\
+       lt [--socket <path>]\n\n\
+lt is the local Lattice CLI and agent. status, ping, sign, and load are passed\n\
+directly to the bundled lattice client with the same arguments and exit status.\n\
+With no command it reads agent prompts interactively.\n\
 It embeds llama.cpp and the bundled SmolLM2-135M Q4 model; no model server is used.\n\
-The agent can only call lattice_status and lattice_ping. It cannot run shell commands,\n\
-read or write files, use MCP, browse the web, manage keys, or sign payloads."
+The model can only call lattice_status and lattice_ping. Direct, explicit CLI calls\n\
+may use every native lattice command. The model cannot run shell commands, read or\n\
+write files, use MCP, browse the web, manage keys, or sign payloads."
     );
+}
+
+fn direct_lattice_command(args: &[String]) -> bool {
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--socket" | "--session-token-file" => index += 2,
+            "status" | "stats" | "ping" | "sign" | "load" => return true,
+            _ => return false,
+        }
+    }
+    false
+}
+
+fn bundled_binary(name: &str) -> Result<PathBuf, String> {
+    let executable =
+        env::current_exe().map_err(|error| format!("cannot locate lt executable: {error}"))?;
+    let bin_dir = executable
+        .parent()
+        .ok_or_else(|| "lt executable has no parent directory".to_owned())?;
+    let binary = bin_dir.join(name);
+    if !binary.is_file() {
+        return Err(format!(
+            "bundled {name} binary is missing; install a complete lt release bundle"
+        ));
+    }
+    Ok(binary)
+}
+
+fn execute_direct_lattice(args: &[String]) -> Result<ExitCode, String> {
+    let lattice = bundled_binary("lattice")?;
+    Command::new(lattice)
+        .args(args)
+        .status()
+        .map(|status| ExitCode::from(status.code().unwrap_or(1) as u8))
+        .map_err(|error| format!("cannot start bundled lattice CLI: {error}"))
 }
 
 fn runtime_paths_for(executable: &Path) -> Result<(PathBuf, PathBuf), String> {
@@ -293,6 +334,16 @@ fn interactive(settings: &Settings) -> Result<(), String> {
 }
 
 fn main() -> ExitCode {
+    let raw_args: Vec<String> = env::args().skip(1).collect();
+    if direct_lattice_command(&raw_args) {
+        return match execute_direct_lattice(&raw_args) {
+            Ok(status) => status,
+            Err(error) => {
+                eprintln!("lt: {error}");
+                ExitCode::from(1)
+            }
+        };
+    }
     match parse_settings() {
         Ok((settings, Some(prompt))) => match ask(&settings, &prompt) {
             Ok(answer) => {
@@ -364,5 +415,22 @@ mod tests {
             model,
             PathBuf::from("/opt/lattice/models/lt-smollm2-135m-instruct-q4_k_m.gguf")
         );
+    }
+
+    #[test]
+    fn recognizes_all_native_lattice_commands_but_not_agent_prompts() {
+        assert!(direct_lattice_command(&["status".to_owned()]));
+        assert!(direct_lattice_command(&[
+            "--socket".to_owned(),
+            "/run/lattice/latticed.sock".to_owned(),
+            "sign".to_owned(),
+            "payload".to_owned(),
+        ]));
+        assert!(direct_lattice_command(&["load".to_owned()]));
+        assert!(!direct_lattice_command(&[
+            "ask".to_owned(),
+            "status".to_owned()
+        ]));
+        assert!(!direct_lattice_command(&["--socket".to_owned()]));
     }
 }

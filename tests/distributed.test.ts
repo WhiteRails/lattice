@@ -42,6 +42,19 @@ async function overlayPubkey(home: string): Promise<string> {
   return pk;
 }
 
+async function onionNodeKeys(home: string) {
+  let keys: Awaited<ReturnType<import('../node/node-crypto').NodeCryptoBackend['ensureKeys']>> = [];
+  await configureHome(home, async () => {
+    const { createNodeCryptoBackend } = await import('../node/node-crypto');
+    keys = await createNodeCryptoBackend().ensureKeys(['identity', 'onion', 'gateway-encryption']);
+  });
+  return {
+    identity: keys.find(key => key.purpose === 'identity')!,
+    onion: keys.find(key => key.purpose === 'onion')!,
+    gatewayEncryption: keys.find(key => key.purpose === 'gateway-encryption')!,
+  };
+}
+
 function spawnCli(home: string, args: string[]): ChildProcessWithoutNullStreams {
   const tsNode = path.join(process.cwd(), 'node_modules/.bin/ts-node');
   return spawn(tsNode, ['cli/lattice.ts', ...args], {
@@ -186,7 +199,7 @@ describe('LpGatewayResolver + routing-cache (hybrid)', () => {
     homes.push(home);
     const { saveNodeConfig } = await import('../node/node-config');
     const { LpGatewayResolver, LpRoutingNotFoundError } = await import('../node/lp-resolver');
-    saveNodeConfig({ nodeId: 'relay-a', roles: ['relay'], distributedMesh: true });
+    saveNodeConfig({ nodeId: 'relay-a', roles: ['relay'], distributedMesh: true, overlayProtocol: 'onion-v1' });
     const yaml = (await import('../node/node-config')).loadNodeConfig();
     const resolver = new LpGatewayResolver(yaml, null);
     await expect(resolver.resolveDestination('lp://echo.lattice')).rejects.toThrow(LpRoutingNotFoundError);
@@ -273,12 +286,12 @@ describe('LpGatewayResolver + routing-cache (hybrid)', () => {
   });
 
   it('round-trips Entry → Relay → Gateway across isolated homes without shared overlaySecret', async () => {
-    let relayPort: number;
+    let relayPorts: number[];
     let gatewayPort: number;
     let entryPort: number;
     let backendPort: number;
     try {
-      relayPort = await freePort();
+      relayPorts = await Promise.all([freePort(), freePort(), freePort()]);
       gatewayPort = await freePort();
       entryPort = await freePort();
       backendPort = await freePort();
@@ -288,18 +301,31 @@ describe('LpGatewayResolver + routing-cache (hybrid)', () => {
     }
 
     const entryHome = (await freshLatticeHome()).home;
-    const relayHome = (await freshLatticeHome()).home;
+    const relayHomes = [await freshLatticeHome(), await freshLatticeHome(), await freshLatticeHome()];
     const gatewayHome = (await freshLatticeHome()).home;
-    homes.push(entryHome, relayHome, gatewayHome);
+    const hiddenGatewayHome = (await freshLatticeHome()).home;
+    homes.push(entryHome, ...relayHomes.map(value => value.home), gatewayHome, hiddenGatewayHome);
 
     const entryPk = await overlayPubkey(entryHome);
-    const relayPk = await overlayPubkey(relayHome);
+    const relayPks: string[] = [];
+    for (const value of relayHomes) relayPks.push(await overlayPubkey(value.home));
     const gatewayPk = await overlayPubkey(gatewayHome);
+    const hiddenGatewayPk = await overlayPubkey(hiddenGatewayHome);
+    const entryNodeKeys = await onionNodeKeys(entryHome);
+    const relayNodeKeys: Awaited<ReturnType<typeof onionNodeKeys>>[] = [];
+    for (const value of relayHomes) relayNodeKeys.push(await onionNodeKeys(value.home));
+    const gatewayNodeKeys = await onionNodeKeys(gatewayHome);
+    const hiddenGatewayNodeKeys = await onionNodeKeys(hiddenGatewayHome);
+    const entryOperator = '11'.repeat(32);
+    const relayOperators = ['22'.repeat(32), '44'.repeat(32), '55'.repeat(32)];
+    const relayLabels = ['relay-a', 'relay-b', 'relay-c'];
+    const gatewayOperator = '33'.repeat(32);
+    const hiddenGatewayOperator = '66'.repeat(32);
     let agentPublicKey = '';
 
     await configureHome(entryHome, async () => {
       const { saveNodeConfig } = await import('../node/node-config');
-      const { upsertLatticeNodeLocalRecord } = await import('../node/routing-cache');
+      const { upsertLatticeNodeLocalRecord, upsertRoutingPayload, ROUTING_PAYLOAD_VERSION } = await import('../node/routing-cache');
       const { saveAgent, loadCA } = await import('../node/state');
       const { LatticeCA } = await import('../core/ca');
       const { generateKeyPair } = await import('../core/identity');
@@ -307,10 +333,59 @@ describe('LpGatewayResolver + routing-cache (hybrid)', () => {
         nodeId: 'entry-a',
         roles: ['entry'],
         distributedMesh: true,
+        overlayProtocol: 'onion-v1',
+        circuit: { allowInsecureLoopbackTests: true },
         bind: { entry: `127.0.0.1:${entryPort}` },
-        upstreamRelays: [{ label: 'relay-a', url: `ws://127.0.0.1:${relayPort}` }],
+        upstreamRelays: [{ label: 'relay-a', url: `ws://127.0.0.1:${relayPorts[0]}` }],
       });
-      upsertLatticeNodeLocalRecord(null, 'relay-a', { overlayPubKeyB64: relayPk, roleBitmask: 2 });
+      for (let index = 0; index < 3; index++) {
+        upsertLatticeNodeLocalRecord(null, relayLabels[index]!, {
+          overlayPubKeyB64: relayPks[index]!, identityPubKeyB64: relayNodeKeys[index]!.identity.publicKey,
+          onionPubKeyB64Url: relayNodeKeys[index]!.onion.publicKey, operatorId: relayOperators[index]!,
+          endpoint: `ws://127.0.0.1:${relayPorts[index]}`, roleBitmask: 2,
+        });
+      }
+      upsertLatticeNodeLocalRecord(null, 'gateway-a', {
+        overlayPubKeyB64: gatewayPk, identityPubKeyB64: gatewayNodeKeys.identity.publicKey,
+        onionPubKeyB64Url: gatewayNodeKeys.onion.publicKey, operatorId: gatewayOperator, roleBitmask: 4,
+      });
+      upsertLatticeNodeLocalRecord(null, 'gateway-hidden', {
+        overlayPubKeyB64: hiddenGatewayPk,
+        identityPubKeyB64: hiddenGatewayNodeKeys.identity.publicKey,
+        onionPubKeyB64Url: hiddenGatewayNodeKeys.onion.publicKey,
+        operatorId: hiddenGatewayOperator,
+        roleBitmask: 4,
+      });
+      upsertRoutingPayload(null, {
+        version: ROUTING_PAYLOAD_VERSION,
+        fqdn: 'echo.lattice',
+        gatewayNodeLabel: 'gateway-a',
+        gatewayPubKeyB64: gatewayPk,
+        gatewayEndpoints: [`ws://127.0.0.1:${gatewayPort}`],
+        gatewayEncryptionKeyId: gatewayNodeKeys.gatewayEncryption.keyId,
+        gatewayEncryptionPubKeyB64Url: gatewayNodeKeys.gatewayEncryption.publicKey,
+        hpkeSuite: 'DHKEM-X25519-HKDF-SHA256/HKDF-SHA256/AES-256-GCM',
+        delivery: { mode: 'public' },
+      });
+      const hiddenToken = crypto.createHmac('sha256', hiddenGatewayNodeKeys.gatewayEncryption.keyId)
+        .update('relay-a\0echo-hidden.lattice', 'utf8').digest('base64url');
+      upsertRoutingPayload(null, {
+        version: ROUTING_PAYLOAD_VERSION,
+        fqdn: 'echo-hidden.lattice',
+        gatewayNodeLabel: 'gateway-hidden',
+        gatewayPubKeyB64: hiddenGatewayPk,
+        gatewayEndpoints: [],
+        gatewayEncryptionKeyId: hiddenGatewayNodeKeys.gatewayEncryption.keyId,
+        gatewayEncryptionPubKeyB64Url: hiddenGatewayNodeKeys.gatewayEncryption.publicKey,
+        hpkeSuite: 'DHKEM-X25519-HKDF-SHA256/HKDF-SHA256/AES-256-GCM',
+        delivery: {
+          mode: 'hidden',
+          rendezvous: [{
+            nodeLabel: 'relay-a', endpoint: `ws://127.0.0.1:${relayPorts[0]}`,
+            token: hiddenToken, expiresAt: new Date(Date.now() + 5 * 60_000).toISOString(),
+          }],
+        },
+      });
       const caState = loadCA();
       const ca = LatticeCA.fromKeyPair(caState.caId, { publicKey: caState.publicKey, privateKey: caState.privateKey });
       const keys = generateKeyPair();
@@ -334,25 +409,45 @@ describe('LpGatewayResolver + routing-cache (hybrid)', () => {
       });
     });
 
-    await configureHome(relayHome, async () => {
-      const { saveNodeConfig } = await import('../node/node-config');
-      const { upsertLatticeNodeLocalRecord, upsertRoutingPayload, ROUTING_PAYLOAD_VERSION } = await import('../node/routing-cache');
-      saveNodeConfig({
-        nodeId: 'relay-a',
-        roles: ['relay'],
-        distributedMesh: true,
-        bind: { relay: `127.0.0.1:${relayPort}` },
+    for (let index = 0; index < 3; index++) {
+      await configureHome(relayHomes[index]!.home, async () => {
+        const { saveNodeConfig } = await import('../node/node-config');
+        const { upsertLatticeNodeLocalRecord } = await import('../node/routing-cache');
+        saveNodeConfig({
+          nodeId: relayLabels[index]!,
+          roles: ['relay'],
+          distributedMesh: true,
+          overlayProtocol: 'onion-v1',
+          circuit: { allowInsecureLoopbackTests: true },
+          bind: { relay: `127.0.0.1:${relayPorts[index]}` },
+        });
+        upsertLatticeNodeLocalRecord(null, 'entry-a', {
+          overlayPubKeyB64: entryPk, identityPubKeyB64: entryNodeKeys.identity.publicKey,
+          onionPubKeyB64Url: entryNodeKeys.onion.publicKey, operatorId: entryOperator, roleBitmask: 1,
+        });
+        upsertLatticeNodeLocalRecord(null, 'gateway-a', {
+          overlayPubKeyB64: gatewayPk, identityPubKeyB64: gatewayNodeKeys.identity.publicKey,
+          onionPubKeyB64Url: gatewayNodeKeys.onion.publicKey, operatorId: gatewayOperator, roleBitmask: 4,
+        });
+        upsertLatticeNodeLocalRecord(null, 'gateway-hidden', {
+          overlayPubKeyB64: hiddenGatewayPk,
+          identityPubKeyB64: hiddenGatewayNodeKeys.identity.publicKey,
+          onionPubKeyB64Url: hiddenGatewayNodeKeys.onion.publicKey,
+          operatorId: hiddenGatewayOperator,
+          roleBitmask: 4,
+        });
+        for (let peerIndex = 0; peerIndex < 3; peerIndex++) {
+          upsertLatticeNodeLocalRecord(null, relayLabels[peerIndex]!, {
+            overlayPubKeyB64: relayPks[peerIndex]!,
+            identityPubKeyB64: relayNodeKeys[peerIndex]!.identity.publicKey,
+            onionPubKeyB64Url: relayNodeKeys[peerIndex]!.onion.publicKey,
+            operatorId: relayOperators[peerIndex]!,
+            endpoint: `ws://127.0.0.1:${relayPorts[peerIndex]}`,
+            roleBitmask: 2,
+          });
+        }
       });
-      upsertLatticeNodeLocalRecord(null, 'entry-a', { overlayPubKeyB64: entryPk, roleBitmask: 1 });
-      upsertLatticeNodeLocalRecord(null, 'gateway-a', { overlayPubKeyB64: gatewayPk, roleBitmask: 4 });
-      upsertRoutingPayload(null, {
-        version: ROUTING_PAYLOAD_VERSION,
-        fqdn: 'echo.lattice',
-        gatewayNodeLabel: 'gateway-a',
-        gatewayPubKeyB64: gatewayPk,
-        gatewayEndpoints: [`ws://127.0.0.1:${gatewayPort}`],
-      });
-    });
+    }
 
     await configureHome(gatewayHome, async () => {
       const { saveNodeConfig } = await import('../node/node-config');
@@ -362,11 +457,47 @@ describe('LpGatewayResolver + routing-cache (hybrid)', () => {
         nodeId: 'gateway-a',
         roles: ['gateway'],
         distributedMesh: true,
+        overlayProtocol: 'onion-v1',
+        circuit: { allowInsecureLoopbackTests: true },
         bind: { gateway: `127.0.0.1:${gatewayPort}` },
       });
-      upsertLatticeNodeLocalRecord(null, 'relay-a', { overlayPubKeyB64: relayPk, roleBitmask: 2 });
+      for (let index = 0; index < 3; index++) {
+        upsertLatticeNodeLocalRecord(null, relayLabels[index]!, {
+          overlayPubKeyB64: relayPks[index]!, identityPubKeyB64: relayNodeKeys[index]!.identity.publicKey,
+          onionPubKeyB64Url: relayNodeKeys[index]!.onion.publicKey, operatorId: relayOperators[index]!,
+          endpoint: `ws://127.0.0.1:${relayPorts[index]}`, roleBitmask: 2,
+        });
+      }
       const policy = new PolicyLoader();
       policy.grant('bot1', 'lp://echo.lattice', ['ping']);
+      policy.pinAgentPublicKey('bot1', agentPublicKey);
+    });
+
+    await configureHome(hiddenGatewayHome, async () => {
+      const { saveNodeConfig } = await import('../node/node-config');
+      const { upsertLatticeNodeLocalRecord } = await import('../node/routing-cache');
+      const { PolicyLoader } = await import('../node/policy-loader');
+      saveNodeConfig({
+        nodeId: 'gateway-hidden',
+        roles: ['gateway'],
+        distributedMesh: true,
+        overlayProtocol: 'onion-v1',
+        circuit: { allowInsecureLoopbackTests: true },
+        gateway: {
+          mode: 'hidden',
+          hiddenServiceAddress: 'lp://echo-hidden.lattice',
+          rendezvousRelays: [{ label: 'relay-a', url: `ws://127.0.0.1:${relayPorts[0]}` }],
+        },
+      });
+      for (let index = 0; index < 3; index++) {
+        upsertLatticeNodeLocalRecord(null, relayLabels[index]!, {
+          overlayPubKeyB64: relayPks[index]!, identityPubKeyB64: relayNodeKeys[index]!.identity.publicKey,
+          onionPubKeyB64Url: relayNodeKeys[index]!.onion.publicKey, operatorId: relayOperators[index]!,
+          endpoint: `ws://127.0.0.1:${relayPorts[index]}`, roleBitmask: 2,
+        });
+      }
+      const policy = new PolicyLoader();
+      policy.grant('bot1', 'lp://echo-hidden.lattice', ['ping']);
       policy.pinAgentPublicKey('bot1', agentPublicKey);
     });
 
@@ -380,17 +511,35 @@ describe('LpGatewayResolver + routing-cache (hybrid)', () => {
     });
 
     const children: ChildProcessWithoutNullStreams[] = [];
+    let nodeOutput = '';
     try {
       const gw = spawnCli(gatewayHome, ['node', 'start', '--role', 'gateway', '--service', 'lp://echo.lattice', '--target', `http://127.0.0.1:${backendPort}`]);
       children.push(gw);
+      gw.stdout.on('data', d => { nodeOutput += d.toString(); });
+      gw.stderr.on('data', d => { nodeOutput += d.toString(); });
       await waitForOutput(gw, /Gateway.*listening/);
 
-      const relay = spawnCli(relayHome, ['node', 'start', '--role', 'relay']);
-      children.push(relay);
-      await waitForOutput(relay, /RelayNode.*Listening/);
+      for (const relayHome of relayHomes) {
+        const relay = spawnCli(relayHome.home, ['node', 'start', '--role', 'relay']);
+        children.push(relay);
+        relay.stdout.on('data', d => { nodeOutput += d.toString(); });
+        relay.stderr.on('data', d => { nodeOutput += d.toString(); });
+        await waitForOutput(relay, /RelayNode.*Listening/);
+      }
+
+      const hiddenGateway = spawnCli(hiddenGatewayHome, [
+        'node', 'start', '--role', 'gateway', '--service', 'lp://echo-hidden.lattice',
+        '--target', `http://127.0.0.1:${backendPort}`,
+      ]);
+      children.push(hiddenGateway);
+      hiddenGateway.stdout.on('data', d => { nodeOutput += d.toString(); });
+      hiddenGateway.stderr.on('data', d => { nodeOutput += d.toString(); });
+      await waitForOutput(hiddenGateway, /starting in HIDDEN mode/);
 
       const entry = spawnCli(entryHome, ['node', 'start', '--role', 'entry']);
       children.push(entry);
+      entry.stdout.on('data', d => { nodeOutput += d.toString(); });
+      entry.stderr.on('data', d => { nodeOutput += d.toString(); });
       await waitForOutput(entry, /EntryNode.*Listening/);
 
       const smoke = spawnCli(entryHome, [
@@ -411,8 +560,19 @@ describe('LpGatewayResolver + routing-cache (hybrid)', () => {
       smoke.stdout.on('data', d => { out += d.toString(); });
       smoke.stderr.on('data', d => { out += d.toString(); });
       const code = await new Promise<number | null>(resolve => smoke.on('exit', resolve));
-      expect(code, out).toBe(0);
+      expect(code, `${out}\n${nodeOutput}`).toBe(0);
       expect(out).toContain('pong');
+
+      const hiddenSmoke = spawnCli(entryHome, [
+        'mesh', 'smoke', '--agent', 'bot1', '--entry', `http://127.0.0.1:${entryPort}`,
+        '--host', 'echo-hidden.lattice', '--path', '/ping', '--expect-status', '200',
+      ]);
+      let hiddenOut = '';
+      hiddenSmoke.stdout.on('data', d => { hiddenOut += d.toString(); });
+      hiddenSmoke.stderr.on('data', d => { hiddenOut += d.toString(); });
+      const hiddenCode = await new Promise<number | null>(resolve => hiddenSmoke.on('exit', resolve));
+      expect(hiddenCode, `${hiddenOut}\n${nodeOutput}`).toBe(0);
+      expect(hiddenOut).toContain('pong');
     } finally {
       children.forEach(child => child.kill());
       await new Promise<void>(resolve => backend.close(() => resolve()));

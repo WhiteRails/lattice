@@ -25,6 +25,7 @@ import { stableStringify } from './message';
 import { applyInboundHttpNetworkLimits, readHttpsTlsCredentials } from './ws-stack';
 import { inboundNetworkLimitsFromEnv } from './network-limits';
 import type { LatticeNodeYaml } from './node-config';
+import { LATTICE_HPKE_SUITE } from './hpke-envelope';
 
 export const FEDERATION_DEFAULT_PORT = 9000;
 export const FEDERATION_DEFAULT_TTL_SECONDS = 300;
@@ -74,13 +75,41 @@ export interface AnnounceRequest {
   announceHmac?: string;
 }
 
-const RoutingPayloadSchema = z.object({
+const RoutingPayloadV2Schema = z.object({
   version: z.literal(2),
   fqdn: z.string().min(3).max(253).regex(/^(?:[a-z0-9-]+\.)+(?:lattice|id)$/),
   gatewayNodeLabel: z.string().regex(/^[a-z0-9._-]{1,64}$/).optional(),
   gatewayPubKeyB64: z.string().regex(/^[A-Za-z0-9+/]{59}=$/),
   gatewayEndpoints: z.array(z.string().url().max(2_048)).min(1).max(16),
 }).strict();
+
+const RendezvousDescriptorSchema = z.object({
+  nodeLabel: z.string().regex(/^[a-z0-9._-]{1,64}$/),
+  endpoint: z.string().url().max(2_048),
+  token: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
+  expiresAt: z.string().datetime({ offset: true }),
+}).strict();
+
+const RoutingPayloadV3Schema = z.object({
+  version: z.literal(3),
+  fqdn: z.string().min(3).max(253).regex(/^(?:[a-z0-9-]+\.)+(?:lattice|id)$/),
+  gatewayNodeLabel: z.string().regex(/^[a-z0-9._-]{1,64}$/),
+  gatewayPubKeyB64: z.string().regex(/^[A-Za-z0-9+/]{59}=$/),
+  gatewayEndpoints: z.array(z.string().url().max(2_048)).max(16),
+  gatewayEncryptionKeyId: z.string().regex(/^[a-f0-9]{64}$/),
+  gatewayEncryptionPubKeyB64Url: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
+  hpkeSuite: z.literal(LATTICE_HPKE_SUITE),
+  delivery: z.discriminatedUnion('mode', [
+    z.object({ mode: z.literal('public') }).strict(),
+    z.object({ mode: z.literal('hidden'), rendezvous: z.array(RendezvousDescriptorSchema).min(1).max(16) }).strict(),
+  ]),
+}).strict().superRefine((value, ctx) => {
+  if (value.delivery.mode === 'public' && value.gatewayEndpoints.length < 1) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['gatewayEndpoints'], message: 'Public v3 routes require a Gateway endpoint' });
+  }
+});
+
+const RoutingPayloadSchema = z.union([RoutingPayloadV2Schema, RoutingPayloadV3Schema]);
 
 const AnnounceSchema = z.object({
   payload: RoutingPayloadSchema,

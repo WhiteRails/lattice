@@ -45,6 +45,24 @@ const tlsSchema = z
   .strict()
   .optional();
 
+const nodeCryptoSchema = z.object({
+  backend: z.enum(['local', 'plugin']).optional(),
+  pluginCommand: z.string().min(1).max(4_096).optional(),
+  keyDir: z.string().min(1).max(4_096).optional(),
+}).strict().optional();
+
+const circuitSchema = z.object({
+  /** Protocol constants are bounded here so a peer cannot negotiate weaker values. */
+  maxAgeSeconds: z.number().int().min(60).max(600).optional(),
+  maxStreams: z.number().int().min(1).max(100).optional(),
+  maxConcurrentStreams: z.number().int().min(1).max(32).optional(),
+  guardLifetimeDays: z.number().int().min(1).max(30).optional(),
+  /** Accepted only when every configured endpoint is loopback. */
+  allowSingleOperatorLoopbackTests: z.boolean().optional(),
+  /** Allows local TLS-less socket fixtures, never public endpoints. */
+  allowInsecureLoopbackTests: z.boolean().optional(),
+}).strict().optional();
+
 const upstreamRelaySchema = z.union([
   z.string().url(),
   z.object({
@@ -71,6 +89,9 @@ const latticeNodeConfigSchema = z.object({
   nodeId: z.string().min(1).optional(),
   roles: z.array(z.enum(LATTICE_NODE_ROLES)).min(1).optional(),
   distributedMesh: z.boolean().optional(),
+  overlayProtocol: z.enum(['onion-v1']).optional(),
+  crypto: nodeCryptoSchema,
+  circuit: circuitSchema,
 
   bind: z
     .object({
@@ -161,6 +182,20 @@ const latticeNodeConfigSchema = z.object({
       message: 'nodeId is required when distributedMesh is true',
     });
   }
+  if (cfg.distributedMesh && cfg.overlayProtocol !== 'onion-v1') {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['overlayProtocol'],
+      message: 'overlayProtocol onion-v1 is required when distributedMesh is true',
+    });
+  }
+  if (cfg.crypto?.backend === 'plugin' && !cfg.crypto.pluginCommand?.trim()) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['crypto', 'pluginCommand'],
+      message: 'pluginCommand is required when crypto.backend is plugin',
+    });
+  }
   if (cfg.gateway?.mode === 'hidden') {
     if (!cfg.gateway.hiddenServiceAddress?.trim()) {
       ctx.addIssue({
@@ -196,6 +231,59 @@ export function resolveGatewayIssuerGrants(cfg: LatticeNodeYaml | null): Gateway
   return cfg?.gateway?.issuerGrants ?? [];
 }
 export type NodeChainConfig = { rpcUrl: string; contractAddress: string };
+
+export interface OnionCircuitConfig {
+  maxAgeSeconds: number;
+  maxStreams: number;
+  maxConcurrentStreams: number;
+  guardLifetimeDays: number;
+  allowSingleOperatorLoopbackTests: boolean;
+  allowInsecureLoopbackTests: boolean;
+}
+
+export function resolveOnionCircuitConfig(cfg: LatticeNodeYaml | null): OnionCircuitConfig {
+  return {
+    maxAgeSeconds: cfg?.circuit?.maxAgeSeconds ?? 600,
+    maxStreams: cfg?.circuit?.maxStreams ?? 100,
+    maxConcurrentStreams: cfg?.circuit?.maxConcurrentStreams ?? 32,
+    guardLifetimeDays: cfg?.circuit?.guardLifetimeDays ?? 30,
+    allowSingleOperatorLoopbackTests: cfg?.circuit?.allowSingleOperatorLoopbackTests ?? false,
+    allowInsecureLoopbackTests: cfg?.circuit?.allowInsecureLoopbackTests ?? false,
+  };
+}
+
+export function onionOverlayEffective(cfg: LatticeNodeYaml | null): boolean {
+  return distributedMeshEffective(cfg) && cfg?.overlayProtocol === 'onion-v1';
+}
+
+export function assertOnionOverlayRequired(cfg: LatticeNodeYaml | null, distributedMesh = distributedMeshEffective(cfg)): void {
+  if (distributedMesh && cfg?.overlayProtocol !== 'onion-v1') {
+    throw new Error('ROUTE_ENCRYPTION_REQUIRED: distributedMesh requires overlayProtocol onion-v1');
+  }
+}
+
+export function assertOnionWebSocketUrls(cfg: LatticeNodeYaml | null, urls: readonly string[]): void {
+  if (!onionOverlayEffective(cfg)) return;
+  const allowLoopback = resolveOnionCircuitConfig(cfg).allowInsecureLoopbackTests;
+  for (const value of urls) {
+    const url = new URL(value);
+    if (url.protocol === 'wss:') continue;
+    if (url.protocol === 'ws:' && allowLoopback && isLoopbackHostname(url.hostname)) continue;
+    throw new Error(`ONION_WSS_REQUIRED: distributed Onion v1 endpoint must use wss:// (${value})`);
+  }
+}
+
+export function assertOnionListenerTls(cfg: LatticeNodeYaml | null, bindHost: string, role: LatticeNodeRole): void {
+  if (!onionOverlayEffective(cfg) || role === 'entry') return;
+  if (cfg?.tls?.certFile?.trim() && cfg?.tls?.keyFile?.trim()) return;
+  if (resolveOnionCircuitConfig(cfg).allowInsecureLoopbackTests && isLoopbackHostname(bindHost)) return;
+  throw new Error(`ONION_WSS_REQUIRED: ${role} listener requires tls.certFile and tls.keyFile`);
+}
+
+function isLoopbackHostname(hostname: string): boolean {
+  const host = hostname.replace(/^\[|]$/g, '').toLowerCase();
+  return host === '127.0.0.1' || host === '::1' || host === 'localhost';
+}
 
 export function nodeConfigPath(): string {
   return path.join(LATTICE_DIR, NODE_CONFIG_FILENAME);

@@ -420,17 +420,26 @@ export async function chainRegisterLatticeNode(
   contractAddress: string,
   nodeLabel: string,
   overlayPubKeyB64: string,
-  tlsFingerprintSha256Hex: string | undefined,
+  identityPubKeyB64: string,
+  onionPubKeyB64Url: string,
+  tlsFingerprintSha256Hex: string,
+  operatorIdHex: string,
   roleBitmask: number,
 ): Promise<string> {
   const c = getSignerContract(rpcUrl, privateKey, contractAddress);
   const pk = Buffer.from(overlayPubKeyB64.trim(), 'base64');
   const overlayBytes = ethers.getBytes(pk);
-  const tls =
-    tlsFingerprintSha256Hex?.trim() !== undefined && tlsFingerprintSha256Hex.trim() !== ''
-      ? parseBytes32HexOrZero(tlsFingerprintSha256Hex.trim())
-      : ethers.ZeroHash;
-  const tx = await c.registerLatticeNode(nodeLabel.trim(), overlayBytes, tls, roleBitmask);
+  const identityBytes = ethers.getBytes(Buffer.from(identityPubKeyB64.trim(), 'base64'));
+  const onionBytes = ethers.getBytes(Buffer.from(onionPubKeyB64Url.trim(), 'base64url'));
+  if (identityBytes.length < 32 || identityBytes.length > 128) throw new Error('Invalid node identity public key');
+  if (onionBytes.length !== 32) throw new Error('Invalid node onion public key');
+  const tls = parseBytes32HexOrZero(tlsFingerprintSha256Hex.trim());
+  if (tls === ethers.ZeroHash) throw new Error('Missing TLS SPKI pin');
+  const operatorId = parseBytes32HexOrZero(operatorIdHex);
+  if (operatorId === ethers.ZeroHash) throw new Error('Missing operator id');
+  const tx = await c.registerLatticeNode(
+    nodeLabel.trim(), overlayBytes, identityBytes, onionBytes, tls, operatorId, roleBitmask,
+  );
   const receipt = await tx.wait();
   return receipt.hash;
 }
@@ -450,7 +459,10 @@ export async function chainSetLatticeNodeActive(
 
 export interface ChainLatticeNodeRecord {
   overlayPubKeyB64: string;
+  identityPubKeyB64: string;
+  onionPubKeyB64Url: string;
   tlsFingerprintSha256: string;
+  operatorId: string;
   roleBitmask: number;
   active: boolean;
 }
@@ -479,13 +491,21 @@ export async function chainGetLatticeNode(
       ? row.tlsFingerprintSha256
       : ethers.hexlify(row.tlsFingerprintSha256);
 
+  const identityPubKeyRaw = ethers.getBytes(row.identityPubKey);
+  const onionPubKeyRaw = ethers.getBytes(row.onionPubKey);
+  if (identityPubKeyRaw.length < 32 || identityPubKeyRaw.length > 128 || onionPubKeyRaw.length !== 32) return null;
+  const operatorId = typeof row.operatorId === 'string' ? row.operatorId : ethers.hexlify(row.operatorId);
+
   const roleBitmask =
     typeof row.roleBitmask === 'bigint' ? Number(row.roleBitmask) : Number(row.roleBitmask ?? 0);
   const active = Boolean(row.active);
 
   return {
     overlayPubKeyB64: Buffer.from(pkDecoded).toString('base64'),
+    identityPubKeyB64: Buffer.from(identityPubKeyRaw).toString('base64'),
+    onionPubKeyB64Url: Buffer.from(onionPubKeyRaw).toString('base64url'),
     tlsFingerprintSha256,
+    operatorId,
     roleBitmask,
     active,
   };

@@ -16,6 +16,8 @@
     "build": "tsc",
     "build:native": "cmake -S daemon -B build/daemon && cmake --build build/daemon",
     "test:rust": "cargo test --manifest-path clients/rust/Cargo.toml",
+    "test:network": "cargo test --manifest-path network/Cargo.toml --workspace",
+    "build:network": "cargo build --manifest-path network/Cargo.toml --workspace",
     "test:native": "npm run build:native && LATTICED_BIN=\"$PWD/build/daemon/latticed\" cargo test --manifest-path clients/rust/Cargo.toml",
     "test:replay-redis": "LATTICE_REDIS_INTEGRATION=1 vitest run tests/redis-replay.integration.test.ts",
     "lattice": "ts-node cli/lattice.ts",
@@ -43,6 +45,8 @@
     "tmp": "0.2.7"
   },
   "dependencies": {
+    "@hpke/core": "^1.9.0",
+    "@hpke/dhkem-x25519": "^1.8.0",
     "@types/chalk": "^0.4.31",
     "@types/http-proxy": "^1.17.17",
     "@types/js-yaml": "^4.0.9",
