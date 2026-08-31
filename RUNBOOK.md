@@ -6,6 +6,7 @@ WebSocket fallback procedure.
 ## 1. Preconditions
 
 - A private Lattice X.509 root/intermediate and Ed25519 control signing key.
+- A Gateway host with TUN, IP forwarding and explicit private-service or egress routing.
 - A managed client whose trust store may receive the private service root.
 - Linux: `iproute2`, `nftables`, `systemd`, `util-linux` and TUN.
 - UDP reachability to the configured QUIC port (default 7443).
