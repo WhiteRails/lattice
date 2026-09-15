@@ -54,7 +54,7 @@ Required invariants:
 - Full-tunnel policy contains only approved egress CIDRs/protocols/ports.
 - `max_stale_seconds` is at most 86400.
 - Per-agent profiles require leases and pin each agent's raw Ed25519 public key.
-- `http_policy` is absent unless the Gateway terminates inner TLS.
+- `http_policy` must be absent: this release has no HTTP enforcement adapter.
 
 Start `lattice-netctl enrollment-serve` on the pinned endpoint with its server
 certificate/key. The one-time token is consumed atomically after a valid CSR;
@@ -87,7 +87,7 @@ decision, policy version and fingerprints—never payloads or full DNS questions
 ## 5. Linux client
 
 The release bundle's `install-network.sh` installs the four LNP binaries,
-systemd units and `lattice:` desktop handler.
+systemd units and `lttc:` desktop handler.
 
 ```bash
 export LATTICE_CONTROL_PUBLIC_KEY_B64='<pinned-control-key>'
@@ -126,8 +126,8 @@ lattice-netctl profile-egress-allow --template /secure/full-template.json \
 
 Generate only a new unsigned profile template from the archived service/policy
 metadata. The migrator excludes all legacy private keys and certificates. It
-converts `lp://` grants to L3/L4 and needs `--terminate-tls` before it preserves
-an explicit HTTP action policy.
+converts network-only `lp://` grants to L3/L4. Action-scoped grants and
+`--terminate-tls` are rejected to prevent silently widening authorization.
 
 ```bash
 npm run migrate:network -- \
@@ -142,6 +142,25 @@ credential, then revoke and decommission the overlay. Do not copy its agent or
 CA material into LNP/1.
 
 ## 6. Agent isolation
+
+Provision the local signer explicitly once after installation:
+
+```bash
+sudo lattice-agent-init
+sudo systemctl enable --now latticed
+```
+
+Pin the printed **public** Ed25519 key under the chosen agent ID in the signed
+profile's `agent_lease_public_keys`, with `require_agent_lease=true`. Keep the
+private key and token under `/var/lib/lattice/identity` on this client. The
+initializer refuses to overwrite an existing identity; reinstalling preserves
+configuration. Do not give the agent the token or access to the signer socket.
+
+Set `LATTICE_SOCKET=/run/lattice/latticed.sock` and
+`LATTICE_SESSION_TOKEN_FILE=/var/lib/lattice/identity/session.token` for the
+privileged launcher. A lease issued by the CLI lasts four minutes. Both tunnel
+endpoints enforce its deadline on established connections; this release does
+not renew agent leases automatically. Relaunch explicitly for a new lease.
 
 Confirm `net.ipv4.ip_forward=1`, then:
 
@@ -209,3 +228,39 @@ Stop the client/resolver, confirm Lattice nftables tables and routes were
 removed, then remove the managed private CA and URI handler. Do not restore the
 retired proxy. Reuse an earlier LNP profile only if it remains signed, fresh and
 not revoked; otherwise issue a new one.
+
+## 11. Verify a downloaded release
+
+Before extraction or installation, verify provenance for the repository and
+release workflow you trust (GitHub CLI with attestation support is required):
+
+```bash
+gh attestation verify lattice-<version>-linux-x86_64.tar.gz \
+  --repo WhiteRails/lattice \
+  --signer-workflow WhiteRails/lattice/.github/workflows/native-bundles.yml \
+  --source-ref refs/tags/v<version>
+sha256sum -c lattice-<version>-linux-x86_64.tar.gz.sha256
+```
+
+The bundle workflow runs source checks, privileged network E2E, and installation
+checks on its own commit before generating provenance. A locally generated
+archive has no GitHub attestation and is a test candidate only. Attestation
+proves origin and digest, not an independent security audit or production E2E.
+
+## 12. Pilot operations acceptance
+
+Record host/distribution, source commit, artifact digest, topology and expected
+limits. Before enabling a pilot, assign an incident owner and evidence storage.
+Exercise certificate renewal, control-key rotation through the managed trust
+channel, backup restoration, atomic revocation distribution, gateway restart,
+client restart, host reboot, and downgrade to an unrevoked compatible release.
+Capture connection counts, denial counts, memory/CPU, packet loss and recovery
+latency under the expected concurrent load. Configure alerts for repeated
+authentication failures, approaching profile expiry, stale state, process
+restarts and unavailable log collection. Preserve only the metadata permitted
+above. Set retention and access controls at the deployment's log collector.
+
+Keep root/control keys offline from gateways, back up them encrypted, and test
+restoration in isolation. Do not claim the exercise passed without host evidence.
+The repository's test containers do not establish browser trust, managed-host
+reboot behavior, an independent audit or a production service-level objective.

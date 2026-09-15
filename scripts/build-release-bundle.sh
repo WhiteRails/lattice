@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 set -eu
 
-release_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+release_root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 release_version=${LATTICE_VERSION:-$(node -p "require('$release_root/package.json').version")}
 release_os=$(uname -s | tr '[:upper:]' '[:lower:]')
 release_arch=$(uname -m)
@@ -29,8 +29,8 @@ fi
 
 cmake -S "$release_root/daemon" -B "$release_root/build/release-daemon" -DCMAKE_BUILD_TYPE=Release
 cmake --build "$release_root/build/release-daemon" --config Release
-cargo build --manifest-path "$release_root/clients/rust/Cargo.toml" --release
-cargo build --manifest-path "$release_root/network/Cargo.toml" --workspace --release
+cargo build --manifest-path "$release_root/clients/rust/Cargo.toml" --locked --release
+cargo build --manifest-path "$release_root/network/Cargo.toml" --locked --workspace --release
 
 llama_root="$release_root/build/llama.cpp"
 if [ ! -d "$llama_root/.git" ]; then
@@ -82,11 +82,19 @@ install -m 0644 "$release_root/network/platform/linux/systemd/lattice-resolver.s
 install -m 0644 "$release_root/network/platform/linux/systemd/lattice-gatewayd.service" "$release_dir/lib/systemd/system/lattice-gatewayd.service"
 install -m 0644 "$release_root/network/platform/linux/lattice-uri.desktop" "$release_dir/share/applications/lattice-uri.desktop"
 install -m 0644 "$release_root/network/platform/linux/sysctl/90-lattice.conf" "$release_dir/lib/sysctl.d/90-lattice.conf"
+install -m 0755 "$release_root/network/platform/linux/agent-init.sh" "$release_dir/bin/lattice-agent-init"
 install -m 0755 "$release_root/network/platform/linux/install.sh" "$release_dir/install-network.sh"
 install -m 0644 "$release_root/README.md" "$release_dir/README.md"
 install -m 0644 "$llama_root/LICENSE" "$release_dir/THIRD_PARTY_LICENSES/llama.cpp-MIT.txt"
 install -m 0644 "$release_root/docs/third-party-notices.md" "$release_dir/THIRD_PARTY_NOTICES.md"
 
+if git -C "$release_root" rev-parse HEAD > "$release_dir/SOURCE_COMMIT" 2>/dev/null; then
+  git -C "$release_root" status --porcelain > "$release_dir/SOURCE_STATE"
+else
+  printf '%s\n' "${LATTICE_SOURCE_COMMIT:-unknown-export}" > "$release_dir/SOURCE_COMMIT"
+  printf '%s\n' 'exported working tree; local test candidate, not an attested release' > "$release_dir/SOURCE_STATE"
+fi
+(cd "$release_dir" && find bin models -type f -exec sha256sum {} \; | sort > SHA256SUMS)
 tar -C "$release_root/artifacts" -czf "$release_archive" "$release_name"
-shasum -a 256 "$release_archive" > "$release_archive.sha256"
+(cd "$release_root/artifacts" && shasum -a 256 "$release_name.tar.gz" > "$release_name.tar.gz.sha256")
 printf '%s\n' "created $release_archive" "created $release_archive.sha256"

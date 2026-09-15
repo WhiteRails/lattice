@@ -22,3 +22,6 @@ uuid.workspace = true
 libc = "0.2"
 ipnet.workspace = true
 sha2.workspace = true
+
+[dev-dependencies]
+rcgen.workspace = true

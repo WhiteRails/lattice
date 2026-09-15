@@ -12,6 +12,11 @@ jobs:
   bundle:
     name: linux-x86_64
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
@@ -23,15 +28,43 @@ jobs:
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # stable, resolved 2026-08-24
         with:
           toolchain: stable
+          components: clippy, rustfmt
 
       - name: Install OpenSSL development headers
-        run: sudo apt-get update && sudo apt-get install --yes libssl-dev
+        run: sudo apt-get update && sudo apt-get install --yes libssl-dev cmake dnsutils iproute2 nftables iputils-ping jq python3
 
       - name: Install Node dependencies
         run: npm ci
 
+      - name: Verify the candidate source
+        run: |
+          npm run build
+          npm test
+          npm audit --audit-level=high
+          npm run test:native
+          cargo test --locked --manifest-path network/Cargo.toml --workspace
+          cargo clippy --locked --manifest-path network/Cargo.toml --workspace --all-targets -- -D warnings
+          cargo fmt --manifest-path network/Cargo.toml --all -- --check
+          cargo install cargo-audit --version 0.22.2 --locked
+          cargo audit --file network/Cargo.lock
+          cargo audit --file clients/rust/Cargo.lock
+      - name: Verify Linux network enforcement
+        run: |
+          cargo build --locked --manifest-path network/Cargo.toml --bins
+          bash network/tests/enrollment-e2e.sh
+          sudo env LATTICE_E2E_MODE=full bash network/tests/linux-e2e.sh
+          sudo env LATTICE_E2E_MODE=split bash network/tests/linux-e2e.sh
+
       - name: Build native distribution
         run: npm run package:bundle
+
+      - name: Verify installation and signer on the runner
+        run: sudo env LATTICE_INSTALL_E2E=1 bash network/tests/install-e2e.sh artifacts/lattice-*/
+
+      - name: Attest the tested archive
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-path: artifacts/*.tar.gz
 
       - name: Upload native bundle and checksum
         uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4.6.0

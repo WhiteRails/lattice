@@ -32,6 +32,7 @@ const MAX_ACTIVE_FLOWS_PER_PROFILE: usize = 65_536;
 struct ConnectionState {
     connection: Connection,
     flows: Arc<Mutex<FlowTable>>,
+    deadline: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
@@ -257,7 +258,14 @@ async fn handle_connection(
     };
     let profile = store.load(profile_id).await?;
     verify_connection_spki(&connection, &profile.payload.client_spki_sha256)?;
-    verify_agent_lease(&profile, agent_lease.as_deref(), &lease_replays).await?;
+    let lease_deadline =
+        verify_agent_lease(&profile, agent_lease.as_deref(), &lease_replays).await?;
+    let deadline = std::cmp::min(
+        profile.payload.expires_at,
+        profile.payload.issued_at
+            + chrono::Duration::seconds(profile.payload.max_stale_seconds.into()),
+    );
+    let deadline = lease_deadline.map_or(deadline, |lease| deadline.min(lease));
     send.write_all(&encode_control(&ControlFrame::server_hello(
         profile.payload.policy.version,
     ))?)
@@ -294,35 +302,36 @@ async fn handle_connection(
                 ConnectionState {
                     connection: connection.clone(),
                     flows: flows.clone(),
+                    deadline,
                 },
             );
         }
     }
     let initial_fingerprint = profile.fingerprint()?;
     let inbound = gateway_inbound(
-        connection.clone(),
+        ConnectionState {
+            connection: connection.clone(),
+            flows,
+            deadline,
+        },
         device,
         profile.payload.policy,
         client_addresses.clone(),
         profile_id,
         initial_fingerprint.clone(),
-        flows,
     );
     let watchdog = profile_watchdog(
         store.clone(),
         profile_id,
         initial_fingerprint,
-        std::cmp::min(
-            profile.payload.expires_at,
-            profile.payload.issued_at
-                + chrono::Duration::seconds(profile.payload.max_stale_seconds.into()),
-        ),
+        deadline,
         connection.clone(),
     );
     let result = tokio::select! {
         result = inbound => result,
         result = watchdog => result,
     };
+    connection.close(0u32.into(), b"session authority ended");
     {
         let mut active = connections.write().await;
         for address in client_addresses {
@@ -352,6 +361,9 @@ async fn profile_watchdog(
         }
         let remaining = (freshness_deadline - now).to_std().unwrap_or_default();
         tokio::time::sleep(std::cmp::min(remaining, std::time::Duration::from_secs(30))).await;
+        if Utc::now() >= freshness_deadline {
+            continue;
+        }
         let current = store.load(profile_id).await?;
         if current.fingerprint()? != initial_fingerprint {
             connection.close(0u32.into(), b"signed profile changed");
@@ -361,17 +373,25 @@ async fn profile_watchdog(
 }
 
 async fn gateway_inbound(
-    connection: Connection,
+    session: ConnectionState,
     device: Arc<tun_rs::AsyncDevice>,
     policy: NetworkPolicy,
     assigned_sources: Vec<IpAddr>,
     profile_id: Uuid,
     profile_fingerprint: String,
-    flows: Arc<Mutex<FlowTable>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let ConnectionState {
+        connection,
+        flows,
+        deadline,
+    } = session;
     let reassembler = Mutex::new(PacketReassembler::default());
     loop {
         let datagram = connection.read_datagram().await?;
+        if Utc::now() >= deadline {
+            connection.close(0u32.into(), b"session authority expired");
+            return Err("session authority expired".into());
+        }
         let fragment = PacketFragment::decode(&datagram)?;
         let packet = reassembler.lock().await.push(fragment, Instant::now())?;
         if let Some(packet) = packet {
@@ -407,12 +427,12 @@ async fn verify_agent_lease(
     profile: &EnrollmentBundle,
     encoded_lease: Option<&str>,
     replays: &LeaseReplayCache,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<Option<DateTime<Utc>>, Box<dyn std::error::Error + Send + Sync>> {
     let Some(encoded_lease) = encoded_lease else {
         if profile.payload.require_agent_lease {
             return Err("profile requires an agent lease".into());
         }
-        return Ok(());
+        return Ok(None);
     };
     let lease: AgentLease = serde_json::from_str(encoded_lease)?;
     if lease.payload.profile_id != profile.payload.profile_id {
@@ -441,7 +461,7 @@ async fn verify_agent_lease(
     {
         return Err("agent lease replayed".into());
     }
-    Ok(())
+    Ok(Some(lease.payload.expires_at))
 }
 
 fn packet_source(packet: &[u8]) -> Option<IpAddr> {
@@ -471,6 +491,12 @@ async fn gateway_outbound(device: Arc<tun_rs::AsyncDevice>, connections: Connect
         let Some(state) = connections.read().await.get(&metadata.destination).cloned() else {
             continue;
         };
+        if Utc::now() >= state.deadline {
+            state
+                .connection
+                .close(0u32.into(), b"session authority expired");
+            continue;
+        }
         if !state
             .flows
             .lock()
@@ -502,6 +528,59 @@ async fn gateway_outbound(device: Arc<tun_rs::AsyncDevice>, connections: Connect
 mod tests {
     use super::*;
     use std::net::Ipv4Addr;
+
+    // Exercise the actual watchdog over authenticated QUIC without TUN. The
+    // peer keeps its connection open: only the gateway enforces the deadline.
+    #[tokio::test]
+    async fn watchdog_closes_an_existing_connection_at_authority_deadline() {
+        use lattice_net_core::tls::{
+            quinn_enrollment_client_config, quinn_enrollment_server_config,
+        };
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = rcgen::CertificateParams::new(vec!["gateway.test".into()])
+            .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        let server = Endpoint::server(
+            quinn_enrollment_server_config(cert.pem().as_bytes(), key.serialize_pem().as_bytes())
+                .unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .unwrap();
+        let mut client = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        client.set_default_client_config(
+            quinn_enrollment_client_config(cert.pem().as_bytes()).unwrap(),
+        );
+        let pending = client
+            .connect(server.local_addr().unwrap(), "gateway.test")
+            .unwrap();
+        let (peer, accepted) = tokio::join!(pending, async {
+            server.accept().await.unwrap().await.unwrap()
+        });
+        let peer = peer.unwrap();
+        let store = ProfileStore {
+            directory: PathBuf::from("/nonexistent-lattice-watchdog-test"),
+            trusted_key: ed25519_dalek::SigningKey::from_bytes(&[7; 32]).verifying_key(),
+        };
+        let result = profile_watchdog(
+            store,
+            Uuid::new_v4(),
+            String::new(),
+            Utc::now() + chrono::Duration::milliseconds(100),
+            accepted,
+        )
+        .await;
+        assert!(result.unwrap_err().to_string().contains("expired"));
+        let closed = tokio::time::timeout(std::time::Duration::from_secs(2), peer.closed())
+            .await
+            .unwrap();
+        assert!(matches!(
+            closed,
+            quinn::ConnectionError::ApplicationClosed(_)
+        ));
+        client.close(0u32.into(), b"test complete");
+        server.close(0u32.into(), b"test complete");
+    }
 
     fn udp_packet(
         source: Ipv4Addr,

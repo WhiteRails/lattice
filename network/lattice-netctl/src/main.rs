@@ -1,5 +1,4 @@
 use std::fs;
-use std::io::{BufReader, Cursor};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
@@ -17,7 +16,7 @@ use lattice_net_core::profile::{
 use lattice_net_core::protocol::{
     decode_enrollment, encode_enrollment, EnrollmentFrame, MAX_ENROLLMENT_FRAME_BYTES,
 };
-use lattice_net_core::tls::{quinn_enrollment_server_config, spki_sha256_from_der};
+use lattice_net_core::tls::{certificates, quinn_enrollment_server_config, spki_sha256_from_der};
 use pkcs8::LineEnding;
 use rand::rngs::OsRng;
 use rand::RngCore;
@@ -679,10 +678,8 @@ fn profile_revoke(
 }
 
 fn certificate_pin(pem: &[u8]) -> Result<String, Box<dyn std::error::Error>> {
-    let mut reader = BufReader::new(Cursor::new(pem));
-    let der = rustls_pemfile::certs(&mut reader)
-        .next()
-        .ok_or("missing certificate")??;
+    let certs = certificates(pem)?;
+    let der = certs.first().ok_or("missing certificate")?;
     Ok(spki_sha256_from_der(der.as_ref())?)
 }
 

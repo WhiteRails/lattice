@@ -939,6 +939,30 @@ async fn connect(
     agent_lease: Option<String>,
     external_dns: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let lease_deadline = match agent_lease.as_deref() {
+        Some(encoded) => {
+            let lease: AgentLease = serde_json::from_str(encoded)?;
+            if lease.payload.profile_id != bundle.payload.profile_id {
+                return Err("agent lease belongs to another profile".into());
+            }
+            let encoded_key = bundle
+                .payload
+                .agent_lease_public_keys
+                .get(&lease.payload.agent_id)
+                .ok_or("agent is not authorized by this profile")?;
+            let raw = STANDARD.decode(encoded_key)?;
+            let key = VerifyingKey::from_bytes(
+                &raw.try_into()
+                    .map_err(|_| "agent lease key must be 32 bytes")?,
+            )?;
+            lease.verify(&key, Utc::now())?;
+            Some(lease.payload.expires_at)
+        }
+        None if bundle.payload.require_agent_lease => {
+            return Err("profile requires an agent lease".into())
+        }
+        None => None,
+    };
     let gateway = bundle
         .payload
         .gateways
@@ -972,6 +996,8 @@ async fn connect(
         bundle.payload.issued_at
             + chrono::Duration::seconds(bundle.payload.max_stale_seconds.into()),
     );
+    let freshness_deadline =
+        lease_deadline.map_or(freshness_deadline, |lease| freshness_deadline.min(lease));
     let freshness_wait = tokio::time::sleep(
         (freshness_deadline - Utc::now())
             .to_std()

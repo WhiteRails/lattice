@@ -1,3 +1,8 @@
+/* Expose the POSIX interfaces used below with strict -std=c17 on glibc. */
+#if defined(__linux__) && !defined(_POSIX_C_SOURCE)
+#define _POSIX_C_SOURCE 200809L
+#endif
+
 #include "lattice_protocol.h"
 
 #include <errno.h>

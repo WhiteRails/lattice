@@ -1,21 +1,34 @@
-# Security Policy
+# Security policy
 
-## Supported Versions
+## Support boundary
 
-Use this section to tell people about which versions of your project are
-currently being supported with security updates.
+Lattice 0.1.x is a pre-production candidate. The release target is Linux LNP/1.
+There is no supported public production release at present. The archived
+HTTP/WebSocket overlay and unsigned macOS/Windows adapters are not supported
+deployment targets. New releases must pass the gates in `RUNBOOK.md`.
 
-| Version | Supported          |
-| ------- | ------------------ |
-| 5.1.x   | :white_check_mark: |
-| 5.0.x   | :x:                |
-| 4.0.x   | :white_check_mark: |
-| < 4.0   | :x:                |
+## Reporting vulnerabilities
 
-## Reporting a Vulnerability
+Use the repository's **Security → Report a vulnerability** private reporting
+channel when enabled: https://github.com/WhiteRails/lattice/security/advisories/new.
+If private reporting is unavailable, open a public issue requesting a private
+contact without including vulnerability details, exploit code, or secrets.
+Do not publish private keys, session tokens, profiles with enrollment tokens,
+or captured user payloads in issues or logs.
 
-Use this section to tell people how to report a vulnerability.
+Include the affected commit/release, platform, minimal reproduction, expected
+and actual behavior, and whether the issue crosses an authorization boundary.
+Maintainers must enable private reporting and assign a response owner before
+public production release. No response-time SLA is currently promised.
 
-Tell them where to go, how often they can expect to get an update on a
-reported vulnerability, what to expect if the vulnerability is accepted or
-declined, etc.
+## Release security gates
+
+- No known dependency vulnerability in shipped lockfiles; documented disposition
+  of unmaintained or yanked dependencies.
+- Regression tests for every verified security fix and privileged Linux E2E.
+- Independent security review of the exact candidate before public enablement.
+- Artifact provenance verification, recovery/rotation exercise, and a tested
+  rollback that does not reopen unauthorized traffic.
+
+Passing these gates does not certify AI alignment or protection against all
+possible actions within an otherwise authorized service.

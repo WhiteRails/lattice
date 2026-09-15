@@ -22,7 +22,6 @@ interface Arguments {
   token: string;
   mode: 'split' | 'full';
   out: string;
-  terminateTls: boolean;
   egressCidrs: string[];
 }
 
@@ -33,10 +32,9 @@ function fail(message: string): never {
 function parseArguments(argv: string[]): Arguments {
   const values = new Map<string, string>();
   const egressCidrs: string[] = [];
-  let terminateTls = false;
   for (let index = 0; index < argv.length; index += 1) {
     const flag = argv[index];
-    if (flag === '--terminate-tls') { terminateTls = true; continue; }
+    if (flag === '--terminate-tls') fail('--terminate-tls is unsupported: LNP/1 cannot enforce HTTP action policies');
     const value = argv[index + 1];
     if (!flag.startsWith('--') || value === undefined) fail(`missing value for ${flag}`);
     index += 1;
@@ -57,7 +55,6 @@ function parseArguments(argv: string[]): Arguments {
     token: required('--enrollment-token'),
     mode,
     out: path.resolve(required('--out')),
-    terminateTls,
     egressCidrs,
   };
 }
@@ -104,6 +101,7 @@ function main(): void {
   }
 
   const toRules = (rules: LegacyPolicyRule[] | undefined): object[] => (rules ?? []).flatMap((rule) => {
+    if (rule.actions?.length) fail('HTTP action constraints cannot be migrated to L3/L4; keep enforcement at the application service');
     const fqdn = canonicalService(rule.resource);
     if (fqdn === null) {
       if (rule.resource !== 'internet:*') console.error(`warning: skipped non-network legacy resource ${rule.resource}`);
@@ -116,15 +114,6 @@ function main(): void {
   const allow = toRules(legacy.allow);
   for (const cidr of args.egressCidrs) allow.push({ destination: cidr, protocols: ['any'], ports: [], service: null });
   const deny = toRules(legacy.deny);
-
-  const actionsByService = new Map<string, string[]>();
-  for (const rule of legacy.allow ?? []) {
-    const fqdn = canonicalService(rule.resource);
-    if (fqdn && rule.actions?.length) actionsByService.set(fqdn, [...new Set(rule.actions)].sort());
-  }
-  if (!args.terminateTls && actionsByService.size > 0) {
-    console.error('warning: legacy HTTP actions were not inferred at L3/L4; rerun with --terminate-tls only for a TLS-terminating Gateway');
-  }
 
   const now = new Date();
   const expires = new Date(now.getTime() + 90 * 24 * 60 * 60 * 1000 - 60 * 1000);
@@ -154,9 +143,7 @@ function main(): void {
       gateway: args.gateway,
       tls_spki_sha256: args.serviceTlsPin,
       policy_version: 1,
-      http_policy: args.terminateTls && actionsByService.has(service.fqdn)
-        ? { terminate_tls: true, allowed_actions: actionsByService.get(service.fqdn) }
-        : null,
+      http_policy: null,
     })),
     policy: { version: 1, mode: args.mode, allow, deny },
   };

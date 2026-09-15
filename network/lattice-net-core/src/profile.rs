@@ -40,8 +40,8 @@ pub struct ServiceBinding {
     pub gateway: SocketAddr,
     pub tls_spki_sha256: String,
     pub policy_version: u64,
-    /// Present only when this gateway explicitly terminates the inner HTTPS
-    /// session. LNP/1 never infers HTTP actions from encrypted IP packets.
+    /// Reserved for a future application gateway. Current LNP/1 rejects any
+    /// HTTP policy rather than silently dropping application constraints.
     #[serde(default)]
     pub http_policy: Option<HttpPolicy>,
 }
@@ -196,6 +196,8 @@ pub enum ProfileError {
     InvalidControlKey,
     #[error("network policy is invalid")]
     InvalidPolicy,
+    #[error("HTTP action policies are unsupported by the LNP/1 packet gateway")]
+    UnsupportedHttpPolicy,
     #[error("profile is revoked")]
     Revoked,
 }
@@ -314,15 +316,8 @@ impl EnrollmentBundle {
             }
             validate_sha256_pin(&service.tls_spki_sha256)?;
             canonical_service_fqdn(&service.tls_spki_sha256)?;
-            if service.http_policy.as_ref().is_some_and(|policy| {
-                !policy.terminate_tls
-                    || policy.allowed_actions.len() > 256
-                    || policy
-                        .allowed_actions
-                        .iter()
-                        .any(|action| action.is_empty() || action.len() > 128)
-            }) {
-                return Err(ProfileError::InvalidPolicy);
+            if service.http_policy.is_some() {
+                return Err(ProfileError::UnsupportedHttpPolicy);
             }
         }
         for gateway in &payload.gateways {
@@ -544,6 +539,32 @@ mod tests {
         EnrollmentBundle {
             payload,
             signature_b64,
+        }
+    }
+
+    #[test]
+    fn signed_http_policies_are_rejected_even_when_tls_termination_is_claimed() {
+        let now = Utc::now();
+        let key = SigningKey::generate(&mut OsRng);
+        for terminate_tls in [false, true] {
+            let mut bundle = signed_bundle(now, &key);
+            bundle.payload.services.push(ServiceBinding {
+                fqdn: "echo.lattice".into(),
+                addresses: vec!["10.0.0.1".parse().unwrap()],
+                gateway: "127.0.0.1:7443".parse().unwrap(),
+                tls_spki_sha256: "11".repeat(32),
+                policy_version: 1,
+                http_policy: Some(HttpPolicy {
+                    terminate_tls,
+                    allowed_actions: vec!["read".into()],
+                }),
+            });
+            bundle.signature_b64 =
+                STANDARD.encode(key.sign(&bundle.canonical_payload().unwrap()).to_bytes());
+            assert!(matches!(
+                bundle.verify_fresh(&key.verifying_key(), now),
+                Err(ProfileError::UnsupportedHttpPolicy)
+            ));
         }
     }
 

@@ -28,7 +28,6 @@ describe('network state migration', () => {
         'agent: bot1',
         'allow:',
         '  - resource: lp://echo.lattice',
-        '    actions: [read, write]',
         'deny:',
         '  - resource: lp://admin.lattice',
       ].join('\n'),
@@ -52,9 +51,8 @@ describe('network state migration', () => {
         '--service-tls-pin', 'b'.repeat(64),
         '--enrollment-token', 'single-use-token',
         '--out', output,
-        '--terminate-tls',
       ],
-      { cwd: process.cwd(), encoding: 'utf8' },
+      { cwd: process.cwd(), encoding: 'utf8', timeout: 10_000 },
     );
 
     expect(result.status, result.stderr).toBe(0);
@@ -67,13 +65,27 @@ describe('network state migration', () => {
     expect(profile.policy.deny).toEqual([
       expect.objectContaining({ destination: '100.96.0.1/32', protocols: ['any'], service: 'admin.lattice' }),
     ]);
-    expect(profile.services.find((service: { fqdn: string }) => service.fqdn === 'echo.lattice').http_policy).toEqual({
-      terminate_tls: true,
-      allowed_actions: ['read', 'write'],
-    });
+    expect(profile.services.find((service: { fqdn: string }) => service.fqdn === 'echo.lattice').http_policy).toBeNull();
     expect(JSON.stringify(profile)).not.toContain('must-not-be-copied');
     expect(profile.client_spki_sha256).toBe('0'.repeat(64));
     expect(profile.control_plane_key_b64).toBe(Buffer.alloc(32).toString('base64'));
     expect(fs.statSync(output).mode & 0o777).toBe(0o600);
-  });
+
+    // A migration must never widen an action-scoped grant to a network grant.
+    fs.writeFileSync(path.join(home, 'policies', 'bot1.yaml'),
+      'agent: bot1\nallow:\n  - resource: lp://echo.lattice\n    actions: [read]\n');
+    for (const extra of [[], ['--terminate-tls']]) {
+      const rejectedOutput = path.join(root, `rejected-${extra.length}.json`);
+      const rejected = spawnSync(process.execPath, [
+        '-r', 'ts-node/register', 'scripts/migrate-network-state.ts',
+        '--lattice-home', home, '--agent', 'bot1', '--organization', 'example',
+        '--gateway', '198.51.100.10:7443', '--gateway-name', 'gateway.example',
+        '--gateway-pin', 'a'.repeat(64), '--service-tls-pin', 'b'.repeat(64),
+        '--enrollment-token', 'single-use-token', '--out', rejectedOutput, ...extra,
+      ], { cwd: process.cwd(), encoding: 'utf8', timeout: 10_000 });
+      expect(rejected.status).not.toBe(0);
+      expect(rejected.stderr).toMatch(/HTTP action/);
+      expect(fs.existsSync(rejectedOutput)).toBe(false);
+    }
+  }, 30_000);
 });

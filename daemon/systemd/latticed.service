@@ -8,6 +8,7 @@ User=lattice
 Group=lattice
 RuntimeDirectory=lattice
 RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=yes
 ExecStart=/usr/local/bin/latticed --config /etc/lattice/latticed.conf
 Restart=on-failure
 RestartSec=2

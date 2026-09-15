@@ -1,8 +1,8 @@
-use std::io::{BufReader, Cursor};
 use std::sync::Arc;
 use std::time::Duration;
 
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
+use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::WebPkiClientVerifier;
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
@@ -54,8 +54,7 @@ pub fn spki_sha256_from_der(certificate_der: &[u8]) -> Result<String, TlsConfigE
 }
 
 pub fn certificates(pem: &[u8]) -> Result<Vec<CertificateDer<'static>>, TlsConfigError> {
-    let mut reader = BufReader::new(Cursor::new(pem));
-    let certs: Vec<_> = rustls_pemfile::certs(&mut reader)
+    let certs: Vec<_> = CertificateDer::pem_slice_iter(pem)
         .collect::<Result<_, _>>()
         .map_err(|_| TlsConfigError::InvalidCertificate)?;
     if certs.is_empty() {
@@ -65,10 +64,7 @@ pub fn certificates(pem: &[u8]) -> Result<Vec<CertificateDer<'static>>, TlsConfi
 }
 
 pub fn private_key(pem: &[u8]) -> Result<PrivateKeyDer<'static>, TlsConfigError> {
-    let mut reader = BufReader::new(Cursor::new(pem));
-    rustls_pemfile::private_key(&mut reader)
-        .map_err(|_| TlsConfigError::InvalidPrivateKey)?
-        .ok_or(TlsConfigError::InvalidPrivateKey)
+    PrivateKeyDer::from_pem_slice(pem).map_err(|_| TlsConfigError::InvalidPrivateKey)
 }
 
 pub fn root_store(root_pem: &[u8]) -> Result<RootCertStore, TlsConfigError> {

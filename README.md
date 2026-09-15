@@ -239,8 +239,9 @@ npm run migrate:network -- \
   --out /secure/profile-template.json
 ```
 
-HTTP authorizations are preserved only with an explicit `--terminate-tls`; an
-encrypted packet does not imply HTTP permission by itself.
+Action-scoped HTTP grants and `--terminate-tls` are rejected by the migrator.
+LNP/1 cannot enforce HTTP operations; keep those constraints in the destination
+service. Profiles containing `http_policy` are rejected.
 
 ## Platform status
 
